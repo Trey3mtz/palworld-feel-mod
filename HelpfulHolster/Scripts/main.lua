@@ -204,12 +204,23 @@ local HookList = {
     -- these register at mod load.
     { name = "next weapon", path = "/Script/Pal.PalPlayerController:OnPressedWeaponNextButtonKeyboard",
         callback = function(Context)
+            dbg("pressed next weapon")
             if IsHolstered() then ToggleHolsterState() end
         end },
 
     { name = "prev weapon", path = "/Script/Pal.PalPlayerController:OnPressedWeaponPrevButton",
         callback = function(Context)
+            dbg("pressed prev weapon")
             if IsHolstered() then ToggleHolsterState() end
+        end },
+    
+    { name = "nex_weapon loadout", path = "/Script/Pal.PalLoadoutSelectorComponent:ChangeNextWeaponLoadout",
+        callback = function(Context)
+            dbg("loadout selector changed next wepaon")
+        end },
+        { name = "prev_weapon loadout", path = "/Script/Pal.PalLoadoutSelectorComponent:ChangePrevWeaponLoadout",
+        callback = function(Context)
+            dbg("loadout selector changed prev wepaon")
         end },
 }
 
