@@ -105,6 +105,28 @@ local function ToggleHolsterState()
         tostring(loadout.primaryTargetInventoryType),
         tostring(loadout.currentItemSlotIndex))
 
+-- ADDED FOR DEBUGGING, DELTET LATER
+local ok, list = pcall(function() return loadout:GetWeaponList() end)
+if not ok or not list then
+    dbg("GetWeaponList failed: %s", tostring(list))
+    return
+end
+
+local okN, n = pcall(function() return #list end)
+dbg("weapons: %s", tostring(okN and n))
+
+for i = 1, (okN and n or 0) do
+    local w = list[i]
+    if w then
+        local okT, wt  = pcall(function() return w.WeaponType end)
+        local okI, idx = pcall(function() return w.LoadoutSelectorIndex end)
+        local okF, fn  = pcall(function() return w:GetFullName() end)
+        dbg("  [%d] type=%s loadoutIdx=%s %s", i,
+            tostring(okT and wt), tostring(okI and idx), tostring(okF and fn))
+    end
+end
+-- END OF DELETE LATER
+    
     if not IsHolstered() then
         LastEquippedIndex = loadout.currentItemSlotIndex
         loadout:SelectItem(INV_WEAPON_LOADOUT, -1)
