@@ -27,10 +27,12 @@ local CutMultiplier            = 0.69   -- rising Vz scale applied on release (n
 local M = { name = "jump" }
 local JumpKey = require("jumpkey")
 
+-- Jump States
 local jumpInitiated = false
 local launchInitiated = false
 
-local DEBUG_PRINT = false
+-- Debug reports
+local DEBUG_PRINT = true
 
 local function jdbg(fmt, ...)
     if DEBUG_PRINT then print(string.format("[PalFeel:jump] " .. fmt .. "\n", ...)) end
