@@ -21,7 +21,7 @@ local LowGravity               = 1.4
 local NegativeThreshold        = -150  -- uu/s
 local NegativeThresholdExtreme = -450
 local PositiveThreshold        = 20
-local CutMultiplier            = 0.6   -- rising Vz scale applied on release
+local CutMultiplier            = 0.69   -- rising Vz scale applied on release (nice)
 
 
 local M = { name = "jump" }
@@ -79,6 +79,7 @@ function M.OnTick(dt, pawn, cmc)
 
     local vz = cmc.Velocity.Z
 
+    -- Adjust launch pads against higher gravity
     if launchInitiated then
         cmc.Velocity.Z = cmc.Velocity.Z * LaunchMultiplier
         launchInitiated = false
@@ -107,5 +108,10 @@ function M.OnTick(dt, pawn, cmc)
         jumpInitiated = false
     end
 end
+
+
+NotifyOnNewObject("/Script/Pal.PalLevelGimmickJumpSpot", function(obj)
+    print("[PalFeel] jumpspot: " .. obj:GetFullName() .. "\n")
+end)
 
 return M
