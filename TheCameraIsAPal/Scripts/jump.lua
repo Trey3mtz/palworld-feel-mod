@@ -43,6 +43,12 @@ M.Hooks = {
         callback = function(Context)
             jumpInitiated = true
             jdbg("jump initiated (delegate)")
+        end },    
+        { name = "PalLevelGimmickJumpSpot:OnLaunchCharacter",
+        path = "/Script/Pal.PalLevelGimmickJumpSpot:OnLaunchCharacter",
+        callback = nil,   -- no pre work; the launch value does not exist yet
+        post = function(Context, Param)
+            jdbg("LAUNCH JUMP BIG")
         end },
 }
 -- =========================================================================
