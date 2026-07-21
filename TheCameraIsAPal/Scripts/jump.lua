@@ -13,6 +13,7 @@
 -- =========================================================================
 
 local JumpVel                  = 900
+local LaunchMultiplier         = 1.275
 local TargetGravity            = 1.8
 local TargetGravityExtreme     = 4
 local VanillaGravity           = 2.6   -- original game vanilla is 1.6
@@ -22,10 +23,12 @@ local NegativeThresholdExtreme = -450
 local PositiveThreshold        = 20
 local CutMultiplier            = 0.6   -- rising Vz scale applied on release
 
+
 local M = { name = "jump" }
 local JumpKey = require("jumpkey")
 
 local jumpInitiated = false
+local launchInitiated = false
 
 local DEBUG_JUMP = false
 
@@ -44,12 +47,18 @@ M.Hooks = {
             jumpInitiated = true
             jdbg("jump initiated (delegate)")
         end },    
-        { name = "PalLevelGimmickJumpSpot:OnLaunchCharacter",
-        path = "/Script/Pal.PalLevelGimmickJumpSpot:OnLaunchCharacter",
-        callback = nil,   -- no pre work; the launch value does not exist yet
-        post = function(Context, Param)
-            jdbg("LAUNCH JUMP BIG")
-        end },
+        { name = "JumpSpotLarge:OnLaunchCharacter",
+            path = "/Game/Pal/Blueprint/LevelObject/BP_LevelGimmickJumpSpotLarge.BP_LevelGimmickJumpSpotLarge_C:OnLaunchCharacter",
+            post = function()
+                jdbg("LAUNCH JUMP BIG")
+                launchInitiated = true
+            end },
+        { name = "JumpSpotSmall:OnLaunchCharacter",
+            path = "/Game/Pal/Blueprint/LevelObject/BP_LevelGimmickJumpSpotSmall.BP_LevelGimmickJumpSpotSmall_C:OnLaunchCharacter",
+            post = function()
+                jdbg("LAUNCH JUMP SMALL")
+                launchInitiated = true
+            end },
 }
 -- =========================================================================
 
@@ -69,6 +78,11 @@ function M.OnTick(dt, pawn, cmc)
     end
 
     local vz = cmc.Velocity.Z
+
+    if launchInitiated then
+        cmc.Velocity.Z = cmc.Velocity.Z * LaunchMultiplier
+        launchInitiated = false
+    end
 
     -- Jump cut: only for jumps we started from the ground.
     if jumpInitiated and released and vz > 0 then
