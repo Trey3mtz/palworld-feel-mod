@@ -30,10 +30,10 @@ local JumpKey = require("jumpkey")
 local jumpInitiated = false
 local launchInitiated = false
 
-local DEBUG_JUMP = false
+local DEBUG_PRINT = false
 
 local function jdbg(fmt, ...)
-    if DEBUG_JUMP then print(string.format("[PalFeel:jump] " .. fmt .. "\n", ...)) end
+    if DEBUG_PRINT then print(string.format("[PalFeel:jump] " .. fmt .. "\n", ...)) end
 end
 
 -- Declaration only: main.lua reads M.Hooks at load and registers each
