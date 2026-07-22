@@ -9,44 +9,56 @@
 --     mod load.
 --   * /Game/ (Blueprint) paths resolve only once their class is loaded.
 --     NotifyOnNewObject on /Script/Pal.PalPlayerCharacter fires at class
---     load (CDO), first spawn, every respawn, and every world reload. By
---     pawn-spawn time the possessing BP_PalPlayerController_C exists, so
---     the controller tick is registrable. A failed attempt is NOT latched
---     -- the next construction event retries it.
---   * BP classes are GC'd and reloaded on world transitions, so Blueprint
---     hooks are unbound and rebound on each pass.
+--     load (CDO), first spawn, every respawn, and every world reload -- so
+--     it doubles as the re-cache / re-bind trigger. A failed registration
+--     is not latched; the next construction event retries it.
+--
+-- Holster mechanism:
+--   ShooterComponent:ChangeWeapon(nil, true) clears the equipped weapon.
+--   The loadout index does NOT change, so holster state is tracked with a
+--   flag (_didHolster) plus a saved weapon reference for restore.
+--
+-- Detecting a drawn weapon (crash-safe):
+--   shooter.HasWeapon is never nil -- when holstered it holds a placeholder
+--   that reports as a plain UObject; a real drawn weapon reports as AActor
+--   (APalWeaponBase derives from AActor). The placeholder object faults on
+--   GetClass()/GetFullName() even under pcall, so we must NOT dereference
+--   its class. Instead we read the type prefix from tostring(), which UE4SS
+--   generates without touching the object's class: "AActor: 0x..." vs
+--   "UObject: 0x...". Any AActor-tagged HasWeapon means a real weapon.
+--
+-- State integrity:
+--   The game re-arms through paths we do not hook (tap next-weapon, scroll,
+--   UI, pickup). The tick reconciles: if _didHolster is set but a real
+--   (AActor) weapon is present, the game re-armed us -- drop state quietly.
 -- =========================================================================
 
 local UEHelpers = require("UEHelpers")
-local Config = require("config")
+local Config    = require("config")
 
-local DEBUGGING = true
+local DEBUGGING = false
 
 local PATH_CONTROLLER_TICK =
     "/Game/Pal/Blueprint/Controller/BP_PalPlayerController.BP_PalPlayerController_C:ReceiveTick"
-
--- Native base class of the player pawn; its construction is the
--- "blueprints are loaded" signal.
 local PAWN_NATIVE_CLASS = "/Script/Pal.PalPlayerCharacter"
 
--- Input keys. FKey marshals from a table keyed by KeyName. Built once:
--- constructing FName every frame is wasteful.
-local KEY_KEYBOARD   = { KeyName = FName(Config.Binding) }
+-- FKey marshals from a table keyed by KeyName; built once, not per frame.
+local KEY_KEYBOARD   = { KeyName = FName(Config.KeyboardBinding) }
 local KEY_CONTROLLER = { KeyName = FName(Config.ControllerBinding) }
 
 -- ---------------------------- state --------------------------------------
 
-local playerController = nil
-
-local LastEquippedIndex = 0
-local TimeInputHeld     = 0
-local IsInputKeyDown    = false
+local playerController   = nil
+local _didHolster        = false
+local LastEquippedWeapon = nil
+local TimeInputHeld      = 0
+local IsInputKeyDown     = false
 
 local function dbg(fmt, ...)
     if DEBUGGING then print(string.format("[Helpful Holster] " .. fmt .. "\n", ...)) end
 end
 
--- ---------------------------- player cache -------------------------------
+-- ---------------------------- component access ---------------------------
 
 local function CacheController()
     local ok, pc = pcall(function() return UEHelpers.GetPlayerController() end)
@@ -60,88 +72,106 @@ local function ValidController()
     return CacheController()
 end
 
---- Player's loadout component, or nil.
-local function GetLoadout()
+local function GetPawn()
     if not ValidController() then return nil end
     local ok, pawn = pcall(function() return playerController.Pawn end)
     if not ok or not pawn or not pawn:IsValid() then return nil end
-    local ok2, loadout = pcall(function() return pawn.LoadoutSelectorComponent end)
-    if not ok2 or not loadout or not loadout:IsValid() then return nil end
-    return loadout
+    return pawn
+end
+
+local function GetShooter()
+    local pawn = GetPawn()
+    if not pawn then return nil end
+    local ok, shooter = pcall(function() return pawn.ShooterComponent end)
+    if not ok or not shooter or not shooter:IsValid() then return nil end
+    return shooter
+end
+
+-- ---------------------------- weapon detection ---------------------------
+
+--- True when the shooter holds a REAL drawn weapon. Reads only the type
+--- prefix from tostring() -- never dereferences the object's class, which
+--- crashes on the holstered placeholder. "AActor:" = real weapon;
+--- "UObject:" = holstered placeholder; nil = nothing.
+local function HasRealWeapon()
+    local shooter = GetShooter()
+    if not shooter then return false end
+    local okF, w = pcall(function() return shooter.HasWeapon end)
+    if not okF or w == nil then return false end
+    local okT, s = pcall(function() return tostring(w) end)
+    if not okT or type(s) ~= "string" then return false end
+    return s:sub(1, 7) == "AActor:"
 end
 
 -- ---------------------------- holster logic ------------------------------
-local INV_NONE           = 6
-local INV_WEAPON_LOADOUT = 3
-function IsHolstered()
-    local loadout = GetLoadout()
-    if not loadout then return false end
-    local ok, t = pcall(function() return loadout:GetPrimaryInventoryType() end)
-    if ok and t then return t == INV_NONE end
-    -- fall back to the property if the accessor doesn't marshal
-    return loadout.primaryTargetInventoryType == INV_NONE
-end
---- @param TargetIndex integer (-1 to holster, 0-3 for weapon slots)
-local function SetWeaponIndex(TargetIndex)
-    local loadout = GetLoadout()
-    if not loadout then return end
 
-    local ok, err = pcall(function()
-        loadout:SetWeaponLoadoutIndex_Internal(TargetIndex)
-        if loadout:TryEquipNowSelectedWeapon() then
-            dbg("Equipped selected weapon")
+local function AbandonHolsterState(reason)
+    _didHolster        = false
+    LastEquippedWeapon = nil
+    dbg("Holster state cleared: %s", reason)
+end
+
+--- True when the native unarmed slot is selected, or we holstered a weapon.
+function IsHolstered()
+    local pawn = GetPawn()
+    if pawn then
+        local ok, loadout = pcall(function() return pawn.LoadoutSelectorComponent end)
+        if ok and loadout then
+            local okI, idx = pcall(function() return loadout.currentItemSlotIndex end)
+            if okI and idx == -1 then return true end
         end
-    end)
-    if not ok then
-        print("[Helpful Holster] Error setting weapon index: " .. tostring(err))
     end
+    return _didHolster and not HasRealWeapon()
+end
+
+--- Save the current weapon, then clear it. Refuses when no real weapon is
+--- drawn, so holstering while already unarmed is a no-op (issue 1).
+local function Unequip()
+    local shooter = GetShooter()
+    if not shooter then return false end
+
+    if not HasRealWeapon() then
+        dbg("Nothing to holster")
+        return false
+    end
+
+    local okF, w = pcall(function() return shooter.HasWeapon end)
+    if not okF or w == nil then return false end
+
+    local ok, err = pcall(function() shooter:ChangeWeapon(nil, true) end)
+    if not ok then
+        dbg("Unequip failed: %s", tostring(err))
+        return false
+    end
+    LastEquippedWeapon = w
+    return true
+end
+
+--- Hand the saved weapon back. Guards against a stale/destroyed reference.
+local function RestoreEquipped()
+    local shooter = GetShooter()
+    if not shooter then return false end
+    if not (LastEquippedWeapon and LastEquippedWeapon:IsValid()) then
+        return false
+    end
+    local ok, err = pcall(function() shooter:ChangeWeapon(LastEquippedWeapon, true) end)
+    if not ok then dbg("Restore failed: %s", tostring(err)) end
+    return ok
 end
 
 local function ToggleHolsterState()
-    local loadout = GetLoadout()
-    if not loadout then return end
-
-    dbg("before: type=%s idx=%s",
-        tostring(loadout.primaryTargetInventoryType),
-        tostring(loadout.currentItemSlotIndex))
-
--- ADDED FOR DEBUGGING, DELTET LATER
-local ok, list = pcall(function() return loadout:GetWeaponList() end)
-if not ok or not list then
-    dbg("GetWeaponList failed: %s", tostring(list))
-    return
-end
-
-local okN, n = pcall(function() return #list end)
-dbg("weapons: %s", tostring(okN and n))
-
-for i = 1, (okN and n or 0) do
-    local w = list[i]
-    if w then
-        local okT, wt  = pcall(function() return w.WeaponType end)
-        local okI, idx = pcall(function() return w.LoadoutSelectorIndex end)
-        local okF, fn  = pcall(function() return w:GetFullName() end)
-        dbg("  [%d] type=%s loadoutIdx=%s %s", i,
-            tostring(okT and wt), tostring(okI and idx), tostring(okF and fn))
+    if _didHolster then
+        if RestoreEquipped() then
+            _didHolster        = false
+            LastEquippedWeapon = nil
+            dbg("Restored")
+        else
+            AbandonHolsterState("restore unavailable")
+        end
+    elseif Unequip() then
+        _didHolster = true
+        dbg("Holstered")
     end
-end
--- END OF DELETE LATER
-    
-    if not IsHolstered() then
-        LastEquippedIndex = loadout.currentItemSlotIndex
-        loadout:SelectItem(INV_WEAPON_LOADOUT, -1)
-        loadout:TryEquipNowSelectedWeapon()
-        dbg("Holstered (saved slot %d)", LastEquippedIndex)
-    else
-        local RestoreIndex = (LastEquippedIndex >= 0) and LastEquippedIndex or 0
-        loadout:SelectItem(INV_WEAPON_LOADOUT, RestoreIndex)
-        loadout:TryEquipNowSelectedWeapon()
-        dbg("Restored slot %d", RestoreIndex)
-    end
-
-    dbg("after: type=%s idx=%s",
-    tostring(loadout.primaryTargetInventoryType),
-    tostring(loadout.currentItemSlotIndex))
 end
 
 local function ResetInputState()
@@ -152,9 +182,16 @@ end
 -- ---------------------------- tick ---------------------------------------
 
 --- Gamepad input cannot be serviced by RegisterKeyBind, so both bindings
---- are sampled here per frame.
+--- are sampled here per frame. Also reconciles holster state against the
+--- game (see State integrity, header).
 local function Tick(dt)
     if not ValidController() then return end
+
+    -- Reconciliation: game re-armed us through a path we do not hook. The
+    -- weapon is a real AActor again while we still think we holstered.
+    if _didHolster and HasRealWeapon() then
+        AbandonHolsterState("re-armed by game")
+    end
 
     if IsInputKeyDown then
         TimeInputHeld = TimeInputHeld + dt
@@ -166,7 +203,6 @@ local function Tick(dt)
     end)
     if okP and pressed then
         IsInputKeyDown = true
-        dbg("Input pressed")
     end
 
     local okR, released = pcall(function()
@@ -175,7 +211,6 @@ local function Tick(dt)
     end)
     if okR and released then
         ResetInputState()
-        dbg("Input released")
     end
 
     if Config.HoldToHolster then
@@ -183,11 +218,9 @@ local function Tick(dt)
             ToggleHolsterState()
             ResetInputState()
         end
-    else
-        if IsInputKeyDown then
-            ToggleHolsterState()
-            ResetInputState()
-        end
+    elseif IsInputKeyDown then
+        ToggleHolsterState()
+        ResetInputState()
     end
 end
 
@@ -200,27 +233,18 @@ local HookList = {
             Tick(ok and dt or 0.0083)
         end },
 
-    -- Weapon switch: if holstered, come out of the holster. Native, so
-    -- these register at mod load.
+    -- Weapon switch via held-modifier d-pad (the paths that cross
+    -- ProcessEvent). Drop our stale state immediately rather than waiting
+    -- for tick reconciliation. Other switch paths (tap) are caught by the
+    -- reconciliation above.
     { name = "next weapon", path = "/Script/Pal.PalPlayerController:OnPressedWeaponNextButtonKeyboard",
         callback = function(Context)
-            dbg("pressed next weapon")
-            if IsHolstered() then ToggleHolsterState() end
+            if _didHolster then AbandonHolsterState("weapon switch (next)") end
         end },
 
     { name = "prev weapon", path = "/Script/Pal.PalPlayerController:OnPressedWeaponPrevButton",
         callback = function(Context)
-            dbg("pressed prev weapon")
-            if IsHolstered() then ToggleHolsterState() end
-        end },
-    
-    { name = "nex_weapon loadout", path = "/Script/Pal.PalLoadoutSelectorComponent:ChangeNextWeaponLoadout",
-        callback = function(Context)
-            dbg("loadout selector changed next wepaon")
-        end },
-        { name = "prev_weapon loadout", path = "/Script/Pal.PalLoadoutSelectorComponent:ChangePrevWeaponLoadout",
-        callback = function(Context)
-            dbg("loadout selector changed prev wepaon")
+            if _didHolster then AbandonHolsterState("weapon switch (prev)") end
         end },
 }
 
@@ -228,9 +252,6 @@ local function IsNativePath(path)
     return path:sub(1, 8) == "/Script/"
 end
 
---- One registration attempt. Failure on a /Game/ path is not an error:
---- it means the class is not loaded yet, and the next construction event
---- retries. Nothing is latched.
 local function Register(h, context)
     local ok, pre, post = pcall(RegisterHook, h.path, h.callback)
     if ok then
@@ -249,8 +270,8 @@ local function InstallNativeHooks()
     end
 end
 
---- Blueprint hooks: unbind stale registrations first, since a world reload
---- GCs and reloads the BP class, leaving the old hook bound to a dead one.
+--- (Re)bind Blueprint hooks whose class was (re)loaded. Only attempts a
+--- path that is not currently bound, so a same-world refire never doubles up.
 local function RefreshBlueprintHooks(context)
     for _, h in ipairs(HookList) do
         if not IsNativePath(h.path) and not h.preId then
@@ -265,11 +286,9 @@ dbg("Loaded. Hooks declared: %d", #HookList)
 
 InstallNativeHooks()
 
--- Fires at class load (CDO), first spawn, every respawn, every world
--- reload. Refs are cleared here and re-cached lazily on the next tick:
--- at construction time the pawn is not fully initialized.
 NotifyOnNewObject(PAWN_NATIVE_CLASS, function()
     playerController = nil
+    AbandonHolsterState("pawn constructed")
     ResetInputState()
     RefreshBlueprintHooks("pawn constructed")
 end)
@@ -282,3 +301,5 @@ ExecuteInGameThread(function()
         RefreshBlueprintHooks("mid-session load")
     end
 end)
+
+require("HelpfulHolster_bridge")
