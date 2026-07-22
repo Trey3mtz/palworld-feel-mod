@@ -13,7 +13,7 @@
 -- =========================================================================
 
 local JumpVel                  = 900
-local LaunchMultiplier         = 1.275
+local LaunchMultiplier         = 1.275 -- This value perfectly counter's increased gravity back to vanilla launch feel
 local TargetGravity            = 1.8
 local TargetGravityExtreme     = 4
 local VanillaGravity           = 2.6   -- original game vanilla is 1.6
@@ -21,15 +21,17 @@ local LowGravity               = 1.4
 local NegativeThreshold        = -150  -- uu/s
 local NegativeThresholdExtreme = -450
 local PositiveThreshold        = 20
-local CutMultiplier            = 0.69   -- rising Vz scale applied on release (nice)
+local CutMultiplier            = 0.65   -- rising Vz scale applied on release (nice)
+local JumpCutOn                = true   -- Turns the feature for jump cutting on/off
 
-
+-- Mod
 local M = { name = "jump" }
 local JumpKey = require("jumpkey")
+local jumpspotNotified = false
 
 -- Jump States
 local jumpInitiated = false
-local launchInitiated = false
+
 
 -- Debug reports
 local DEBUG_PRINT = true
@@ -48,19 +50,7 @@ M.Hooks = {
         callback = function(Context)
             jumpInitiated = true
             jdbg("jump initiated (delegate)")
-        end },    
-        { name = "JumpSpotLarge:OnLaunchCharacter",
-            path = "/Game/Pal/Blueprint/LevelObject/BP_LevelGimmickJumpSpotLarge.BP_LevelGimmickJumpSpotLarge_C:OnLaunchCharacter",
-            post = function()
-                jdbg("LAUNCH JUMP BIG")
-                launchInitiated = true
-            end },
-        { name = "JumpSpotSmall:OnLaunchCharacter",
-            path = "/Game/Pal/Blueprint/LevelObject/BP_LevelGimmickJumpSpotSmall.BP_LevelGimmickJumpSpotSmall_C:OnLaunchCharacter",
-            post = function()
-                jdbg("LAUNCH JUMP SMALL")
-                launchInitiated = true
-            end },
+        end }
 }
 -- =========================================================================
 
@@ -68,6 +58,21 @@ function M.OnPlayerCached(pawn, cmc)
     cmc.GravityScale  = VanillaGravity   -- clean slate on (re)spawn
     cmc.JumpZVelocity = JumpVel
     jumpInitiated     = false            -- a respawn mid-air must not inherit it
+
+    -- one-time: boost every jump spot as it streams in
+    if not jumpspotNotified then
+        jumpspotNotified = true
+        ---@diagnostic disable-next-line: undefined-global
+        NotifyOnNewObject("/Script/Pal.PalLevelGimmickJumpSpot", function(obj)
+            if obj and obj:IsValid() then
+                local ok, v = pcall(function() return obj.JumpZVelocity end)
+                if ok and v then
+                    obj.JumpZVelocity = v * LaunchMultiplier
+                    jdbg("jumpspot Z %.0f -> %.0f", v, obj.JumpZVelocity)
+                end
+            end
+        end)
+    end
 end
 
 function M.OnTick(dt, pawn, cmc)
@@ -81,17 +86,10 @@ function M.OnTick(dt, pawn, cmc)
 
     local vz = cmc.Velocity.Z
 
-    -- Adjust launch pads against higher gravity
-    if launchInitiated then
-        cmc.Velocity.Z = cmc.Velocity.Z * LaunchMultiplier
-        launchInitiated = false
-    end
-
     -- Jump cut: only for jumps we started from the ground.
-    if jumpInitiated and released and vz > 0 then
+    if JumpCutOn and jumpInitiated and released and vz > 0 then
         cmc.Velocity.Z = vz * CutMultiplier
         vz = cmc.Velocity.Z
-        jdbg("jump cut -> Vz=%.0f", vz)
     end
 
     -- Distinct velocity sections, checked deepest-first so exactly one
@@ -112,8 +110,5 @@ function M.OnTick(dt, pawn, cmc)
 end
 
 
-NotifyOnNewObject("/Script/Pal.PalLevelGimmickJumpSpot", function(obj)
-    print("[PalFeel] jumpspot: " .. obj:GetFullName() .. "\n")
-end)
 
 return M
