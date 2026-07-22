@@ -1,40 +1,48 @@
 -- =========================================================================
--- CineCam — standalone cinematic third-person camera mod for Palworld
+-- TheCameraIsAPal — standalone cinematic third-person camera mod, Palworld
 -- UE4SS Lua, Palworld 1.0, offline/single-player.
 --
--- Install: Pal\Binaries\Win64\ue4ss\Mods\CineCam\Scripts\   (all files)
---          then add "CineCam : 1" to ue4ss\Mods\mods.txt
+-- Install: Pal\Binaries\Win64\ue4ss\Mods\TheCameraIsAPal\Scripts\
+--          then add "TheCameraIsAPal : 1" to ue4ss\Mods\mods.txt
 --
 -- main.lua owns: reference caching (pawn / cmc / controller / spring arm /
--- camera / loadout), respawn re-cache, per-tick signal derivation, and
--- subsystem dispatch. Subsystems implement:
+-- camera / loadout), respawn re-cache, per-tick signal derivation, rig
+-- frame lifecycle, and subsystem dispatch. Subsystems implement:
 --
 --   M.name                       string tag for logs
 --   M.OnCached(ctx)              called when refs are (re)acquired
 --   M.OnTick(dt, ctx, sig)       called every controller tick
 --   M.Hooks (optional)           { {name=, path=, callback=}, ... }
 --
+-- Tick order: BuildSignals -> Rig.Begin -> subsystems (request effects via
+-- Rig.Add) -> Rig.Finish (smooth + single write). Subsystems never write
+-- camera properties directly.
+--
 -- ctx : stable references             sig : per-tick derived state
 --   .pawn    APalPlayerCharacter        .speed2d      2D speed (uu/s)
 --   .cmc     PalCharacterMovementComp   .vz           vertical velocity
 --   .pc      APalPlayerController       .mode         MovementMode enum
---   .arm     spring arm component*      .grounded     mode 1 or 2
---   .cam     camera component*          .falling      mode 3
+--   .arm     PalShooterSpringArmComp    .grounded     mode 1 or 2
+--   .cam     PalCharacterCameraComp     .falling      mode 3
 --   .loadout LoadoutSelectorComponent   .sprinting    request + min speed
 --                                       .holstered    slot index < 0
---   * nil until discovery succeeds      .heading      vel heading deg / nil
+--                                       .heading      vel heading deg / nil
 --                                       .camInput     look-axis magnitude
+--                                       .userLooking  camInput > deadzone
 -- =========================================================================
 
-local UEHelpers = require("UEHelpers")
-local U         = require("camutil")
+local UEHelpers   = require("UEHelpers")
+local U           = require("camutil")
+local Rig         = require("rig")
+local HolsterLink = require("holsterlink")
 
 local Subsystems = {
-    require("probe"),
-    -- require("holsterframe"),   -- phase B: BOTW centering + zoom-out
-    -- require("sprintfx"),       -- phase C: sprint FOV + wobble
-    -- require("fallfx"),         -- phase C: fall FOV + scaled shake
-    -- require("follow"),         -- phase D: delayed follow / turn-follow
+    require("probe"),          -- passive signal recon; keep WRITE_TEST=false
+    require("xray"),           -- one-shot reflection dump of Pal camera classes
+    require("statecam"),       -- holster framing, anti jump-zoom, camera lag
+    require("sprintfx"),       -- sprint sway + FOV widening (via rig)
+    require("fallfx"),         -- fall wobble + FOV, velocity-scaled (via rig)
+    -- require("follow"),      -- phase D: delayed follow / sprint turn-follow
 }
 
 local DEBUG = true
@@ -42,9 +50,9 @@ local PATH_CONTROLLER_TICK =
     "/Game/Pal/Blueprint/Controller/BP_PalPlayerController.BP_PalPlayerController_C:ReceiveTick"
 
 -- signal tuning
-local SPRINT_MIN_SPEED  = 350    -- uu/s; sprint "counts" above this
-local HEADING_MIN_SPEED = 60     -- uu/s; below this heading = nil
-local CAM_INPUT_DEADZONE = 0.05  -- axis magnitude regarded as "no input"
+local SPRINT_MIN_SPEED   = 420    -- uu/s; above walk cap 350, below sprint 610
+local HEADING_MIN_SPEED  = 60     -- uu/s; below this heading = nil
+local CAM_INPUT_DEADZONE = 0.05   -- axis magnitude regarded as "no input"
 
 -- ------------------------------------------------------------------------
 
@@ -53,7 +61,7 @@ local ctx    = { pawn = nil, cmc = nil, pc = nil,
 local subErr = {}
 
 local function dbg(fmt, ...)
-    if DEBUG then print(string.format("[CineCam] " .. fmt .. "\n", ...)) end
+    if DEBUG then print(string.format("[TheCameraIsAPal] " .. fmt .. "\n", ...)) end
 end
 
 -- ------------------------- UObject array helper --------------------------
@@ -75,8 +83,11 @@ local function ForEachUObjArray(arr, fn)
 end
 
 -- ------------------------- component discovery ---------------------------
--- Three-stage fallback. After the probe confirms exact class names on this
--- build, collapse this to a direct lookup for those names.
+-- Probe confirmed the component names on BP_PlayerBase:
+--   pawn.CameraBoom   -> PalShooterSpringArmComponent
+--   pawn.FollowCamera -> PalCharacterCameraComponent
+-- Fast path reads those directly; generic sniffing remains as a fallback
+-- in case a patch renames them.
 
 local function SniffAssign(comp)
     local okN, full = pcall(function() return comp:GetFullName() end)
@@ -89,6 +100,21 @@ end
 local function DiscoverCameraParts()
     ctx.arm, ctx.cam = nil, nil
     local pawn = ctx.pawn
+
+    -- Stage 0: confirmed named properties.
+    pcall(function()
+        local b = pawn.CameraBoom
+        if b and b:IsValid() then ctx.arm = b end
+    end)
+    pcall(function()
+        local c = pawn.FollowCamera
+        if c and c:IsValid() then ctx.cam = c end
+    end)
+    if ctx.arm and ctx.cam then
+        dbg("discovery (fast path): arm=%s  cam=%s",
+            ctx.arm:GetFullName(), ctx.cam:GetFullName())
+        return
+    end
 
     -- Stage 1: enumerate the pawn's components.
     local compClass = StaticFindObject("/Script/Engine.ActorComponent")
@@ -105,7 +131,7 @@ local function DiscoverCameraParts()
     -- Stage 2: global instance search filtered by owner.
     if ctx.arm == nil or ctx.cam == nil then
         local pawnName = pawn:GetFullName()
-        for _, cls in ipairs({ "PalCameraSpringArmComponent", "SpringArmComponent",
+        for _, cls in ipairs({ "PalShooterSpringArmComponent", "SpringArmComponent",
                                "PalCharacterCameraComponent", "CameraComponent" }) do
             local okF, all = pcall(function() return FindAllOf(cls) end)
             if okF and all then
@@ -120,17 +146,7 @@ local function DiscoverCameraParts()
         end
     end
 
-    -- Stage 3: common named properties on the pawn.
-    if ctx.arm == nil or ctx.cam == nil then
-        for _, p in ipairs({ "SpringArm", "CameraBoom", "Camera", "FollowCamera" }) do
-            local okP, v = pcall(function() return pawn[p] end)
-            if okP and v ~= nil then
-                pcall(function() if v:IsValid() then SniffAssign(v) end end)
-            end
-        end
-    end
-
-    dbg("discovery: arm=%s  cam=%s",
+    dbg("discovery (fallback): arm=%s  cam=%s",
         ctx.arm and ctx.arm:GetFullName() or "NOT FOUND",
         ctx.cam and ctx.cam:GetFullName() or "NOT FOUND")
 end
@@ -157,6 +173,7 @@ local function CacheAll()
         ctx.pc and "ok" or "MISSING",
         ctx.loadout and "ok" or "MISSING")
 
+    Rig.OnCached(ctx)
     for _, sub in ipairs(Subsystems) do
         local okS, err = pcall(sub.OnCached, ctx)
         if not okS then dbg("[%s] OnCached error: %s", sub.name, tostring(err)) end
@@ -181,22 +198,21 @@ local function BuildSignals()
     s.vz      = v.Z
     s.speed2d = math.sqrt(v.X * v.X + v.Y * v.Y)
     s.mode    = ctx.cmc.MovementMode
+    s.custom  = 0
+    pcall(function() s.custom = ctx.cmc.CustomMovementMode end)
     s.grounded = (s.mode == 1 or s.mode == 2)
     s.falling  = (s.mode == 3)
 
-    s.sprinting = false
-    pcall(function()
-        s.sprinting = ctx.cmc.bRequestSprint
-                      and s.grounded
-                      and s.speed2d > SPRINT_MIN_SPEED
-    end)
+    -- Sprint detection is SPEED-BASED. The bRequestSprint gate never fired
+    -- across multiple capture sessions (flag unreadable or not the live
+    -- sprint state) and its pcall silently disabled every sprint effect.
+    -- Grounded speed above the walk cap (350) cannot silently fail.
+    s.sprinting = s.grounded and s.speed2d > SPRINT_MIN_SPEED
 
-    s.holstered = false
-    if ctx.loadout and ctx.loadout:IsValid() then
-        pcall(function()
-            s.holstered = ctx.loadout.currentItemSlotIndex < 0
-        end)
-    end
+    -- Holster state comes from the HelpfulHolster bridge when available
+    -- (its IsHolstered(), published via shared variable), with the game
+    -- property as fallback. See holsterlink.lua.
+    s.holstered = HolsterLink.IsHolstered(ctx)
 
     s.heading = U.VelocityHeadingDeg(v.X, v.Y, HEADING_MIN_SPEED)
 
@@ -218,6 +234,7 @@ end
 local function Tick(dt)
     if not ValidRefs() then return end
     local sig = BuildSignals()
+    Rig.Begin()
     for _, sub in ipairs(Subsystems) do
         local ok, err = pcall(sub.OnTick, dt, ctx, sig)
         if not ok and not subErr[sub.name] then
@@ -225,6 +242,7 @@ local function Tick(dt)
             dbg("[%s] OnTick error (logged once): %s", sub.name, tostring(err))
         end
     end
+    Rig.Finish(dt, ctx)
 end
 
 -- ------------------------- wiring ----------------------------------------
@@ -261,4 +279,4 @@ end)
 
 local names = {}
 for _, s in ipairs(Subsystems) do names[#names + 1] = s.name end
-dbg("CineCam loaded. Subsystems: %s", table.concat(names, ", "))
+dbg("TheCameraIsAPal loaded. Subsystems: %s", table.concat(names, ", "))
