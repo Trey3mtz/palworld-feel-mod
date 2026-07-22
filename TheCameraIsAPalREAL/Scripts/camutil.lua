@@ -128,4 +128,25 @@ function M.MapClamped(v, inA, inB, outA, outB)
     return outA + (outB - outA) * t
 end
 
+--- Footstep-style camera bob, phase-driven so cadence can vary per frame.
+--- phase counts STEPS elapsed (accumulate: ph = ph + stepHz * dt).
+--- Returns lateral, vertical in [-1, 1]:
+---   lateral  alternates sign each step (period = 2 steps)
+---   vertical dips once per step, sharpened (sharp < 1 widens peaks and
+---   quickens reversals for a punchy, jolting character)
+function M.Bob(phase, sharp)
+    sharp = sharp or 0.65
+    local lat = math.sin(math.pi * phase)
+    local v   = math.sin(2.0 * math.pi * phase + 0.6)
+    local vert = ((v >= 0) and 1 or -1) * (math.abs(v) ^ sharp)
+    return lat, vert
+end
+
+--- Sharpened sine for heavy heave motion (same shaping as Bob's vertical).
+function M.Heave(t, hz, sharp)
+    sharp = sharp or 0.7
+    local v = math.sin(2.0 * math.pi * hz * t)
+    return ((v >= 0) and 1 or -1) * (math.abs(v) ^ sharp)
+end
+
 return M
