@@ -7,7 +7,13 @@
 -- Owns: player caching, respawn re-cache, event-driven hook lifecycle.
 -- Subsystems implement: M.name, M.OnPlayerCached(pawn, cmc),
 --                       M.OnTick(dt, pawn, cmc)
--- Optional:             M.Hooks = { { name, path, callback }, ... }
+-- Optional:             M.Hooks = { { name, path, callback, post }, ... }
+--                       callback = PRE  (may be nil)
+--                       post     = POST (may be nil)
+--   Use post whenever the value you want to read or edit is produced BY the
+--   hooked function — e.g. a launch velocity. A pre callback runs before it
+--   exists. UE4SS wants a pre slot regardless, so a no-op is substituted
+--   when a subsystem declares post only.
 --
 -- Hook lifecycle (no polling, no timers):
 --   * /Script/ (native) paths exist from engine init — registered once at
@@ -29,6 +35,8 @@
 -- =========================================================================
 
 local UEHelpers = require("UEHelpers")
+
+-- CHANGED: jumpspot added.
 local Subsystems = {
     require("jump"),
     require("walking"),
@@ -103,14 +111,22 @@ local function IsNativePath(path)
     return path:sub(1, 8) == "/Script/"
 end
 
+local function NoOp() end
+
 -- One registration attempt. On success stores the callback ids needed to
 -- unbind later. A /Game/ failure here is not an error condition: it means
 -- the class is not loaded yet, and the next construction event retries.
+--
+-- CHANGED: forwards h.post as the post callback. UE4SS expects a pre slot
+-- even for post-only hooks, so NoOp fills it and preId stays valid for the
+-- unregister path below.
 local function Register(h, context)
-    local ok, pre, post = pcall(RegisterHook, h.path, h.callback)
+    local preFn = h.callback or NoOp
+    local ok, pre, post = pcall(RegisterHook, h.path, preFn, h.post)
     if ok then
         h.preId, h.postId = pre, post
-        dbg("Hook installed (%s): %s", context, h.name)
+        dbg("Hook installed (%s): %s%s", context, h.name,
+            h.post and "  [pre+post]" or "")
     else
         h.preId, h.postId = nil, nil
         dbg("Hook pending (%s): %s -- %s", context, h.name, tostring(pre))
@@ -169,6 +185,7 @@ NotifyOnNewObject(PAWN_NATIVE_CLASS, function()
     pawn, cmc = nil, nil
     RefreshBlueprintHooks("pawn constructed")
 end)
+
 
 -- Hot-reload mid-session: the pawn already exists, so no construction
 -- notification is coming — bind immediately.
