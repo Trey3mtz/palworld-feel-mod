@@ -51,7 +51,6 @@ local function ReadOpt(cmc, prop)
 end
 
 function M.OnPlayerCached(pawn, cmc)
-    if true then return end
     dbg("---- vanilla sliding values ----")
     for _, o in ipairs(OVERRIDES) do
         dbg("  %-42s = %s", o[1], ReadOpt(cmc, o[1]))
@@ -68,7 +67,6 @@ function M.OnPlayerCached(pawn, cmc)
 end
 
 function M.OnTick(dt, pawn, cmc)
-    if true then return end
     if not DEBUG then return end
     -- Movement-mode transition watcher: identifies the slide's custom-mode
     -- enum value (and glide/climb IDs as a side effect) for later phases.
