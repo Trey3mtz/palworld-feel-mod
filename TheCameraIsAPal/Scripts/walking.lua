@@ -84,7 +84,6 @@ local function WriteOpt(cmc, prop, value, label)
 end
 
 function M.OnPlayerCached(pawn, cmc)
-    if true then return end
     desired   = cmc.MaxWalkSpeed
     moving    = false
     lastWrite = nil
@@ -111,7 +110,6 @@ function M.OnPlayerCached(pawn, cmc)
 end
 
 function M.OnTick(dt, pawn, cmc)
-    if true then return end
     local mode = cmc.MovementMode
     local grounded = (mode == 1 or mode == 2)   -- Walking / NavWalking
     if not grounded then return end             -- keep momentum through jumps
