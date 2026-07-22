@@ -3,34 +3,7 @@
 -- HelpfulHolster
 -- author  = TheTr3y
 -- version = 1.0.0
---
--- Hook lifecycle (event-driven, no polling):
---   * /Script/ (native) paths exist from engine init -> registered once at
---     mod load.
---   * /Game/ (Blueprint) paths resolve only once their class is loaded.
---     NotifyOnNewObject on /Script/Pal.PalPlayerCharacter fires at class
---     load (CDO), first spawn, every respawn, and every world reload -- so
---     it doubles as the re-cache / re-bind trigger. A failed registration
---     is not latched; the next construction event retries it.
---
--- Holster mechanism:
---   ShooterComponent:ChangeWeapon(nil, true) clears the equipped weapon.
---   The loadout index does NOT change, so holster state is tracked with a
---   flag (_didHolster) plus a saved weapon reference for restore.
---
--- Detecting a drawn weapon (crash-safe):
---   shooter.HasWeapon is never nil -- when holstered it holds a placeholder
---   that reports as a plain UObject; a real drawn weapon reports as AActor
---   (APalWeaponBase derives from AActor). The placeholder object faults on
---   GetClass()/GetFullName() even under pcall, so we must NOT dereference
---   its class. Instead we read the type prefix from tostring(), which UE4SS
---   generates without touching the object's class: "AActor: 0x..." vs
---   "UObject: 0x...". Any AActor-tagged HasWeapon means a real weapon.
---
--- State integrity:
---   The game re-arms through paths we do not hook (tap next-weapon, scroll,
---   UI, pickup). The tick reconciles: if _didHolster is set but a real
---   (AActor) weapon is present, the game re-armed us -- drop state quietly.
+-- date    = 2026-07-22
 -- =========================================================================
 
 local UEHelpers = require("UEHelpers")
@@ -42,7 +15,7 @@ local PATH_CONTROLLER_TICK =
     "/Game/Pal/Blueprint/Controller/BP_PalPlayerController.BP_PalPlayerController_C:ReceiveTick"
 local PAWN_NATIVE_CLASS = "/Script/Pal.PalPlayerCharacter"
 
--- FKey marshals from a table keyed by KeyName; built once, not per frame.
+-- FKey marshals from a table keyed by KeyName.
 local KEY_KEYBOARD   = { KeyName = FName(Config.KeyboardBinding) }
 local KEY_CONTROLLER = { KeyName = FName(Config.ControllerBinding) }
 
@@ -181,9 +154,8 @@ end
 
 -- ---------------------------- tick ---------------------------------------
 
---- Gamepad input cannot be serviced by RegisterKeyBind, so both bindings
---- are sampled here per frame. Also reconciles holster state against the
---- game (see State integrity, header).
+--- Gamepad input cannot be serviced by RegisterKeyBind, so both bindings are sampled here per frame.
+--- Also reconciles holster state against the game (see State integrity, header).
 local function Tick(dt)
     if not ValidController() then return end
 
@@ -233,10 +205,9 @@ local HookList = {
             Tick(ok and dt or 0.0083)
         end },
 
-    -- Weapon switch via held-modifier d-pad (the paths that cross
-    -- ProcessEvent). Drop our stale state immediately rather than waiting
-    -- for tick reconciliation. Other switch paths (tap) are caught by the
-    -- reconciliation above.
+    -- Weapon switch via held-modifier d-pad (the paths that cross ProcessEvent).
+    -- Drop our stale state immediately rather than waiting for tick reconciliation.
+    -- Other switch paths (tap) are caught by the reconciliation above.
     { name = "next weapon", path = "/Script/Pal.PalPlayerController:OnPressedWeaponNextButtonKeyboard",
         callback = function(Context)
             if _didHolster then AbandonHolsterState("weapon switch (next)") end
@@ -301,5 +272,3 @@ ExecuteInGameThread(function()
         RefreshBlueprintHooks("mid-session load")
     end
 end)
-
-require("HelpfulHolster_bridge")
