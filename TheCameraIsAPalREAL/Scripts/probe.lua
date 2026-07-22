@@ -1,27 +1,26 @@
 -- =========================================================================
--- CineCam subsystem: probe — camera recon (run before building phase B)
+-- TheCameraIsAPal subsystem: probe — passive camera / signal recon
 --
--- Discovery is handled by main.lua; this subsystem answers the rest:
---   [B] Vanilla values for every property the camera rig will touch.
---   [C] Whether the game REASSERTS those values per frame or writes stick,
---       including which FVector write path works on this UE4SS build
---       (struct field write vs whole-struct table assignment).
---   [D] The camera manager's real class name and modifier stack contents.
---   [E] Live validation of every signal main.lua derives:
---       holster index, bRequestSprint, movement mode, look input.
+-- Pass 1 (2026-07-21) confirmed:
+--   arm = PalShooterSpringArmComponent  (pawn.CameraBoom)
+--   cam = PalCharacterCameraComponent   (pawn.FollowCamera)
+--   vanilla: arm 400, SocketOffset (0,0,0), FOV 70, lag disabled
+--   camera manager: BP_PalPlayerCameraManager_C with standard modifier
+--   stack (CameraAnimationCameraModifier, CameraModifier_CameraShake)
 --
--- Two-pass usage:
---   Pass 1: WRITE_TEST = false. Load in, walk, sprint, jump, holster and
---           draw the weapon. Read the log; confirm [B]/[D]/[E].
---   Pass 2: WRITE_TEST = true. Load in and STAND STILL, camera untouched,
---           for ~10 seconds. Read the [C] VERDICT lines.
+-- IMPORTANT: keep WRITE_TEST = false permanently. The rig now writes
+-- TargetArmLength / FieldOfView / SocketOffset every tick and carries its
+-- own reassert detector, which supersedes the probe's write test — running
+-- both would have them fight each other. This subsystem remains useful for
+-- its [E] signal transition logging and the vanilla dump on each (re)spawn;
+-- remove it from main.lua's Subsystems list when moving past the dev phase.
 -- =========================================================================
 
-local WRITE_TEST      = false
-local WRITE_AT        = 3.0     -- s after cache before test writes
-local VERDICT_AT      = 9.0     -- s after cache to judge stickiness
-local ARM_DELTA       = 150.0   -- TargetArmLength += this
-local FOV_DELTA       = 10.0    -- FieldOfView += this
+local WRITE_TEST      = false   -- keep false; superseded by rig (see header)
+local WRITE_AT        = 3.0
+local VERDICT_AT      = 9.0
+local ARM_DELTA       = 150.0
+local FOV_DELTA       = 10.0
 local SAMPLE_INTERVAL = 1.0
 
 local M = { name = "probe" }
@@ -33,12 +32,12 @@ local verdictDone   = false
 local base          = {}
 local written       = {}
 local sockWritePath = "none"
-local C             = nil       -- ctx captured at OnCached
+local C             = nil
 
 local lastHolstered, lastSprint, lastMode, lastLooking = nil, nil, nil, nil
 
 local function dbg(fmt, ...)
-    print(string.format("[CineCam:probe] " .. fmt .. "\n", ...))
+    print(string.format("[TheCameraIsAPal:probe] " .. fmt .. "\n", ...))
 end
 
 local function ReadOpt(obj, prop)
@@ -133,7 +132,7 @@ local function DumpCameraManager()
     end
 end
 
--- ------------------------- [C] write test --------------------------------
+-- ------------------------- [C] write test (dormant) ----------------------
 
 local function ApplyWriteTest()
     dbg("---- [C] applying test writes (stand still!) ----")
@@ -145,14 +144,12 @@ local function ApplyWriteTest()
     end
     if C.arm and base.sockY ~= nil then
         written.sockY = 0.0
-        -- Path 1: field write through the struct proxy.
         local ok1 = pcall(function() C.arm.SocketOffset.Y = 0.0 end)
         local applied1 = false
         pcall(function() applied1 = math.abs(C.arm.SocketOffset.Y) < 0.01 end)
         if ok1 and applied1 then
             sockWritePath = "field"
         else
-            -- Path 2: whole-struct table assignment.
             local x, z = 0, 0
             pcall(function()
                 local so = C.arm.SocketOffset
@@ -236,7 +233,7 @@ function M.OnTick(dt, ctx, sig)
         lastLooking = sig.userLooking
     end
 
-    -- [C] write-test timeline
+    -- [C] write-test timeline (dormant while WRITE_TEST = false)
     if WRITE_TEST and not wroteTest and t >= WRITE_AT then
         wroteTest = true
         ApplyWriteTest()
