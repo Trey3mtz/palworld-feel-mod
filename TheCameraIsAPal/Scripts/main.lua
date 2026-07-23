@@ -41,6 +41,7 @@ local Subsystems = {
     require("jump"),
     require("walking"),
     require("slide"),
+    require("climb")
 }
 
 local DEBUG = true
