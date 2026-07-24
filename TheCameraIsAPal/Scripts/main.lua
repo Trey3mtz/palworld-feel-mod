@@ -39,9 +39,9 @@ local UEHelpers = require("UEHelpers")
 -- CHANGED: jumpspot added.
 local Subsystems = {
     require("jump"),
-    require("walking"),
+    require("horizontalmove"),
     require("slide"),
-    require("climb")
+    require("climb"),
 }
 
 local DEBUG = true
