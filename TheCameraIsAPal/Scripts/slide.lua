@@ -54,7 +54,7 @@ local OVERRIDES = {
 -- 250 on a 605 entry is ~40%, comfortably above the ~20% needed for a speed
 -- change to register at all.
 local ENTRY_BOOST_MULT = 1.00
-local ENTRY_BOOST_ADD  = 250
+local ENTRY_BOOST_ADD  = 50
 local ENTRY_HOLD       = 0.40   -- s the floor is held flat (beats SubRate decay)
 local ENTRY_RELEASE    = 0.35   -- s easing the floor away afterwards
 
@@ -63,10 +63,10 @@ local JUMP_BOOST_ADD   = 250
 local JUMP_HOLD        = 0.10   -- air is ballistic; the write just has to land
 local JUMP_RELEASE     = 0.10
 
-local BOOST_CEILING    = 1200   -- keep in step with SlidingMaxSpeed
+local BOOST_CEILING    = 1000   -- keep in step with SlidingMaxSpeed
 local BOOST_MIN_SPEED  = 120    -- no kick out of a standstill crouch
 local JUMP_VZ_MIN      = 150    -- separates a jump from walking off a ledge
-local JUMP_GRACE       = 0.20   -- s after slide ends that a jump still counts
+local JUMP_GRACE       = 0.12   -- s after slide ends that a jump still counts
 
 local DEBUG = true
 
