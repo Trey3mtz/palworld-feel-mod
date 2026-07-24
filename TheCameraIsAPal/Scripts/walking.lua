@@ -69,7 +69,9 @@ local KEEP_MAX_DOT    = 0.995   -- above this the player is going straight
 local KEEP_MIN_ANALOG = 0.35    -- must be actively holding input
 local KEEP_MIN_SPEED  = 80      -- no point restoring a crawl
 local KEEP_DECAY      = 200     -- uu/s^2 the remembered speed bleeds off
-
+local KEEP_MIN_DOT = 0.0   -- retention assists forward arcs only; the
+                           -- -0.35..0 band is half-reversal territory
+                           
 -- ---- wall contact ----
 local WALL_DECEL = 6000   -- uu/s^2; no braking path reaches this with input held inside the retention window
 local WALL_HOLD  = 0.20   -- s the latch persists past the last impact frame
@@ -430,7 +432,7 @@ local function RetainTurnSpeed(dt, cmc, f, walled)
 
     -- Straight line: leave the engine alone. Hard reversal: that belongs to
     -- the sliding turn, not here.
-    if dot > KEEP_MAX_DOT or dot < TURN_DOT then
+    if dot > KEEP_MAX_DOT or dot < KEEP_MIN_DOT then
         keepActive = false
         return
     end
