@@ -116,6 +116,7 @@ local function Unequip()
         dbg("Unequip failed: %s", tostring(err))
         return false
     end
+    dbg("[after changed to nil] OverrideWeapontype: %s ", shooter.OverrideWeapontype)
     LastEquippedWeapon = w
     return true
 end
