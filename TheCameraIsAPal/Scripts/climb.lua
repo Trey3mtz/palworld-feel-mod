@@ -97,29 +97,28 @@ local JUMP_DETECT_VZ = 600
 local IDLE_BAND      = 25
 local DOWN_BAND      = -60
 
--- ---- climb jump: directional leaps (BotW buckets) ----
--- Classified from cached pre-detach climb velocity by angle from the
--- wall-up axis: <22.5 deg = UP, 22.5-67.5 = DIAG, >67.5 = SIDE.
--- vz is the one-shot vertical impulse; side is the per-frame lateral
--- carry along the wall. UP preserves the previous 1550; DIAG/SIDE are
--- starting values for tuning at G=5.
-local JUMP_DIRS = {
-    UP   = { vz = 1550, side = 0    },
-    DIAG = { vz = 1250, side = 900  },
-    SIDE = { vz = 700,  side = 1400 },
-}
-local CLIMB_JUMP_GRAVITY = 5.0
-local HUG_IN             = 150    -- into-wall carry, common to all buckets
-local REGRAB_VZ          = 0      -- probe for attach at/below this vz
-local HUG_TIMEOUT        = 1.5
+-- ---- climb jump: directional leaps (equal-distance, driven) ----
+-- Every hug leap travels LEAP_DIST at LEAP_SPEED along its wall-plane
+-- direction -- identical magnitude in all directions by construction,
+-- because the velocity vector is driven every frame rather than
+-- launched ballistically. SIDE is purely horizontal (Velocity.Z written
+-- 0 each frame). Gravity is zeroed during the drive; jump.lua's bands
+-- resume the frame after the leap ends (it writes every mode-3 frame
+-- and runs before us).
+local LEAP_SPEED    = 900    -- uu/s along the leap direction
+local LEAP_DIST     = 250    -- uu of travel before the attach check
+local LEAP_ANGLES   = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 }
+local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
+
+
+
 
 -- ---- climb jump: forced-attach probe ----
 local PROBE_DIST   = 40     -- swept distance into the wall facing
 local PROBE_BLOCK  = 0.5    -- moved/commanded below this = wall present
 
 -- ---- climb jump: attach verification ----
-local ATTACH_RETRY_S   = 0.15   -- spacing after an attach that didn't stick
-local ATTACH_MAX_TRIES = 4      -- then stop forcing; organic grab/timeout
+local ATTACH_MAX_TRIES = 3      -- then stop forcing; organic grab/timeout
 
 -- ---- climb jump: hop away (DOWN) ----
 local HOP_VZ    = 620
@@ -270,23 +269,18 @@ end
 -- ClimbMaxSpeed = 0 doubles as the input lock.
 -- =========================================================================
 
-local function BeginWallSlide(cmc, entryVz)
-    local v = math.min(math.abs(entryVz), VZ_CAP)
-    slideV  = v * TRANSFER
-    sliding = true
-    savedClimbMax = ReadOpt(cmc, "ClimbMaxSpeed")
-    if savedClimbMax ~= nil then
-        local ok = pcall(function() cmc.ClimbMaxSpeed = 0 end)
-        if not ok then
-            dbg("WARN: ClimbMaxSpeed write failed -- input not locked")
-            savedClimbMax = nil
-        end
-    else
-        dbg("WARN: ClimbMaxSpeed unreadable -- input not locked")
-    end
-    dbg("slide start: entryVz=%.0f v0=%.0f (est dist %.0f uu) lock=%s",
-        entryVz, slideV, (slideV * slideV) / (2 * DECEL),
-        tostring(savedClimbMax ~= nil))
+local function BeginWallHugLeap(pawn, cmc, bucket, sideSign)
+    local ang = math.rad(LEAP_ANGLES[bucket])
+    cj = { mode = "hug", kind = bucket, t = 0, f = prevWallFwd,
+           upVel   = math.cos(ang) * LEAP_SPEED,
+           sideVel = math.sin(ang) * LEAP_SPEED * sideSign,
+           driveT  = LEAP_DIST / LEAP_SPEED,
+           l0 = GetLoc(pawn),
+           probes = 0, tries = 0, logged = false }
+    M.InClimbJump = true
+    dbg("climb jump [%s%s] -> driven leap (speed=%d dist=%d up=%d side=%d)",
+        bucket, sideSign ~= 0 and (sideSign > 0 and "/R" or "/L") or "",
+        LEAP_SPEED, LEAP_DIST, math.floor(cj.upVel), math.floor(cj.sideVel))
 end
 
 local function EndWallSlide(cmc, reason)
@@ -505,7 +499,7 @@ end
 
 local function BeginHopAway(pawn, cmc, bucket)
     cj = { mode = "hop", kind = bucket, t = 0, f = prevWallFwd,
-           z0 = prevClimbZ or GetZ(pawn) }
+           l0 = GetLoc(pawn) }
     M.InClimbJump = true
     pcall(function() cmc.Velocity.Z = HOP_VZ end)
     SetHorizVel(cmc, -prevWallFwd.X * HOP_OUT, -prevWallFwd.Y * HOP_OUT)
@@ -515,10 +509,15 @@ end
 
 local function EndClimbJump(pawn, cmc, reason)
     if cj == nil then return end
-    local z = GetZ(pawn)
-    dbg("  climb jump end [%s/%s]: %s  t=%.0fms net=%+.0f uu probes=%d",
-        cj.kind, cj.mode, reason, cj.t * 1000,
-        (z and cj.z0) and (z - cj.z0) or 0, cj.probes or 0)
+    local l = GetLoc(pawn)
+    local dz, dp = 0, 0
+    if l ~= nil and cj.l0 ~= nil then
+        dz = l.Z - cj.l0.Z
+        local dx, dy = l.X - cj.l0.X, l.Y - cj.l0.Y
+        dp = math.sqrt(dx * dx + dy * dy)
+    end
+    dbg("  climb jump end [%s/%s]: %s  t=%.0fms dz=%+.0f planar=%.0f probes=%d",
+        cj.kind, cj.mode, reason, cj.t * 1000, dz, dp, cj.probes or 0)
     cj = nil
     M.InClimbJump = false
 end
@@ -565,66 +564,56 @@ local function TickHug(dt, pawn, cmc, mode, inClimb)
         EndClimbJump(pawn, cmc, "attached")
         return
     end
-    -- Left Falling without entering climb: landed on a ledge top
-    -- (mode 1, the vault case) or another state grabbed us. Stop.
     if mode ~= 3 then
         EndClimbJump(pawn, cmc,
             string.format("left falling (mode %d)", mode))
         return
     end
-    if cj.t > HUG_TIMEOUT then
-        EndClimbJump(pawn, cmc, "hug timeout")
-        return
-    end
-
-    -- Own gravity for the whole leap (jump.lua wrote its band this
-    -- frame; we run after it).
-    pcall(function() cmc.GravityScale = CLIMB_JUMP_GRAVITY end)
 
     local f = cj.f
-    local rx, ry = -f.Y, f.X
-    SetHorizVel(cmc,
-        f.X * HUG_IN + rx * cj.sideVel * cj.side,
-        f.Y * HUG_IN + ry * cj.sideVel * cj.side)
-    FaceYaw(pawn, f)
 
-    -- Past apex: probe with BOTH sensors; attach only on agreement.
-    -- Attempts are spaced and capped so a refused attach can never
-    -- hammer the component (12:46:36: ~70 per-frame attach writes
-    -- against a rim perch the game kept rejecting).
-    local vz = 0
-    pcall(function() vz = cmc.Velocity.Z end)
-    if vz <= REGRAB_VZ and cj.tries < ATTACH_MAX_TRIES
-       and cj.t >= cj.nextTry then
-        local swept, moved = ProbeWall(pawn, f)
-        local traced = TraceWallTest(pawn, f, cj)
-        cj.probes = (cj.probes or 0) + 1
+    if cj.t <= cj.driveT + ATTACH_WINDOW then
+        -- Drive phase (and window): the velocity vector is fully owned.
+        pcall(function() cmc.GravityScale = 0.0 end)
+        local rx, ry = -f.Y, f.X
+        SetHorizVel(cmc,
+            f.X * HUG_IN + rx * cj.sideVel,
+            f.Y * HUG_IN + ry * cj.sideVel)
+        pcall(function() cmc.Velocity.Z = cj.upVel end)
+        FaceYaw(pawn, f)
+    end
 
-        if swept == true and traced == true then
-            local canBefore = ReadOpt(comp, "CanClimbing")
-            local okMode, okCan, okIs = ForceClimbAttach(cmc)
-            cj.tries   = cj.tries + 1
-            cj.nextTry = cj.t + ATTACH_RETRY_S
-            dbg("  probes agree (moved %.1f/%d) -> forced attach #%d at "
-                .. "t=%.0fms vz=%.0f (mode=%s can=%s is=%s, before can=%s)",
-                moved, PROBE_DIST, cj.tries, cj.t * 1000, vz,
-                tostring(okMode), tostring(okCan), tostring(okIs),
-                tostring(canBefore))
-            if cj.tries >= ATTACH_MAX_TRIES then
-                dbg("  attach not taking after %d tries -- flying on; "
-                    .. "organic grab or timeout decides", cj.tries)
+    if cj.t >= cj.driveT then
+        -- Attach window: the leap's scheduled end. Both sensors must
+        -- agree; attempts bounded by the window and the try cap.
+        if cj.tries < ATTACH_MAX_TRIES then
+            local swept, moved = ProbeWall(pawn, f)
+            local traced = TraceWallTest(pawn, f, cj)
+            cj.probes = (cj.probes or 0) + 1
+
+            if swept == true and traced == true then
+                local canBefore = ReadOpt(comp, "CanClimbing")
+                local okMode, okCan, okIs = ForceClimbAttach(cmc)
+                cj.tries = cj.tries + 1
+                dbg("  probes agree (moved %.1f/%d) -> forced attach #%d "
+                    .. "at t=%.0fms (mode=%s can=%s is=%s, before can=%s)",
+                    moved, PROBE_DIST, cj.tries, cj.t * 1000,
+                    tostring(okMode), tostring(okCan), tostring(okIs),
+                    tostring(canBefore))
+            elseif swept ~= nil and traced ~= nil and swept ~= traced then
+                if not cj.logged then
+                    cj.logged = true
+                    dbg("  probes DISAGREE at t=%.0fms: sweep=%s trace=%s",
+                        cj.t * 1000, tostring(swept), tostring(traced))
+                end
             end
-        elseif swept ~= nil and traced ~= nil and swept ~= traced then
-            if not cj.logged then
-                cj.logged = true
-                dbg("  probes DISAGREE at t=%.0fms: sweep=%s trace=%s -- "
-                    .. "no attach, flying on", cj.t * 1000,
-                    tostring(swept), tostring(traced))
-            end
-        elseif swept == false and not cj.logged then
-            cj.logged = true
-            dbg("  wall probe open (moved %.1f/%d) at t=%.0fms -- flying on",
-                moved or -1, PROBE_DIST, cj.t * 1000)
+        end
+
+        if cj.t > cj.driveT + ATTACH_WINDOW then
+            -- No confirmed wall at the leap's end: continue in the
+            -- direction we were going, detached. Gravity control
+            -- returns to jump.lua next frame.
+            EndClimbJump(pawn, cmc, "no wall at leap end -- free fall")
         end
     end
 end
