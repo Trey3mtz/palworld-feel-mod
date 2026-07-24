@@ -109,6 +109,11 @@ local HOP_LOCK  = 0.20
 
 local LOCK_ROTATION = true
 
+
+-- ---- component flag reconciliation ----
+local RECONCILE_TICKS = 3   -- consecutive desynced ticks before repair
+
+
 -- =========================================================================
 -- 2. MODULE + STATE
 -- =========================================================================
@@ -143,6 +148,11 @@ local cj             = nil
 local CAP_PRE, CAP_POST = 12, 30
 local ring, ringN, capLeft = {}, 0, 0
 local prevCan, prevIs, prevCustom = nil, nil, nil
+
+-- ---- flag watch state ----
+local prevFlagIs, prevFlagCan, prevFlagEnding = nil, nil, nil
+local stuckIsTicks = 0
+local KSL = nil             -- KismetSystemLibrary default object, lazy
 
 -- =========================================================================
 -- 3. UTILITIES
@@ -376,6 +386,14 @@ local function ProbeWall(pawn, f)
 end
 
 
+-- Write the component into the ORGANIC post-attach signature
+-- (is=true can=true ending=false, per flag edges at 12:31:29 and
+-- 12:31:46). The mode-only experiment attached mechanically but left
+-- the component unaware -- is=false/ending=true while climbing -- so
+-- the next detach ran no cooldown and the game re-grabbed the wall
+-- 24ms into the following climb jump. Mimicking the organic signature
+-- makes the detach path run normally; the reconciler remains the
+-- safety net for flags our own maneuvers leave behind.
 local function ForceClimbAttach(cmc)
     if not IsLive(comp) then
         dbg("WARN: climb component stale -- attach skipped")
@@ -389,8 +407,105 @@ local function ForceClimbAttach(cmc)
             cmc.CustomMovementMode = 5
         end)
     end
-    local okIs = pcall(function() comp.IsClimbing = true end)
+    local okIs = pcall(function()
+        comp.IsClimbing = true
+        comp.IsEnding   = false
+    end)
     return okMode, okCan, okIs
+end
+
+-- Always-on flag history: any change of the component's state booleans is
+-- logged with mode context. IsEnding included -- the dump shows a scripted
+-- vault-to-top subsystem whose state can presumably desync the same way.
+local function LogComponentFlagEdges(mode, custom)
+    if not DEBUG then return end
+    local is     = ReadOpt(comp, "IsClimbing")
+    local can    = ReadOpt(comp, "CanClimbing")
+    local ending = ReadOpt(comp, "IsEnding")
+    if is ~= prevFlagIs or can ~= prevFlagCan or ending ~= prevFlagEnding then
+        dbg("flags: is=%s can=%s ending=%s (mode %d/%d)",
+            tostring(is), tostring(can), tostring(ending), mode, custom)
+        prevFlagIs, prevFlagCan, prevFlagEnding = is, can, ending
+    end
+end
+
+-- Repair the observed desync: IsClimbing latched true while not climbing.
+-- Waits N consecutive ticks so the game's own detach transition frames
+-- are never fought. CanClimbing is deliberately left alone -- its
+-- cooldown is the component's business, and forcing it is how we got
+-- here in the first place.
+local function ReconcileStuckClimbFlag(inClimb)
+    if inClimb then stuckIsTicks = 0 return end
+    if ReadOpt(comp, "IsClimbing") ~= true then stuckIsTicks = 0 return end
+    stuckIsTicks = stuckIsTicks + 1
+    if stuckIsTicks >= RECONCILE_TICKS then
+        local ok = pcall(function() comp.IsClimbing = false end)
+        dbg("reconciled stuck IsClimbing -> false (write ok=%s)", tostring(ok))
+        stuckIsTicks = 0
+    end
+end
+
+local function TraceWallTest(pawn, f, cjState)
+    if not IsLive(KSL) then
+        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        if not IsLive(KSL) then return nil end
+    end
+    local l = GetLoc(pawn)
+    if l == nil then return nil end
+
+    local rayLen  = ReadOpt(comp, "Const_ForwardRayLength") or 80.0
+    local channel = ReadOpt(comp, "Const_RayChannel") or 0
+    local complex = ReadOpt(comp, "TraceComplex") or false
+    local finish  = { X = l.X + f.X * rayLen, Y = l.Y + f.Y * rayLen, Z = l.Z }
+
+    local hit, out = nil, {}
+    local ok = pcall(function()
+        hit = KSL:LineTraceSingle(pawn, l, finish, channel, complex, {},
+            2, out, true,
+            { R = 1.0, G = 0.0, B = 0.0, A = 1.0 },
+            { R = 0.0, G = 1.0, B = 0.0, A = 1.0 }, 2.0)
+    end)
+    if not ok then
+        dbg("  trace: LineTraceSingle call failed")
+        return nil
+    end
+
+    if cjState.lastTrace == nil or cjState.lastTrace ~= hit then
+        cjState.lastTrace = hit
+        local nz, dist = "?", "?"
+        pcall(function() nz   = string.format("%+.2f", out.ImpactNormal.Z) end)
+        pcall(function() dist = string.format("%.1f", out.Distance) end)
+        dbg("  trace: hit=%s dist=%s normalZ=%s", tostring(hit), dist, nz)
+    end
+    return hit
+end
+
+-- One-shot out-struct characterization. Every wall tested is vertical,
+-- where normalZ=0.00 is both the true value and the zero-init value, so
+-- wall hits cannot distinguish a populated normal from a dead struct. A
+-- floor trace can: its normal is +1.00 by definition. Runs once per pawn.
+local function CharacterizeTraceStruct(pawn)
+    if not IsLive(KSL) then
+        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        if not IsLive(KSL) then return end
+    end
+    local l = GetLoc(pawn)
+    if l == nil then return end
+    local out, hit = {}, nil
+    local ok = pcall(function()
+        hit = KSL:LineTraceSingle(pawn, l,
+            { X = l.X, Y = l.Y, Z = l.Z - 200 },
+            ReadOpt(comp, "Const_RayChannel") or 0, false, {},
+            0, out, true,
+            { R = 1.0, G = 0.0, B = 0.0, A = 1.0 },
+            { R = 0.0, G = 1.0, B = 0.0, A = 1.0 }, 0.0)
+    end)
+    if not ok then dbg("floor trace: call failed") return end
+    local nz, dist = "?", "?"
+    pcall(function() nz   = string.format("%+.2f", out.ImpactNormal.Z) end)
+    pcall(function() dist = string.format("%.1f", out.Distance) end)
+    dbg("floor trace: hit=%s dist=%s normalZ=%s  (+1.00 = normals live, "
+        .. "+0.00 = struct dead)", tostring(hit), dist, nz)
 end
 
 local function BeginWallHugLeap(pawn, cmc, kind, sideSign)
@@ -485,6 +600,7 @@ local function TickHug(dt, pawn, cmc, mode, inClimb)
     pcall(function() vz = cmc.Velocity.Z end)
     if vz <= REGRAB_VZ then
         local hit, moved = ProbeWall(pawn, f)
+        TraceWallTest(pawn, f, cj)      -- parallel diagnostic; not gating yet
         cj.probes = (cj.probes or 0) + 1
         if hit == true then
             local canBefore = ReadOpt(comp, "CanClimbing")
@@ -603,6 +719,9 @@ function M.OnPlayerCached(pawn, cmc)
     cj             = nil
     M.InClimbJump  = false
     hbT = 0
+    prevFlagIs, prevFlagCan, prevFlagEnding = nil, nil, nil
+    stuckIsTicks = 0
+    KSL = nil
     ring, ringN, capLeft = {}, 0, 0
     prevCan, prevIs, prevCustom = nil, nil, nil
 
@@ -612,6 +731,7 @@ function M.OnPlayerCached(pawn, cmc)
         dbg("component: %s  ClimbMaxSpeed=%s  fwdRay=%s",
             compName, tostring(ReadOpt(cmc, "ClimbMaxSpeed")),
             tostring(ReadOpt(comp, "Const_ForwardRayLength")))
+        CharacterizeTraceStruct(pawn)
     end
 end
 
@@ -645,30 +765,19 @@ function M.OnTick(dt, pawn, cmc)
     local inClimb = (mode == 6 and custom == 5)
 
     RememberFallSpeed(mode, cmc)
-
-    -- Diagnostic heartbeat: component flag state once per second while
-    -- airborne. Answers whether CanClimbing sticks after an air-climb hop.
-    if DEBUG and mode == 3 then
-        hbT = hbT + dt
-        if hbT >= 1.0 then
-            hbT = 0
-            dbg("air: can=%s is=%s",
-                tostring(ReadOpt(comp, "CanClimbing")),
-                tostring(ReadOpt(comp, "IsClimbing")))
-        end
-    else
-        hbT = 0
-    end
+    LogComponentFlagEdges(mode, custom)
 
     local jumpEdge = DetectClimbJump(pawn, cmc, mode)
     TickClimbJump(dt, pawn, cmc, mode, inClimb)
 
     -- FIX A: TickClimbJump may have force-attached this very tick; the
-    -- slide, frame cache, and prevCustomIs5 must see the real state.
+    -- reconcile, slide, frame cache, and prevCustomIs5 must see the real
+    -- state.
     mode    = cmc.MovementMode
     custom  = ReadOpt(cmc, "CustomMovementMode") or 0
     inClimb = (mode == 6 and custom == 5)
 
+    ReconcileStuckClimbFlag(inClimb)
     UpdateWallSlide(dt, pawn, cmc, inClimb)
     CacheClimbFrame(pawn, cmc, inClimb)
 
