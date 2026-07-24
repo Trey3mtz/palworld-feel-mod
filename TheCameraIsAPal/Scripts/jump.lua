@@ -12,17 +12,17 @@
 --                  it — polling is the only working release signal.
 -- =========================================================================
 
-local JumpVel                  = 900
-local LaunchMultiplier         = 1.275 -- This value perfectly counter's increased gravity back to vanilla launch feel
+local JumpVel                  = 1050
+local LaunchMultiplier         = 2.5 -- This value perfectly counter's increased gravity back to vanilla launch feel
 local TargetGravity            = 1.8
 local TargetGravityExtreme     = 4
 local VanillaGravity           = 2.6   -- original game vanilla is 1.6
-local LowGravity               = 1.4
+local LowGravity               = 1.55
 local NegativeThreshold        = -150  -- uu/s
 local NegativeThresholdExtreme = -450
-local PositiveThreshold        = 20
-local CutMultiplier            = 0.65   -- rising Vz scale applied on release (nice)
-local JumpCutOn                = true   -- Turns the feature for jump cutting on/off
+local PositiveThreshold        = 55
+local CutMultiplier            = 0.25   -- rising Vz scale applied on release (nice)
+local JumpCutOn                = true  -- Turns the feature for jump cutting on/off
 
 -- Mod
 local M = { name = "jump" }
@@ -77,6 +77,10 @@ end
 
 function M.OnTick(dt, pawn, cmc)
     local _, _, released = JumpKey.Poll()   -- unconditional, first
+    local down, pressed, released = JumpKey.Poll()
+    M.KeyDown     = down
+    M.KeyPressed  = pressed
+    M.KeyReleased = released
 
     local mode = cmc.MovementMode
     if mode ~= 3 then       -- NOT Move_FALLING
@@ -87,9 +91,13 @@ function M.OnTick(dt, pawn, cmc)
     local vz = cmc.Velocity.Z
 
     -- Jump cut: only for jumps we started from the ground.
+    -- BUGGED, RELEASED LIKELY THE ISSUE
     if JumpCutOn and jumpInitiated and released and vz > 0 then
-        cmc.Velocity.Z = vz * CutMultiplier
-        vz = cmc.Velocity.Z
+        vz = vz * CutMultiplier
+        cmc.Velocity.Z = vz
+        jumpInitiated = false
+        released = false
+        jdbg("Jump CUT!")
     end
 
     -- Distinct velocity sections, checked deepest-first so exactly one
@@ -97,14 +105,14 @@ function M.OnTick(dt, pawn, cmc)
     if vz <= NegativeThresholdExtreme then
         cmc.GravityScale = TargetGravityExtreme   -- full falling acceleration
     elseif vz <= NegativeThreshold then
-        cmc.GravityScale = TargetGravity          -- build-up after the peak
+        cmc.GravityScale = TargetGravity          -- build-up after the peak of jump
     elseif vz < PositiveThreshold then
-        cmc.GravityScale = LowGravity             -- peak twilight
+        cmc.GravityScale = LowGravity             -- peak twilight of jump
     else
-        cmc.GravityScale = VanillaGravity         -- fast rise
+        cmc.GravityScale = TargetGravityExtreme   -- fast rise
     end
 
-    if vz < 0 and jumpInitiated then
+    if vz < -0.01 and jumpInitiated then
         jumpInitiated = false
     end
 end
