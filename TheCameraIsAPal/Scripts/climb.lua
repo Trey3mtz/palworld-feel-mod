@@ -67,6 +67,9 @@ local HUG_WRAP_COS   = -0.70   -- new-normal vs facing dot below this = corner t
                                -- sharp (~135 deg) -> detach; >= wraps.
                                -- -0.50~120, -0.70~135, -0.87~150
 local HUG_LOST_TICKS = 4       -- consecutive all-miss frames -> end leap
+local LEAD_RAY_BONUS = 8    -- uu of score preference for the ray angled
+                            -- toward travel; lets it win near-ties so
+                            -- corners are seen before the forward ray
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -80,6 +83,7 @@ local M = { name = "climb" }
 M.InClimbJump = false
 
 local comp, compName = nil, nil
+local capsuleRadius = 40 -- this is a fallback guess, I am unsure what the Player's radius is
 local savedOrient, savedCtrlRot = nil, nil
 
 -- ---- fall / climb frame cache ----
@@ -137,6 +141,54 @@ local function IsLive(obj)
     return ok and valid == true
 end
 
+
+
+-- Rotates the leap's facing toward the wall, capped per frame so a single
+-- bad normal can't whip the player around.
+local function SlewFacingToward(dt, targetX, targetY)
+    local currentAngle = math.atan(climbJumpState.faceDir.Y, climbJumpState.faceDir.X)
+    local targetAngle  = math.atan(targetY, targetX)
+
+    local angleDelta = targetAngle - currentAngle
+    while angleDelta >  math.pi do angleDelta = angleDelta - 2 * math.pi end
+    while angleDelta < -math.pi do angleDelta = angleDelta + 2 * math.pi end
+
+    local maxTurnThisFrame = math.rad(HUG_YAW_RATE) * dt
+    if angleDelta >  maxTurnThisFrame then angleDelta =  maxTurnThisFrame end
+    if angleDelta < -maxTurnThisFrame then angleDelta = -maxTurnThisFrame end
+
+    local newAngle = currentAngle + angleDelta
+    climbJumpState.faceDir = { X = math.cos(newAngle), Y = math.sin(newAngle) }
+end
+
+-- Sets the inward velocity that pulls toward HUG_TARGET. Only trusted when
+-- near-parallel: off-angle, the ray hits obliquely and reads longer than
+-- the true perpendicular gap, which would drive the correction backwards.
+local function UpdateGapCorrection(gap, facingAlignment)
+    local gapReadingIsTrustworthy = facingAlignment >= HUG_PARALLEL
+    if not gapReadingIsTrustworthy then
+        climbJumpState.inVel = 0
+        return
+    end
+
+    local gapError = gap - HUG_TARGET
+    local correction = gapError * HUG_IN_GAIN
+    climbJumpState.inVel = math.max(-HUG_IN_MAX, math.min(HUG_IN_MAX, correction))
+end
+
+-- No ray found the wall this frame. Coast on the last known facing; give up
+-- once it's been gone long enough to mean the wall genuinely ended.
+local function HandleLostWall()
+    climbJumpState.framesWithoutWall = climbJumpState.framesWithoutWall + 1
+    climbJumpState.inVel = 0
+
+    local wallIsGoneForGood = climbJumpState.framesWithoutWall >= HUG_LOST_TICKS
+    if wallIsGoneForGood then
+        EndClimbJumpState()
+        return false
+    end
+    return true
+end
 
 -- Fires three traces in a fan around the current wall facing and returns
 -- the best hit, or nil if the wall was lost this frame.
@@ -373,6 +425,51 @@ end
 -- leap with a scheduled attach window, or DOWN hop away.
 -- =========================================================================
 
+
+-- Drives the leap: along-wall travel from the eased speed curve, the
+-- inward correction that holds the gap, and the vertical component.
+local function ApplyHugVelocity(pawn, cmc)
+    local faceDir = climbJumpState.faceDir
+    local alongWallX, alongWallY = -faceDir.Y, faceDir.X
+
+    local leapProgress =
+        math.min(climbJumpState.deltaTime / climbJumpState.driveTime, 1.0)
+    local driveSpeed = LEAP_EASE(LEAP_SPEED_START, LEAP_SPEED_END, leapProgress)
+
+    local inwardSpeed = climbJumpState.inVel or 0
+
+    SetHorizVel(cmc,
+        alongWallX * climbJumpState.dirSide * driveSpeed + faceDir.X * inwardSpeed,
+        alongWallY * climbJumpState.dirSide * driveSpeed + faceDir.Y * inwardSpeed)
+    pcall(function() cmc.Velocity.Z = climbJumpState.dirUp * driveSpeed end)
+
+    FaceYaw(pawn, faceDir)
+end
+
+-- The leap's scheduled end: both sensors must confirm a wall before the
+-- attach is forced. Gives up once the window closes.
+local function TryAttachToWall(pawn, cmc)
+    local faceDir = climbJumpState.faceDir
+
+    local hasAttemptsLeft = climbJumpState.tries < ATTACH_MAX_TRIES
+    if hasAttemptsLeft then
+        local sweptIntoWall = ProbeWall(pawn, faceDir)
+        local tracedWall    = TraceWallTest(pawn, faceDir, climbJumpState)
+
+        local bothSensorsAgree = (sweptIntoWall == true) and (tracedWall == true)
+        if bothSensorsAgree then
+            ForceClimbAttach(cmc)
+            climbJumpState.tries = climbJumpState.tries + 1
+        end
+    end
+
+    local attachWindowHasClosed =
+        climbJumpState.deltaTime > climbJumpState.driveTime + ATTACH_WINDOW
+    if attachWindowHasClosed then
+        EndClimbJumpState()
+    end
+end
+
 -- Returns bucket, sideSign. Angle is measured from the wall-up axis in
 -- the wall plane. Neutral maps to UP (BotW: no direction held = straight
 -- up). Velocity-based for now; see the input diagnostic in
@@ -470,6 +567,41 @@ local function TraceWallTest(pawn, f, climbJumpState)
         dbg("  trace: hit=%s dist=%s normalZ=%s", tostring(hit), dist, nz)
     end
     return hit
+end
+
+-- Turns a wall reading into a facing update and a gap correction.
+-- Returns false when the leap should end (corner too sharp, or the wall
+-- has been out of sight too long); true to keep going.
+local function TrackWallSurface(dt, wallHit)
+    if wallHit == nil then
+        return HandleLostWall()
+    end
+
+    climbJumpState.framesWithoutWall = 0
+
+    local towardWallX = -wallHit.normalX
+    local towardWallY = -wallHit.normalY
+    local length = math.sqrt(towardWallX * towardWallX + towardWallY * towardWallY)
+
+    local normalIsUsable = length > 1e-3
+    if not normalIsUsable then return true end
+
+    towardWallX = towardWallX / length
+    towardWallY = towardWallY / length
+
+    local facingAlignment =
+        climbJumpState.faceDir.X * towardWallX +
+        climbJumpState.faceDir.Y * towardWallY
+
+    local cornerIsTooSharpToWrap = facingAlignment < HUG_WRAP_COS
+    if cornerIsTooSharpToWrap then
+        EndClimbJumpState()
+        return false
+    end
+
+    SlewFacingToward(dt, towardWallX, towardWallY)
+    UpdateGapCorrection(wallHit.gap, facingAlignment)
+    return true
 end
 
 -- One-shot out-struct characterization: a floor's normal is +1.00 by
@@ -579,164 +711,37 @@ local function StartClimbJump(pawn, cmc)
     end
 end
 
--- Main Logic For Jumping, isClimbing decided by game's code for movementMode
+-- Per-frame driver for a wall-hug climb jump. Ends when the leap attaches,
+-- lands, loses the wall, or runs out its window.
 local function TickHugWall(dt, pawn, cmc, mode, isClimbing)
-    local isNotFalling = mode ~= 3
-
     if isClimbing then
-        EndClimbJumpState(pawn, cmc, "attached")
-        return
-    end
-    if isNotFalling then
-        EndClimbJumpState(pawn, cmc,
-            string.format("left falling (mode %d)", mode))
+        EndClimbJumpState()
         return
     end
 
-    -- faceDir is representative of movement input / normalized left thumbstick values of when we began the jump state
-    local faceDir = climbJumpState.faceDir
+    local hasLeftFalling = mode ~= 3
+    if hasLeftFalling then
+        EndClimbJumpState()
+        return
+    end
 
-    -- if (I am not timed out of my jump yet), then do this
-    if climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW then
-        -- Turn off gravity
+    local isWithinLeapWindow =
+        climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW
+
+    if isWithinLeapWindow then
         pcall(function() cmc.GravityScale = 0.0 end)
 
-        -- --- fan: three rays, wall-side biased, pick closest hit ---
-        local side = (climbJumpState.dirSide >= 0) and 1 or -1
-        local best = nil   -- { nx, ny, gap, deg }
-        if IsLive(KSL) then
-            local l = GetLoc(pawn)
-            if l ~= nil then
-                local ch = ReadOpt(comp, "Const_RayChannel") or 0
-                local function ray(deg)
-                    local a = math.rad(deg) * side
-                    local ca, sa = math.cos(a), math.sin(a)
-                    local dx = climbJumpState.faceDir.X * ca - climbJumpState.faceDir.Y * sa
-                    local dy = climbJumpState.faceDir.X * sa + climbJumpState.faceDir.Y * ca
-                    local out, hit = {}, nil
-                    pcall(function()
-                        hit = KSL:LineTraceSingle(pawn, l,
-                            { X = l.X + dx * HUG_RAY_LEN,
-                              Y = l.Y + dy * HUG_RAY_LEN, Z = l.Z },
-                            ch, false, {}, 0, out, false,
-                            {R=1,G=0,B=0,A=1},{R=0,G=1,B=0,A=1}, 0.0)
-                    end)
-                    if not hit then return end
-                    local nx, ny, d = nil, nil, nil
-                    pcall(function() nx = out.ImpactNormal.X end)
-                    pcall(function() ny = out.ImpactNormal.Y end)
-                    pcall(function() d  = out.Distance end)
-                    if type(nx) ~= "number" or type(d) ~= "number" then return end
-                    -- wall-side ray wins ties (leads the corner); else closest
-                    local score = d - (deg ~= 0 and 8 or 0)
-                    if best == nil or score < best.score then
-                        best = { nx = nx, ny = ny, gap = d, score = score }
-                    end
-                end
-                ray(HUG_FAN_DEG); ray(0); ray(-HUG_FAN_DEG)
-            end
-        end
+        local wallHit = SenseWall(pawn, climbJumpState.faceDir, climbJumpState.dirSide)
+        local leapShouldContinue = TrackWallSurface(dt, wallHit)
+        if not leapShouldContinue then return end
 
-        if best ~= nil then
-            climbJumpState.yawLost = 0
-            -- inward normal is the direction to face
-            local tx, ty = -best.nx, -best.ny
-            local tm = math.sqrt(tx*tx + ty*ty)
-            if tm > 1e-3 then
-                tx, ty = tx/tm, ty/tm
-                local fdotn = climbJumpState.faceDir.X*tx + climbJumpState.faceDir.Y*ty   -- facing . inward normal
-
-                -- corner too sharp to wrap -> detach, continue straight
-                if fdotn < HUG_WRAP_COS then
-                    EndClimbJumpState(pawn, cmc, "corner too sharp -- free fall")
-                    return
-                end
-
-                -- slew facing toward target normal, capped
-                local cur = math.atan(climbJumpState.faceDir.Y, climbJumpState.faceDir.X)
-                local tgt = math.atan(ty, tx)
-                local dA = tgt - cur
-                while dA >  math.pi do dA = dA - 2*math.pi end
-                while dA < -math.pi do dA = dA + 2*math.pi end
-                local maxA = math.rad(HUG_YAW_RATE) * dt
-                if dA >  maxA then dA =  maxA end
-                if dA < -maxA then dA = -maxA end
-                local na = cur + dA
-                climbJumpState.faceDir = { X = math.cos(na), Y = math.sin(na) }
-
-                -- distance hold: only when close to parallel (true gap)
-                if fdotn >= HUG_PARALLEL then
-                    local err = best.gap - HUG_TARGET
-                    climbJumpState.inVel = math.max(-HUG_IN_MAX,
-                                  math.min(HUG_IN_MAX, err * HUG_IN_GAIN))
-                else
-                    climbJumpState.inVel = 0
-                end
-            end
-        else
-            -- all rays miss: dead-reckon, count toward giving up
-            climbJumpState.yawLost = climbJumpState.yawLost + 1
-            climbJumpState.inVel = 0
-            if climbJumpState.yawLost >= HUG_LOST_TICKS then
-                EndClimbJumpState(pawn, cmc, "wall lost -- free fall")
-                return
-            end
-        end
-
-        -- --- apply velocity: along-wall drive + inward hold + up ---
-        local faceDir = climbJumpState.faceDir
-        local rx, ry = -faceDir.Y, faceDir.X
-        local spd = LEAP_EASE(LEAP_SPEED_START, LEAP_SPEED_END,
-                              math.min(climbJumpState.deltaTime / climbJumpState.driveTime, 1.0))
-        local inV = climbJumpState.inVel or 0
-        SetHorizVel(cmc,
-            rx * climbJumpState.dirSide * spd + faceDir.X * (HUG_IN + inV),
-            ry * climbJumpState.dirSide * spd + faceDir.Y * (HUG_IN + inV))
-        pcall(function() cmc.Velocity.Z = climbJumpState.dirUp * spd end)
-        FaceYaw(pawn, faceDir)
-
-        if DEBUG then
-            dbg("  hug t=%.0fms gap=%s face.n=%s in=%.0f",
-                climbJumpState.deltaTime*1000,
-                best and string.format("%.0f", best.gap) or "miss",
-                best and string.format("%+.2f",
-                    climbJumpState.faceDir.X*(-best.nx) + climbJumpState.faceDir.Y*(-best.ny)) or "?",
-                inV)
-        end
+        ApplyHugVelocity(pawn, cmc)
     end
 
-    if climbJumpState.deltaTime >= climbJumpState.driveTime then
-        -- Attach window: the leap's scheduled end. Both sensors must
-        -- agree; attempts bounded by the window and the try cap.
-        if climbJumpState.tries < ATTACH_MAX_TRIES then
-            local swept, moved = ProbeWall(pawn, faceDir)
-            local traced = TraceWallTest(pawn, faceDir, climbJumpState)
-            climbJumpState.probes = (climbJumpState.probes or 0) + 1
-
-            if swept == true and traced == true then
-                local canBefore = ReadOpt(comp, "CanClimbing")
-                local okMode, okCan, okIs = ForceClimbAttach(cmc)
-                climbJumpState.tries = climbJumpState.tries + 1
-                dbg("  probes agree (moved %.1f/%d) -> forced attach #%d "
-                    .. "at t=%.0fms (mode=%s can=%s is=%s, before can=%s)",
-                    moved, PROBE_DIST, climbJumpState.tries, climbJumpState.deltaTime * 1000,
-                    tostring(okMode), tostring(okCan), tostring(okIs),
-                    tostring(canBefore))
-            elseif swept ~= nil and traced ~= nil and swept ~= traced then
-                if not climbJumpState.logged then
-                    climbJumpState.logged = true
-                    dbg("  probes DISAGREE at t=%.0fms: sweep=%s trace=%s",
-                        climbJumpState.deltaTime * 1000, tostring(swept), tostring(traced))
-                end
-            end
-        end
-
-        if climbJumpState.deltaTime > climbJumpState.driveTime + ATTACH_WINDOW then
-            -- No confirmed wall at the leap's end: continue in the
-            -- direction we were going, detached. Priority releases in
-            -- EndClimbJump; jump.lua resumes gravity next tick.
-            EndClimbJumpState(pawn, cmc, "no wall at leap end -- free fall")
-        end
+    local hasReachedAttachWindow =
+        climbJumpState.deltaTime >= climbJumpState.driveTime
+    if hasReachedAttachWindow then
+        TryAttachToWall(pawn, cmc)
     end
 end
 
@@ -934,6 +939,10 @@ function M.OnPlayerCached(pawn, cmc)
     KSL            = nil
     ring, ringN, capLeft = {}, 0, 0
 
+    pcall(function()
+      capsuleRadius = pawn.CapsuleComponent.CapsuleRadius
+    end)
+  
     if comp == nil then
         dbg("climbing component NOT FOUND")
     else
