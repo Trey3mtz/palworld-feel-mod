@@ -83,7 +83,7 @@ local M = { name = "climb" }
 M.InClimbJump = false
 
 local comp, compName = nil, nil
-local capsuleRadius = 40 -- this is a fallback guess, I am unsure what the Player's radius is
+local capsuleRadius = 42 -- this is a fallback for radius someone on discord told me this
 local savedOrient, savedCtrlRot = nil, nil
 
 -- ---- fall / climb frame cache ----
