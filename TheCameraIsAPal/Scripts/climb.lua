@@ -70,6 +70,9 @@ local HUG_LOST_TICKS = 4       -- consecutive all-miss frames -> end leap
 local LEAD_RAY_BONUS = 8    -- uu of score preference for the ray angled
                             -- toward travel; lets it win near-ties so
                             -- corners are seen before the forward ray
+local ATTACH_MAX_GAP = 15   -- uu of clearance from the capsule surface at
+                            -- which a wall counts as grabbable
+
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -449,15 +452,13 @@ end
 -- The leap's scheduled end: both sensors must confirm a wall before the
 -- attach is forced. Gives up once the window closes.
 local function TryAttachToWall(pawn, cmc, wallHit)
-    local faceDir = climbJumpState.faceDir
     local hasAttemptsLeft = climbJumpState.tries < ATTACH_MAX_TRIES
-    
-    if hasAttemptsLeft then
-        local sweptIntoWall = ProbeWall(pawn, faceDir)
-        local tracedWall    = TraceWallTest(pawn, faceDir, climbJumpState)
+    local wallIsInReach   = (wallHit ~= nil) and (wallHit.gap <= ATTACH_MAX_GAP)
 
-        local bothSensorsAgree = (sweptIntoWall == true) and (tracedWall == true)
-        if bothSensorsAgree then
+    if hasAttemptsLeft and wallIsInReach then
+        local sweptIntoWall = ProbeWall(pawn, climbJumpState.faceDir)
+
+        if sweptIntoWall == true then
             ForceClimbAttach(cmc)
             climbJumpState.tries = climbJumpState.tries + 1
         end
