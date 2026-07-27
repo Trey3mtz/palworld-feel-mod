@@ -45,6 +45,13 @@ local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
 
 local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 
+-- ---- init climb: launch schedule ----
+local INIT_CLIMB_LAUNCH_GRACE = 0.10   -- s to leave the ground before the jump counts as refused
+local INIT_CLIMB_ATTACH_AT    = 0.06   -- s of air time before the first attach attempt
+local INIT_CLIMB_LOCK_TIME    = 0.30   -- s of air time before giving up
+local INIT_CLIMB_IN           = 240    -- uu/s into-wall drive during the launch
+local INIT_CLIMB_MAX_TRIES    = 3
+
 -- ---- climb jump: forced-attach probe ----
 local PROBE_DIST   = 40     -- swept distance into the wall facing
 local PROBE_BLOCK  = 0.5    -- moved/commanded below this = wall present
@@ -492,10 +499,29 @@ local function StartClimbFromGround(pawn, cmc, wall)
         tostring(ReadOpt(cmc, "JumpZVelocity")))
 end
   
+-- Runs from the frame the jump is requested until the pawn latches, the
+-- window closes, or the jump turns out never to have executed.
 local function DriveInitClimb(dt, pawn, cmc)
-    initClimbState.deltaTime = initClimbState.deltaTime + dt
+    if not initClimbState.hasLaunched then
+        initClimbState.deltaTime = initClimbState.deltaTime + dt
 
-    local windowHasClosed = initClimbState.deltaTime > INIT_CLIMB_LOCK_TIME
+        -- Jump() only raises bPressedJump; the character's movement tick is
+        -- what acts on it, so a frame or two of Walking here is expected.
+        local hasLeftTheGround = (cmc.MovementMode == 3)
+        if not hasLeftTheGround then
+            local jumpWasRefused = initClimbState.deltaTime > INIT_CLIMB_LAUNCH_GRACE
+            if jumpWasRefused then
+                EndInitClimb("jump never executed")
+            end
+            return
+        end
+
+        initClimbState.hasLaunched = true
+    end
+
+    initClimbState.airTime = initClimbState.airTime + dt
+
+    local windowHasClosed = initClimbState.airTime > INIT_CLIMB_LOCK_TIME
     if windowHasClosed then
         EndInitClimb("window closed without a latch")
         return
@@ -503,7 +529,7 @@ local function DriveInitClimb(dt, pawn, cmc)
 
     ApplyInitClimbVelocity(pawn, cmc)
 
-    local hasClearedTheGround = initClimbState.deltaTime >= INIT_CLIMB_ATTACH_AT
+    local hasClearedTheGround = initClimbState.airTime >= INIT_CLIMB_ATTACH_AT
     if not hasClearedTheGround then return end
 
     local hasLatched = TryInitClimbAttach(pawn, cmc)
@@ -866,6 +892,46 @@ local function EndClimbJumpState()
     climbJumpState = nil
     M.InClimbJump = false
     CommonState.ClimbHasPriority = false
+end
+
+local function EndInitClimb(reason)
+    if not M.InInitClimbState then return end
+    initClimbState     = nil
+    M.InInitClimbState = false
+    dbg("init climb end: %s", reason or "?")
+end
+
+-- Horizontal only. Vertical is jump.lua's, which is the entire reason
+-- StartClimbFromGround calls Jump() rather than launching the pawn itself.
+-- Rewriting X/Y every frame is what makes the launch uncontrollable.
+local function ApplyInitClimbVelocity(pawn, cmc)
+    local faceDir = initClimbState.faceDir
+    SetHorizVel(cmc, faceDir.X * INIT_CLIMB_IN, faceDir.Y * INIT_CLIMB_IN)
+    FaceYaw(pawn, faceDir)
+end
+
+-- Two-sensor agreement, same pair and same thresholds the climb jump uses:
+-- the ray must see the wall AND the swept capsule must be blocked by it.
+-- Returns whether the pawn came out of this in climb mode.
+local function TryInitClimbAttach(pawn, cmc)
+    local hasAttemptsLeft = initClimbState.tries < INIT_CLIMB_MAX_TRIES
+    if not hasAttemptsLeft then return false end
+
+    local wall = TraceAlongDirection(pawn, initClimbState.faceDir, HUG_RAY_LEN)
+    local wallIsInReach = (wall ~= nil) and (wall.gap <= ATTACH_MAX_GAP)
+    if not wallIsInReach then return false end
+
+    local sweptIntoWall = ProbeWall(pawn, initClimbState.faceDir)
+    if sweptIntoWall ~= true then return false end
+
+    ForceClimbAttach(cmc)
+    initClimbState.tries = initClimbState.tries + 1
+
+    -- Read back rather than trusting the write: ForceClimbAttach reports
+    -- whether its calls succeeded, not whether the component kept the mode.
+    local movementMode       = cmc.MovementMode
+    local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
+    return movementMode == 6 and customMovementMode == 5
 end
 
 local function DidClimbJumpStart(cmc, mode)
