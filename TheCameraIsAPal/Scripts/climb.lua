@@ -173,6 +173,36 @@ local function NormalizeXY(x, y)
     return { X = x / length, Y = y / length }
 end
 
+local function EndClimbJumpState()
+    if climbJumpState == nil then return end
+    climbJumpState = nil
+    M.InClimbJump = false
+    CommonState.ClimbHasPriority = false
+end
+
+-- Write the component into the ORGANIC post-attach signature
+-- (is=true can=true ending=false). Mode-only left it unaware (no
+-- cooldown, 24ms re-grabs); writes without ending=false left is=true
+-- stuck after hops. The reconciler remains the safety net.
+local function ForceClimbAttach(cmc)
+    if not IsLive(comp) then
+        dbg("WARN: climb component stale -- attach skipped")
+        return false, false, false
+    end
+    local okCan = pcall(function() comp.CanClimbing = true end)
+    local okMode = pcall(function() cmc:SetMovementMode(6, 5) end)
+    if not okMode then
+        okMode = pcall(function()
+            cmc.MovementMode = 6
+            cmc.CustomMovementMode = 5
+        end)
+    end
+    local okIs = pcall(function()
+        comp.IsClimbing = true
+        comp.IsEnding   = false
+    end)
+    return okMode, okCan, okIs
+end
 
 -- Rotates the leap's facing toward the wall, capped per frame so a single
 -- bad normal can't whip the player around.
@@ -470,6 +500,46 @@ end
 -- =========================================================================
 --  INIT CLIMB SEQUENCE
 -- =========================================================================
+
+local function EndInitClimb(reason)
+    if not M.InInitClimbState then return end
+    initClimbState     = nil
+    M.InInitClimbState = false
+    dbg("init climb end: %s", reason or "?")
+end
+
+-- Horizontal only. Vertical is jump.lua's, which is the entire reason
+-- StartClimbFromGround calls Jump() rather than launching the pawn itself.
+-- Rewriting X/Y every frame is what makes the launch uncontrollable.
+local function ApplyInitClimbVelocity(pawn, cmc)
+    local faceDir = initClimbState.faceDir
+    SetHorizVel(cmc, faceDir.X * INIT_CLIMB_IN, faceDir.Y * INIT_CLIMB_IN)
+    FaceYaw(pawn, faceDir)
+end
+
+-- Two-sensor agreement, same pair and same thresholds the climb jump uses:
+-- the ray must see the wall AND the swept capsule must be blocked by it.
+-- Returns whether the pawn came out of this in climb mode.
+local function TryInitClimbAttach(pawn, cmc)
+    local hasAttemptsLeft = initClimbState.tries < INIT_CLIMB_MAX_TRIES
+    if not hasAttemptsLeft then return false end
+
+    local wall = TraceAlongDirection(pawn, initClimbState.faceDir, HUG_RAY_LEN)
+    local wallIsInReach = (wall ~= nil) and (wall.gap <= ATTACH_MAX_GAP)
+    if not wallIsInReach then return false end
+
+    local sweptIntoWall = ProbeWall(pawn, initClimbState.faceDir)
+    if sweptIntoWall ~= true then return false end
+
+    ForceClimbAttach(cmc)
+    initClimbState.tries = initClimbState.tries + 1
+
+    -- Read back rather than trusting the write: ForceClimbAttach reports
+    -- whether its calls succeeded, not whether the component kept the mode.
+    local movementMode       = cmc.MovementMode
+    local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
+    return movementMode == 6 and customMovementMode == 5
+end
 
 -- Square up to the wall and hand off to the game's own jump. Nothing has
 -- left the ground when this returns -- Jump only raises bPressedJump, and
@@ -831,29 +901,7 @@ local function CharacterizeTraceStruct(pawn)
         .. "+0.00 = struct dead)", tostring(hit), dist, nz)
 end
 
--- Write the component into the ORGANIC post-attach signature
--- (is=true can=true ending=false). Mode-only left it unaware (no
--- cooldown, 24ms re-grabs); writes without ending=false left is=true
--- stuck after hops. The reconciler remains the safety net.
-local function ForceClimbAttach(cmc)
-    if not IsLive(comp) then
-        dbg("WARN: climb component stale -- attach skipped")
-        return false, false, false
-    end
-    local okCan = pcall(function() comp.CanClimbing = true end)
-    local okMode = pcall(function() cmc:SetMovementMode(6, 5) end)
-    if not okMode then
-        okMode = pcall(function()
-            cmc.MovementMode = 6
-            cmc.CustomMovementMode = 5
-        end)
-    end
-    local okIs = pcall(function()
-        comp.IsClimbing = true
-        comp.IsEnding   = false
-    end)
-    return okMode, okCan, okIs
-end
+
 
 local function BeginWallHugLeap(pawn, cmc, bucket, sideSign)
     local ang  = math.rad(LEAP_ANGLES[bucket])
@@ -887,52 +935,8 @@ local function BeginHopAway(pawn, cmc, bucket)
         bucket, HOP_OUT, HOP_VZ, HOP_LOCK)
 end
 
-local function EndClimbJumpState()
-    if climbJumpState == nil then return end
-    climbJumpState = nil
-    M.InClimbJump = false
-    CommonState.ClimbHasPriority = false
-end
 
-local function EndInitClimb(reason)
-    if not M.InInitClimbState then return end
-    initClimbState     = nil
-    M.InInitClimbState = false
-    dbg("init climb end: %s", reason or "?")
-end
 
--- Horizontal only. Vertical is jump.lua's, which is the entire reason
--- StartClimbFromGround calls Jump() rather than launching the pawn itself.
--- Rewriting X/Y every frame is what makes the launch uncontrollable.
-local function ApplyInitClimbVelocity(pawn, cmc)
-    local faceDir = initClimbState.faceDir
-    SetHorizVel(cmc, faceDir.X * INIT_CLIMB_IN, faceDir.Y * INIT_CLIMB_IN)
-    FaceYaw(pawn, faceDir)
-end
-
--- Two-sensor agreement, same pair and same thresholds the climb jump uses:
--- the ray must see the wall AND the swept capsule must be blocked by it.
--- Returns whether the pawn came out of this in climb mode.
-local function TryInitClimbAttach(pawn, cmc)
-    local hasAttemptsLeft = initClimbState.tries < INIT_CLIMB_MAX_TRIES
-    if not hasAttemptsLeft then return false end
-
-    local wall = TraceAlongDirection(pawn, initClimbState.faceDir, HUG_RAY_LEN)
-    local wallIsInReach = (wall ~= nil) and (wall.gap <= ATTACH_MAX_GAP)
-    if not wallIsInReach then return false end
-
-    local sweptIntoWall = ProbeWall(pawn, initClimbState.faceDir)
-    if sweptIntoWall ~= true then return false end
-
-    ForceClimbAttach(cmc)
-    initClimbState.tries = initClimbState.tries + 1
-
-    -- Read back rather than trusting the write: ForceClimbAttach reports
-    -- whether its calls succeeded, not whether the component kept the mode.
-    local movementMode       = cmc.MovementMode
-    local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
-    return movementMode == 6 and customMovementMode == 5
-end
 
 local function DidClimbJumpStart(cmc, mode)
     local notGrounded = mode == 3
