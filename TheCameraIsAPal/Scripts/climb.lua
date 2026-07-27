@@ -743,21 +743,26 @@ local function TickHugWall(dt, pawn, cmc, mode, isClimbing)
     end
 end
 
+-- Per-frame driver for the hop-off. Pushes away from the wall for a fixed
+-- window, then hands control back. No wall sensing — this is a dismount.
 local function TickHopOffWall(dt, pawn, cmc, mode)
-    -- FIX C: landing inside the lock window releases control instead of
+    -- Landing inside the lock window must release control rather than keep
     -- shoving the pawn along the ground.
-    if mode ~= 3 then
-        EndClimbJumpState(pawn, cmc,
-            string.format("left falling (mode %d)", mode))
+    local hasLeftFalling = mode ~= 3
+    if hasLeftFalling then
+        EndClimbJumpState()
         return
     end
-    if climbJumpState.deltaTime < HOP_LOCK then
-        local faceDir = climbJumpState.faceDir
-        SetHorizVel(cmc, -faceDir.X * HOP_OUT, -faceDir.Y * HOP_OUT)
-        FaceYaw(pawn, faceDir)
-    else
-        EndClimbJumpState(pawn, cmc, "control released")
+
+    local isWithinPushWindow = climbJumpState.deltaTime < HOP_LOCK
+    if not isWithinPushWindow then
+        EndClimbJumpState()
+        return
     end
+
+    local faceDir = climbJumpState.faceDir
+    SetHorizVel(cmc, -faceDir.X * HOP_OUT, -faceDir.Y * HOP_OUT)
+    FaceYaw(pawn, faceDir)
 end
 
 -- Hub function for anything with ticking the jump
@@ -1027,7 +1032,7 @@ function M.OnTick(dt, pawn, cmc)
     isClimbing = (movementMode == 6 and customMovementMode == 5)
 
     UpdateClimbPriority(pawn, cmc, isClimbing)
-    ReconcileStuckClimbFlag(isClimbing)
+    --ReconcileStuckClimbFlag(isClimbing)
     UpdateWallSlide(dt, pawn, cmc, isClimbing)
     CacheClimbFrame(pawn, cmc, isClimbing)
 end
