@@ -448,10 +448,10 @@ end
 
 -- The leap's scheduled end: both sensors must confirm a wall before the
 -- attach is forced. Gives up once the window closes.
-local function TryAttachToWall(pawn, cmc)
+local function TryAttachToWall(pawn, cmc, wallHit)
     local faceDir = climbJumpState.faceDir
-
     local hasAttemptsLeft = climbJumpState.tries < ATTACH_MAX_TRIES
+    
     if hasAttemptsLeft then
         local sweptIntoWall = ProbeWall(pawn, faceDir)
         local tracedWall    = TraceWallTest(pawn, faceDir, climbJumpState)
@@ -463,8 +463,7 @@ local function TryAttachToWall(pawn, cmc)
         end
     end
 
-    local attachWindowHasClosed =
-        climbJumpState.deltaTime > climbJumpState.driveTime + ATTACH_WINDOW
+    local attachWindowHasClosed = climbJumpState.deltaTime > climbJumpState.driveTime + ATTACH_WINDOW
     if attachWindowHasClosed then
         EndClimbJumpState()
     end
@@ -725,23 +724,21 @@ local function TickHugWall(dt, pawn, cmc, mode, isClimbing)
         return
     end
 
-    local isWithinLeapWindow =
-        climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW
-
+    local isWithinLeapWindow = climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW
+    local hasReachedAttachWindow = climbJumpState.deltaTime >= climbJumpState.driveTime 
+  
+    local wallHit = SenseWall(pawn, climbJumpState.faceDir, climbJumpState.dirSide)
+  
     if isWithinLeapWindow then
         pcall(function() cmc.GravityScale = 0.0 end)
-
-        local wallHit = SenseWall(pawn, climbJumpState.faceDir, climbJumpState.dirSide)
         local leapShouldContinue = TrackWallSurface(dt, wallHit)
         if not leapShouldContinue then return end
-
         ApplyHugVelocity(pawn, cmc)
     end
 
-    local hasReachedAttachWindow =
-        climbJumpState.deltaTime >= climbJumpState.driveTime
+    -- If time spent in jumpstate is greater than the time we should be in it, ignoring the time it takes to do the attach animation
     if hasReachedAttachWindow then
-        TryAttachToWall(pawn, cmc)
+        TryAttachToWall(pawn, cmc, wallHit)
     end
 end
 
