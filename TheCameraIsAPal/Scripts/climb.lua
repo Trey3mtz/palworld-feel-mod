@@ -37,6 +37,14 @@ local LEAP_ANGLES   = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 }
 local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
 local HUG_IN        = 150    -- into-wall carry, common to all buckets
 
+-- ---- init climb: wall detection ----
+local INIT_CLIMB_CONE_DEG    = 35    -- max angle between input and into-wall
+local INIT_CLIMB_MAX_GAP     = 20    -- uu from capsule SURFACE that counts as reachable
+local INIT_CLIMB_INPUT_FLOOR = 0.75   -- min |Acceleration.XY| that counts as input
+local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
+
+local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
+
 -- ---- climb jump: forced-attach probe ----
 local PROBE_DIST   = 40     -- swept distance into the wall facing
 local PROBE_BLOCK  = 0.5    -- moved/commanded below this = wall present
@@ -84,10 +92,12 @@ local M = { name = "climb" }
 -- gravity back to jump.lua and therefore isn't covered by the priority
 -- gate). Hug leaps are protected by ClimbHasPriority itself.
 M.InClimbJump = false
+M.InInitClimbState = false
 
 local comp, compName = nil, nil
 local capsuleRadius = 42 -- this is a fallback for radius someone on discord told me this
 local savedOrient, savedCtrlRot = nil, nil
+local walkableFloorZ = WALKABLE_FLOOR_Z_FALLBACK
 
 -- ---- fall / climb frame cache ----
 local lastFallVz     = 0
@@ -111,6 +121,11 @@ local JUMP_DIRECTIONS = {
     { name = "SIDE", sign =  1, x =  1.0, y =  0.0 },
     { name = "DOWN", sign =  0, x =  0.0, y = -1.0 },
 }
+
+-- ---- init climb state ----
+-- Shadowed by M.InInitClimbState: the two are written together, in
+-- StartClimbFrom* and EndInitClimb, and nowhere else.
+local initClimbState = nil
 
 -- ---- flag watch state ----
 local prevFlagIs, prevFlagCan, prevFlagEnding = nil, nil, nil
@@ -144,6 +159,12 @@ local function IsLive(obj)
     return ok and valid == true
 end
 
+-- Unit XY direction, or nil when the vector is too short to have one.
+local function NormalizeXY(x, y)
+    local length = math.sqrt(x * x + y * y)
+    if length < 1e-3 then return nil end
+    return { X = x / length, Y = y / length }
+end
 
 
 -- Rotates the leap's facing toward the wall, capped per frame so a single
@@ -191,6 +212,105 @@ local function HandleLostWall()
         return false
     end
     return true
+end
+
+-- Where the player is asking to go, in world space. Acceleration rather
+-- than Velocity: pressed against a wall the velocity collapses to zero
+-- while the input stays populated.
+local function GetInputDirection(cmc)
+    local acceleration = ReadOpt(cmc, "Acceleration")
+    if acceleration == nil then return nil end
+
+    local inputX, inputY = 0, 0
+    local readOk = pcall(function() inputX, inputY = acceleration.X, acceleration.Y end)
+    if not readOk then return nil end
+
+    local inputMagnitude = math.sqrt(inputX * inputX + inputY * inputY)
+    local noInputHeld = inputMagnitude < INIT_CLIMB_INPUT_FLOOR
+    if noInputHeld then return nil end
+
+    return { X = inputX / inputMagnitude, Y = inputY / inputMagnitude }
+end
+
+-- One level ray from the capsule centre, on the climbing component's own
+-- trace channel. Returns { normalX, normalY, normalZ, gap } or nil, where
+-- gap is measured from the capsule SURFACE rather than its centre.
+local function TraceAlongDirection(pawn, direction, rayLength)
+    if not IsLive(KSL) then
+        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        if not IsLive(KSL) then return nil end
+    end
+
+    local origin = GetLoc(pawn)
+    if origin == nil then return nil end
+
+    local finish = {
+        X = origin.X + direction.X * rayLength,
+        Y = origin.Y + direction.Y * rayLength,
+        Z = origin.Z,
+    }
+
+    local hitResult, didHit = {}, nil
+    pcall(function()
+        didHit = KSL:LineTraceSingle(pawn, origin, finish,
+            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, 0,
+            hitResult, true,
+            { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 }, 0.0)
+    end)
+    if not didHit then return nil end
+
+    local normalX, normalY, normalZ, distanceFromCentre
+    pcall(function() normalX = hitResult.ImpactNormal.X end)
+    pcall(function() normalY = hitResult.ImpactNormal.Y end)
+    pcall(function() normalZ = hitResult.ImpactNormal.Z end)
+    pcall(function() distanceFromCentre = hitResult.Distance end)
+
+    local hitIsReadable = type(normalX) == "number"
+        and type(normalY) == "number"
+        and type(normalZ) == "number"
+        and type(distanceFromCentre) == "number"
+    if not hitIsReadable then return nil end
+
+    return {
+        normalX = normalX,
+        normalY = normalY,
+        normalZ = normalZ,
+        gap     = distanceFromCentre - capsuleRadius,
+    }
+end
+
+-- Is the player moving into a wall, rather than past one or up a slope?
+-- Returns the wall as { faceDir, gap } so the starter has a direction to
+-- launch along and face; nil when any condition fails.
+local function WallInMovementPath(pawn, cmc)
+    local inputDirection = GetInputDirection(cmc)
+    if inputDirection == nil then return nil end
+
+    -- Ray length is derived from the grab distance, so "the ray hit" and
+    -- "the wall is close enough" are one statement instead of two knobs.
+    local rayLength = capsuleRadius + INIT_CLIMB_MAX_GAP
+    local hit = TraceAlongDirection(pawn, inputDirection, rayLength)
+    if hit == nil then return nil end
+
+    -- A hit closer than the capsule radius means the trace started inside
+    -- geometry, where UE returns a normal facing back down the trace --
+    -- which would read as a perfectly head-on wall every time.
+    local traceStartedInsideGeometry = hit.gap < 0
+    if traceStartedInsideGeometry then return nil end
+
+    -- The game's own line between "walk up it" and "must climb it".
+    local surfaceIsTooSteepToWalk = hit.normalZ < walkableFloorZ
+    if not surfaceIsTooSteepToWalk then return nil end
+
+    local intoWall = NormalizeXY(-hit.normalX, -hit.normalY)
+    if intoWall == nil then return nil end
+
+    local approachAlignment =
+        inputDirection.X * intoWall.X + inputDirection.Y * intoWall.Y
+    local isHeadOnApproach = approachAlignment >= INIT_CLIMB_CONE_COS
+    if not isHeadOnApproach then return nil end
+
+    return { faceDir = intoWall, gap = hit.gap }
 end
 
 -- Fires three traces in a fan around the current wall facing and returns
@@ -336,6 +456,60 @@ local function FaceYaw(pawn, faceDir)
     pcall(function()
         pawn:K2_SetActorRotation({ Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
     end)
+end
+
+
+
+-- =========================================================================
+--  INIT CLIMB SEQUENCE
+-- =========================================================================
+
+-- Square up to the wall and hand off to the game's own jump. Nothing has
+-- left the ground when this returns -- Jump only raises bPressedJump, and
+-- the character's movement tick is what acts on it.
+local function StartClimbFromGround(pawn, cmc, wall)
+    initClimbState = {
+        deltaTime = 0,
+        faceDir   = wall.faceDir,
+        tries     = 0,
+    }
+
+    -- At most a 35 degree correction, bounded by the detection cone.
+    -- ApplyInitClimbVelocity re-asserts this every frame of the launch.
+    FaceYaw(pawn, wall.faceDir)
+
+    local jumpRequested = pcall(function() pawn:Jump() end)
+    if not jumpRequested then
+        dbg("init climb: Jump() call failed -- aborting")
+        initClimbState = nil
+        return
+    end
+
+    M.InInitClimbState = true
+
+    dbg("init climb from ground: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
+        wall.gap, wall.faceDir.X, wall.faceDir.Y,
+        tostring(ReadOpt(cmc, "JumpZVelocity")))
+end
+  
+local function DriveInitClimb(dt, pawn, cmc)
+    initClimbState.deltaTime = initClimbState.deltaTime + dt
+
+    local windowHasClosed = initClimbState.deltaTime > INIT_CLIMB_LOCK_TIME
+    if windowHasClosed then
+        EndInitClimb("window closed without a latch")
+        return
+    end
+
+    ApplyInitClimbVelocity(pawn, cmc)
+
+    local hasClearedTheGround = initClimbState.deltaTime >= INIT_CLIMB_ATTACH_AT
+    if not hasClearedTheGround then return end
+
+    local hasLatched = TryInitClimbAttach(pawn, cmc)
+    if hasLatched then
+        EndInitClimb("latched")
+    end
 end
 
 -- =========================================================================
@@ -941,7 +1115,10 @@ function M.OnPlayerCached(pawn, cmc)
     lastGroundCheck = nil
     KSL            = nil
     ring, ringN, capLeft = {}, 0, 0
-
+    walkableFloorZ = ReadOpt(cmc, "WalkableFloorZ") or WALKABLE_FLOOR_Z_FALLBACK
+    initClimbState     = nil
+    M.InInitClimbState = false
+  
     pcall(function()
       capsuleRadius = pawn.CapsuleComponent.CapsuleRadius
     end)
@@ -1013,11 +1190,43 @@ local function CacheClimbFrame(pawn, cmc, inClimb)
     prevModeWasClimb = inClimb
 end
 
+
+-- Hub for starting a climb. All functions here are theoretical and don't yet exist.
+local function TickInitClimbStart(dt, pawn, cmc, isWalking)
+    
+    if not M.InInitClimbState then
+        -- First, are we moving into a wall we're allowed to climb?
+        local wallAhead = WallInMovementPath(pawn, cmc)
+        local isMovingIntoWall = (wallAhead ~= nil)
+
+        -- Second, check with the game's native climb checks that we are good to climb
+        local componentAllowsClimb = ReadOpt(comp, "CanClimbing") == true
+
+        if isMovingIntoWall and componentAllowsClimb then
+            -- Second, which state are we entering from?
+            if isWalking then
+                StartClimbFromGround(pawn, cmc, wallAhead)
+            end
+            -- later: StartClimbFromAir(pawn, cmc, wallAhead)
+        end
+    end
+
+    if M.InInitClimbState then
+        DriveInitClimb(dt, pawn, cmc)
+    end
+end
+
+
 function M.OnTick(dt, pawn, cmc)
     local movementMode    = cmc.MovementMode
     local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
     local isClimbing = (movementMode == 6 and customMovementMode == 5)
+    local isWalking = (movementMode == 1 or movementMode == 2 or (movementMode == 6 and customMovementMode == 2))
 
+    if not isClimbing and not M.InClimbJump then
+        TickInitClimbStart(dt, pawn, cmc, isWalking)
+    end
+  
     CacheFallSpeed(movementMode, cmc)
     LogComponentFlagEdges(movementMode, customMovementMode)
 
