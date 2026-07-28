@@ -48,7 +48,8 @@ local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 
 -- ---- init climb: launch schedule ----
 local INIT_CLIMB_LAUNCH_GRACE = 0.10   -- s to leave the ground before the jump counts as refused
-local INIT_CLIMB_ATTACH_AT    = 0.35   -- s of air time before the first attach attempt
+local INIT_CLIMB_ATTACH_AT_GROUND  = 0.35   -- s of air time before the first attach attempt
+local INIT_CLIMB_ATTACH_AT_JUMP    = 0.20
 local INIT_CLIMB_LOCK_TIME    = 0.42   -- s of air time before giving up
 local INIT_CLIMB_IN           = 240    -- uu/s into-wall drive during the launch
 local INIT_CLIMB_MAX_TRIES    = 3
@@ -639,6 +640,33 @@ end
 -- the character's movement tick is what acts on it.
 local function StartClimbFromGround(pawn, cmc, wall)
     initClimbState = {
+        type      = "ground",
+        deltaTime = 0,
+        faceDir   = wall.faceDir,
+        tries     = 0,
+    }
+
+    -- Degree correction bounded by the detection cone.
+    FaceYaw(pawn, wall.faceDir)
+
+    local jumpRequested = pcall(function() pawn:RequestJump() end)
+    if not jumpRequested then
+        dbg("init climb: Jump() call failed -- aborting")
+        nil
+        return
+    end
+
+    M.InInitClimbState = true
+    DisableNativeJump(pawn, cmc)
+
+    dbg("init climb from ground: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
+        wall.gap, wall.faceDir.X, wall.faceDir.Y,
+        tostring(ReadOpt(cmc, "JumpZVelocity")))
+end
+
+local function StartClimbFromJump(pawn, cmc, wall)
+    initClimbState = {
+        type      = "jump",
         deltaTime = 0,
         faceDir   = wall.faceDir,
         tries     = 0,
@@ -657,11 +685,12 @@ local function StartClimbFromGround(pawn, cmc, wall)
     M.InInitClimbState = true
     DisableNativeJump(pawn, cmc)
 
-    dbg("init climb from ground: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
+    dbg("init climb from jump: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
         wall.gap, wall.faceDir.X, wall.faceDir.Y,
         tostring(ReadOpt(cmc, "JumpZVelocity")))
 end
-  
+
+
 -- Runs from the frame the jump is requested until the pawn latches, the
 -- window closes, or the jump turns out never to have executed.
 local function DriveInitClimb(dt, pawn, cmc)
@@ -688,8 +717,15 @@ local function DriveInitClimb(dt, pawn, cmc)
         EndInitClimb(pawn, cmc, "window closed without a latch")
         return
     end
+    
+    local hasClearedTheGround = false 
 
-    local hasClearedTheGround = initClimbState.airTime >= INIT_CLIMB_ATTACH_AT
+    if initClimbState.type == "ground" then
+        hasClearedTheGround = initClimbState.airTime >= INIT_CLIMB_ATTACH_AT_GROUND
+    elseif initClimbState.type == "jump" then
+        hasClearedTheGround = initClimbState.airTime >= INIT_CLIMB_ATTACH_AT_JUMP
+    end
+  
     if not hasClearedTheGround then return end
     -- Fourth, after we lept into the air, try to attach to wall
     local hasLatched = TryInitClimbAttach(pawn, cmc)
@@ -1450,11 +1486,15 @@ local function TickInitClimbStart(dt, pawn, cmc, climbComp, isWalking)
         local componentAllowsClimb = climbComp:CanClimbingStart()
         dbg("Does component allow climb? %s", componentAllowsClimb)
         if isMovingIntoWall and componentAllowsClimb then
+            local isJumping = pawn.bWasJumping
             if isWalking then
                 dbg("[NEW] startclimbing from ground!")
                 StartClimbFromGround(pawn, cmc, wallAhead)
             end
-            -- later: StartClimbFromAir(pawn, cmc, wallAhead)
+            if isJumping then
+                dbg("[NEW] startclimbing from jump!")
+                StartClimbFromJump(pawn, cmc, wallAhead)
+            end
         end
     end
 
