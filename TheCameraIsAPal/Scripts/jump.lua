@@ -27,7 +27,6 @@ local JumpCutOn                = true  -- Turns the feature for jump cutting on/
 -- Mod
 local M = { name = "jump" }
 local JumpKey = require("jumpkey")
-local jumpspotNotified = false
 
 -- Jump States
 local jumpInitiated = false
@@ -52,18 +51,11 @@ M.Hooks = {
             jdbg("jump initiated (delegate)")
         end }
 }
--- =========================================================================
 
-function M.OnPlayerCached(pawn, cmc)
-    cmc.GravityScale  = VanillaGravity   -- clean slate on (re)spawn
-    cmc.JumpZVelocity = JumpVel
-    jumpInitiated     = false            -- a respawn mid-air must not inherit it
-
-    -- one-time: boost every jump spot as it streams in
-    if not jumpspotNotified then
-        jumpspotNotified = true
-        ---@diagnostic disable-next-line: undefined-global
-        NotifyOnNewObject("/Script/Pal.PalLevelGimmickJumpSpot", function(obj)
+M.Notifications = {
+    { name = "JumpSpat",
+        class = "/Script/Pal.PalLevelGimmickJumpSpot",
+        callback = function(obj)
             if obj and obj:IsValid() then
                 local ok, v = pcall(function() return obj.JumpZVelocity end)
                 if ok and v then
@@ -71,8 +63,14 @@ function M.OnPlayerCached(pawn, cmc)
                     jdbg("jumpspot Z %.0f -> %.0f", v, obj.JumpZVelocity)
                 end
             end
-        end)
-    end
+        end },
+}
+-- =========================================================================
+
+function M.OnPlayerCached(pawn, cmc)
+    cmc.GravityScale  = VanillaGravity   -- clean slate on (re)spawn
+    cmc.JumpZVelocity = JumpVel
+    jumpInitiated     = false            -- a respawn mid-air must not inherit it
 end
 
 function M.OnTick(dt, pawn, cmc)
