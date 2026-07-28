@@ -1483,12 +1483,9 @@ local function TickInitClimbStart(dt, pawn, cmc, climbComp, isWalking)
         local isMovingIntoWall = (wallAhead ~= nil)
         
         -- Second, check with the game's native climb checks that we are good to climb
-        local componentAllowsClimb = {}
-        climbComp:CanClimbingStart(componentAllowsClimb)
-for k, v in pairs(componentAllowsClimb) do
-    print(k, v)
-end
-        if isMovingIntoWall and componentAllowsClimb[1] then
+        local componentAllowsClimb = climbComp.CanClimbing
+    
+        if isMovingIntoWall and componentAllowsClimb then
             local isJumping = pawn.bWasJumping
             if isWalking then
                 dbg("[NEW] startclimbing from ground!")
