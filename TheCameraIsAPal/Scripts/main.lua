@@ -44,6 +44,7 @@ local Subsystems = {
     require("horizontalmove"),
     require("slide"),
     require("climb"),
+    require("glider"),
 }
 
 local DEBUG = true
@@ -105,9 +106,15 @@ local HookList = {
             Tick(ok and dt or 0.0083)
         end },
 }
+
+local NotifyList = {}
+
 for _, sub in ipairs(Subsystems) do
     for _, h in ipairs(sub.Hooks or {}) do
         HookList[#HookList + 1] = h
+    end
+    for _, n in ipairs(sub.Notifications or {}) do
+        NotifyList[#NotifyList + 1] = n
     end
 end
 
@@ -145,6 +152,21 @@ local function InstallNativeHooks()
     end
 end
 
+local function InstallNotifications()
+    for _, n in ipairs(NotifyList) do
+        if not n.installed then
+            ---@diagnostic disable-next-line: undefined-global
+            local ok, err = pcall(NotifyOnNewObject, n.class, n.callback)
+            n.installed = ok
+            if ok then
+                dbg("Notification installed: %s", n.name)
+            else
+                dbg("Notification FAILED: %s -- %s", n.name, tostring(err))
+            end
+        end
+    end
+end
+
 -- /Game/ paths: (re)bind on demand. Previously stored ids are unregistered
 -- first, so a world reload (BP class GC'd and reloaded => old hook dead)
 -- rebinds cleanly, and a same-world refire never double-registers.
@@ -169,27 +191,35 @@ end
 
 --\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\-- MOD ENTRY POINT --////////////////////////////////////--
 
-do
-    local names = {}
-    for _, s in ipairs(Subsystems) do names[#names + 1] = s.name end
-    dbg("PalFeel loaded. Subsystems: %s  |  hooks declared: %d",
-        table.concat(names, ", "), #HookList)
-end
-
-InstallNativeHooks()
-
 -- One notification per constructed player character: class load (CDO),
 -- first spawn, every respawn, every world (re)load. The CDO pass can run
 -- before the controller BP is loaded, in which case the tick hook logs as
 -- pending once and the pawn-spawn pass resolves it. Refs are cleared here
 -- but re-cached lazily on the next tick — at construction time the pawn's
 -- components are not initialized yet, so it must not be touched directly.
----@diagnostic disable-next-line: undefined-global
-NotifyOnNewObject(PAWN_NATIVE_CLASS, function()
-    pawn, cmc = nil, nil
-    RefreshBlueprintHooks("pawn constructed")
-end)
+--
+-- Appended rather than declared with the registry above so that the
+-- callback closes over the real RefreshBlueprintHooks. It goes through
+-- NotifyList like any subsystem notification, so the count below is
+-- accurate and there is one installation path.
+NotifyList[#NotifyList + 1] = {
+    name  = "player character constructed",
+    class = PAWN_NATIVE_CLASS,
+    callback = function()
+        pawn, cmc = nil, nil
+        RefreshBlueprintHooks("pawn constructed")
+    end,
+}
 
+do
+    local names = {}
+    for _, s in ipairs(Subsystems) do names[#names + 1] = s.name end
+    dbg("PalFeel loaded. Subsystems: %s  |  hooks declared: %d  |  notifications: %d",
+        table.concat(names, ", "), #HookList, #NotifyList)
+end
+
+InstallNativeHooks()
+InstallNotifications()
 
 -- Hot-reload mid-session: the pawn already exists, so no construction
 -- notification is coming — bind immediately.
