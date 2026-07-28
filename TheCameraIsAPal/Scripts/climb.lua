@@ -39,17 +39,17 @@ local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
 local HUG_IN        = 150    -- into-wall carry, common to all buckets
 
 -- ---- init climb: wall detection ----
-local INIT_CLIMB_CONE_DEG    = 35    -- max angle between input and into-wall
-local INIT_CLIMB_MAX_GAP     = 20    -- uu from capsule SURFACE that counts as reachable
-local INIT_CLIMB_INPUT_FLOOR = 0.75   -- min |Acceleration.XY| that counts as input
+local INIT_CLIMB_CONE_DEG    = 40    -- max angle between input and into-wall
+local INIT_CLIMB_MAX_GAP     = 21    -- uu from capsule SURFACE that counts as reachable
+local INIT_CLIMB_INPUT_FLOOR = 0.6   -- min |Acceleration.XY| that counts as input
 local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
 
 local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 
 -- ---- init climb: launch schedule ----
 local INIT_CLIMB_LAUNCH_GRACE = 0.10   -- s to leave the ground before the jump counts as refused
-local INIT_CLIMB_ATTACH_AT    = 0.06   -- s of air time before the first attach attempt
-local INIT_CLIMB_LOCK_TIME    = 0.30   -- s of air time before giving up
+local INIT_CLIMB_ATTACH_AT    = 0.35   -- s of air time before the first attach attempt
+local INIT_CLIMB_LOCK_TIME    = 0.42   -- s of air time before giving up
 local INIT_CLIMB_IN           = 240    -- uu/s into-wall drive during the launch
 local INIT_CLIMB_MAX_TRIES    = 3
 
@@ -116,6 +116,7 @@ local prevClimbInputAlongWall = 0
 local prevClimbInputUpward = 0
 local vanillaOrientToMovement = nil
 local vanillaControllerRotation = nil
+local prevAtTopAnimPlaying = false
 
 -- ---- slide state ----
 local slidingDownWall        = false
@@ -182,13 +183,24 @@ local function EnableGlider(playerPawn, cmc)
     end
 end
 
+local function DisableMoveInput(pawn)
+    local controller = pawn:GetController()
+    controller:SetIgnoreMoveInput(true)
+end
+
+local function EnableMoveInput(pawn)
+    local controller = pawn:GetController()
+    controller:ResetIgnoreMoveInput()
+end
+
 local originalJumpMax = 1
 local isJumpDisabled = false
 -- When the player latches onto a wall and you want to lock out the native jump:
 local function DisableNativeJump(playerPawn, cmc)
     if isJumpDisabled then return end
-    if playerPawn and playerPawn:IsValid() then
-        DisableGlider(playerPawn, cmc)
+    if playerPawn and playerPawn:IsValid() then       
+        DisableMoveInput(playerPawn)
+        DisableGlider(playerPawn, cmc)       
         -- Store the original max jump count
         originalJumpMax = playerPawn.JumpMaxCount
         -- Set to 0 so ACharacter::CanJump() fails
@@ -201,6 +213,7 @@ end
 local function EnableNativeJump(playerPawn, cmc)
     if not isJumpDisabled then return end
     if playerPawn and playerPawn:IsValid() then
+        EnableMoveInput(playerPawn)
         EnableGlider(playerPawn, cmc)
         -- Restore the original jump count
         playerPawn.JumpMaxCount = originalJumpMax
@@ -337,7 +350,10 @@ end
 local function TraceAlongDirection(pawn, direction, rayLength)
     if not IsLive(KSL) then
         KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
-        if not IsLive(KSL) then return nil end
+        if not IsLive(KSL) then
+            dbg("[climb] Failed Trace Along")
+            return nil 
+        end
     end
 
     local origin = GetLoc(pawn)
@@ -369,7 +385,7 @@ local function TraceAlongDirection(pawn, direction, rayLength)
         and type(normalZ) == "number"
         and type(distanceFromCentre) == "number"
     if not hitIsReadable then return nil end
-
+    dbg("[climb] hit is readable!")
     return {
         normalX = normalX,
         normalY = normalY,
@@ -390,7 +406,7 @@ local function WallInMovementPath(pawn, cmc)
     local rayLength = capsuleRadius + INIT_CLIMB_MAX_GAP
     local hit = TraceAlongDirection(pawn, inputDirection, rayLength)
     if hit == nil then return nil end
-
+      
     -- A hit closer than the capsule radius means the trace started inside
     -- geometry, where UE returns a normal facing back down the trace --
     -- which would read as a perfectly head-on wall every time.
@@ -400,15 +416,14 @@ local function WallInMovementPath(pawn, cmc)
     -- The game's own line between "walk up it" and "must climb it".
     local surfaceIsTooSteepToWalk = hit.normalZ < walkableFloorZ
     if not surfaceIsTooSteepToWalk then return nil end
-
+    
     local intoWall = NormalizeXY(-hit.normalX, -hit.normalY)
     if intoWall == nil then return nil end
 
-    local approachAlignment =
-        inputDirection.X * intoWall.X + inputDirection.Y * intoWall.Y
+    local approachAlignment = inputDirection.X * intoWall.X + inputDirection.Y * intoWall.Y
     local isHeadOnApproach = approachAlignment >= INIT_CLIMB_CONE_COS
     if not isHeadOnApproach then return nil end
-
+    dbg("[climb] Walking into wall!")
     return { faceDir = intoWall, gap = hit.gap }
 end
 
@@ -532,9 +547,10 @@ end
 --  INIT CLIMB SEQUENCE
 -- =========================================================================
 
-local function EndInitClimb(reason)
+local function EndInitClimb(pawn, cmc, reason)
     if not M.InInitClimbState then return end
     initClimbState     = nil
+    EnableNativeJump(pawn, cmc)
     M.InInitClimbState = false
     dbg("init climb end: %s", reason or "?")
 end
@@ -608,9 +624,6 @@ local function TryInitClimbAttach(pawn, cmc)
     local wallIsInReach = (wall ~= nil) and (wall.gap <= ATTACH_MAX_GAP)
     if not wallIsInReach then return false end
 
-    local sweptIntoWall = ProbeWall(pawn, initClimbState.faceDir)
-    if sweptIntoWall ~= true then return false end
-
     ForceClimbAttach(cmc)
     initClimbState.tries = initClimbState.tries + 1
 
@@ -631,11 +644,10 @@ local function StartClimbFromGround(pawn, cmc, wall)
         tries     = 0,
     }
 
-    -- At most a 35 degree correction, bounded by the detection cone.
-    -- ApplyInitClimbVelocity re-asserts this every frame of the launch.
+    -- Degree correction bounded by the detection cone.
     FaceYaw(pawn, wall.faceDir)
 
-    local jumpRequested = pcall(function() pawn:Jump() end)
+    local jumpRequested = pcall(function() pawn:RequestJump() end)
     if not jumpRequested then
         dbg("init climb: Jump() call failed -- aborting")
         initClimbState = nil
@@ -643,6 +655,7 @@ local function StartClimbFromGround(pawn, cmc, wall)
     end
 
     M.InInitClimbState = true
+    DisableNativeJump(pawn, cmc)
 
     dbg("init climb from ground: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
         wall.gap, wall.faceDir.X, wall.faceDir.Y,
@@ -654,19 +667,15 @@ end
 local function DriveInitClimb(dt, pawn, cmc)
     -- First, check if we have launched yet (we have, its impossible otherwise to reach this logic)
     if not initClimbState.hasLaunched then
-        initClimbState.deltaTime = initClimbState.deltaTime + dt
-
-        -- Jump() only raises bPressedJump; the character's movement tick is
-        -- what acts on it, so a frame or two of Walking here is expected.
         local hasLeftTheGround = (cmc.MovementMode == 3)
         if not hasLeftTheGround then
+            initClimbState.deltaTime = initClimbState.deltaTime + dt
             local jumpWasRefused = initClimbState.deltaTime > INIT_CLIMB_LAUNCH_GRACE
             if jumpWasRefused then
-                EndInitClimb("jump never executed")
+                EndInitClimb(pawn, cmc, "jump never executed")
             end
             return
         end
-
         initClimbState.hasLaunched = true
     end
 
@@ -676,22 +685,19 @@ local function DriveInitClimb(dt, pawn, cmc)
     -- Third, are we past the window for jumping to climb?
     local windowHasClosed = initClimbState.airTime > INIT_CLIMB_LOCK_TIME
     if windowHasClosed then
-        EndInitClimb("window closed without a latch")
+        EndInitClimb(pawn, cmc, "window closed without a latch")
         return
     end
-
-    --ApplyInitClimbVelocity(pawn, cmc)
 
     local hasClearedTheGround = initClimbState.airTime >= INIT_CLIMB_ATTACH_AT
     if not hasClearedTheGround then return end
     -- Fourth, after we lept into the air, try to attach to wall
     local hasLatched = TryInitClimbAttach(pawn, cmc)
     if hasLatched then
-        EndInitClimb("latched")
+        EndInitClimb(pawn, cmc, "latched")
     else 
-        dbg("[climb.lua] FAILED ERROR, MISSED LATCH")
+        dbg("[climb.lua] FAILED, MISSED LATCH")
     end
-
 end
 
 -- =========================================================================
@@ -1412,7 +1418,7 @@ local function ReconcileStuckClimbFlag(isClimbing)
 end
 
 -- Cache the climb frame for next tick's detach classification.
-local function CacheClimbFrame(pawn, cmc, inClimb)
+local function CacheClimbFrame(pawn, cmc, inClimb, isClimbingAtTop)
     if inClimb then
         -- Facing first: the input decomposition below needs THIS frame's
         -- wall facing, not the previous frame's.
@@ -1428,22 +1434,22 @@ local function CacheClimbFrame(pawn, cmc, inClimb)
         prevClimbZ = GetZ(pawn)
     end
     prevModeWasClimb = inClimb
+    prevAtTopAnimPlaying = isClimbingAtTop
 end
 
 
 -- Hub for starting a climb. All functions here are theoretical and don't yet exist.
-local function TickInitClimbStart(dt, pawn, cmc, isWalking)
+local function TickInitClimbStart(dt, pawn, cmc, climbComp, isWalking)
     
     if not M.InInitClimbState then
         -- First, are we moving into a wall we're allowed to climb?
         local wallAhead = WallInMovementPath(pawn, cmc)
         local isMovingIntoWall = (wallAhead ~= nil)
-
+        
         -- Second, check with the game's native climb checks that we are good to climb
-        local componentAllowsClimb = ReadOpt(comp, "CanClimbing") == true
-
+        local componentAllowsClimb = climbComp:CanClimbingStart()
+        dbg("Does component allow climb? %s", componentAllowsClimb)
         if isMovingIntoWall and componentAllowsClimb then
-            -- Second, which state are we entering from?
             if isWalking then
                 dbg("[NEW] startclimbing from ground!")
                 StartClimbFromGround(pawn, cmc, wallAhead)
@@ -1458,7 +1464,7 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking)
     end
 end
 
-local prevAtTopAnimPlaying = false
+
 function M.OnTick(dt, pawn, cmc)
     local movementMode    = cmc.MovementMode
     local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
@@ -1470,6 +1476,7 @@ function M.OnTick(dt, pawn, cmc)
         isClimbingAtTop = climbingComponent.UpAtTopMode
     end
 
+    -- Guard against early animation cancels
     if isClimbingAtTop then
         DisableNativeJump(pawn, cmc)   
     end
@@ -1477,32 +1484,35 @@ function M.OnTick(dt, pawn, cmc)
         EnableNativeJump(pawn, cmc)
     end
 
+    -- Tick climb starts
     if not isClimbing and not M.InClimbJump then
-        --TickInitClimbStart(dt, pawn, cmc, isWalking)
+        TickInitClimbStart(dt, pawn, cmc, climbingComponent, isWalking)
     end
 
     CacheFallSpeed(movementMode, cmc)
     LogComponentFlagEdges(movementMode, customMovementMode)
 
+    -- Tick climb jumps
     if DidClimbJumpStart(cmc, movementMode) and not isClimbingAtTop then
         StartClimbJump(pawn, cmc)
     end
     TickClimbJump(dt, pawn, cmc, movementMode, isClimbing)
-    
+
+   -- Fix vanilla climbing input values
     if isClimbing then
         ApplyRawClimbInput(pawn, cmc)
     end
 
+    -- Refresh values that may have changes from the start of the frame
     movementMode    = cmc.MovementMode
     customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
-
     isClimbing = (movementMode == 6 and customMovementMode == 5)
 
     UpdateClimbPriority(pawn, cmc, isClimbing)
-    --ReconcileStuckClimbFlag(isClimbing)
     UpdateWallSlide(dt, pawn, cmc, isClimbing)
-    CacheClimbFrame(pawn, cmc, isClimbing)
-    prevAtTopAnimPlaying = isClimbingAtTop
+  
+    -- Cache values for next frame comparisons
+    CacheClimbFrame(pawn, cmc, isClimbing, isClimbingAtTop)
 end
 
 return M
