@@ -38,10 +38,7 @@ local DEBUG = true
 -- UNCONFIRMED: grep the asset dump for "OnStartGlidingDelegate" and paste
 -- the real path. A wrong path never errors -- main.lua just logs the hook
 -- as pending forever.
-local PATH_ON_START_GLIDING =
-    "/Game/Pal/Blueprint/Character/Base/BP_PlayerBase.BP_PlayerBase_C:"
-    .. "BndEvt__BP_PlayerBase_BP_GliderComponent_K2Node_ComponentBoundEvent_0_"
-    .. "OnStartGlidingDelegate__DelegateSignature"
+local PATH_ON_START_GLIDING = "/Game/Pal/Blueprint/Component/Glider/BP_GliderComponent.BP_GliderComponent_C:OnStartGliding"
 
 -- Fraction of the carried horizontal velocity re-asserted during the hold.
 -- 1.0 = full preservation.
