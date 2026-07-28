@@ -652,7 +652,7 @@ local function StartClimbFromGround(pawn, cmc, wall)
     local jumpRequested = pcall(function() pawn:RequestJump() end)
     if not jumpRequested then
         dbg("init climb: Jump() call failed -- aborting")
-        nil
+        initClimbState = nil
         return
     end
 
@@ -1483,9 +1483,12 @@ local function TickInitClimbStart(dt, pawn, cmc, climbComp, isWalking)
         local isMovingIntoWall = (wallAhead ~= nil)
         
         -- Second, check with the game's native climb checks that we are good to climb
-        local componentAllowsClimb = climbComp:CanClimbingStart()
-        dbg("Does component allow climb? %s", componentAllowsClimb)
-        if isMovingIntoWall and componentAllowsClimb then
+        local componentAllowsClimb = {}
+        climbComp:CanClimbingStart(componentAllowsClimb)
+for k, v in pairs(componentAllowsClimb) do
+    print(k, v)
+end
+        if isMovingIntoWall and componentAllowsClimb[1] then
             local isJumping = pawn.bWasJumping
             if isWalking then
                 dbg("[NEW] startclimbing from ground!")
@@ -1526,7 +1529,7 @@ function M.OnTick(dt, pawn, cmc)
 
     -- Tick climb starts
     if not isClimbing and not M.InClimbJump then
-        TickInitClimbStart(dt, pawn, cmc, climbingComponent, isWalking)
+        --TickInitClimbStart(dt, pawn, cmc, climbingComponent, isWalking)
     end
 
     CacheFallSpeed(movementMode, cmc)
