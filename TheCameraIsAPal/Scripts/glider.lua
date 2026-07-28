@@ -3,29 +3,29 @@
 -- Author: TheTr3y
 --
 -- Symptom: opening the glider visibly discards horizontal momentum for a
--- moment. On the frame the glider opens we write back the horizontal
--- velocity the player carried into it.
+-- moment. The deploy state re-asserts the horizontal velocity the player
+-- carried into the open, for a short hold window.
 --
--- Field model (UPalGliderComponent, the native parent of
--- BP_GliderComponent -- the BP child's own CurrentGliderObject is left
--- alone, since the native member is set on every path):
+-- Field model (UPalGliderComponent, native parent of BP_GliderComponent --
+-- the BP child's own CurrentGliderObject is left alone, since the native
+-- member is set on every path):
 --   bIsGliding         : deploy state
 --   CurrentGlider      : the equipped APalGliderObject
 --   CurrentGliderPalID : FName of the equipped glider
---   OnStartGlidingDelegate / OnEndGlidingDelegate : native multicast
---       edges. If anything in BP binds to them, a BndEvt hook would
---       replace the per-tick edge check below with a real event.
+--   OnStartGlidingDelegate / OnEndGlidingDelegate : native multicast edges
 --
 --   APalGliderObject.GliderMaxSpeed / GliderAirControl / GliderGravityScale
 --       : per-item values, presumed stamped onto the identically named
 --         UPalCharacterMovementComponent fields at deploy.
 --
--- Ordering caveat: this ticks from BP_PalPlayerController:ReceiveTick,
--- which runs before the pawn's movement update. A velocity write here is
--- therefore upstream of PhysCustom. If the deploy clamps speed to
--- GliderMaxSpeed, the restore is overwritten in the same frame and the
--- real fix is raising GliderMaxSpeed instead. The open-edge log prints
--- both numbers so the two cases are distinguishable on sight.
+-- Frame ordering: the controller tick runs before the pawn's component
+-- tick, so within one frame CacheFrameState records the pre-glide velocity,
+-- then StartGliding fires and the hook snapshots it. The first
+-- TickDeployGlider call is therefore one frame after the open, which is
+-- why the state holds across a window instead of writing once.
+--
+-- If the hold does not survive, the deploy is clamping speed to
+-- GliderMaxSpeed downstream of us and the fix moves to that field.
 -- =========================================================================
 
 local DEBUG = true
@@ -34,13 +34,27 @@ local DEBUG = true
 -- 1. TUNING
 -- =========================================================================
 
--- Fraction of the pre-glide horizontal velocity handed back on the open
--- frame. 1.0 = full preservation.
+-- Full path of the Blueprint-bound event for OnStartGlidingDelegate.
+-- UNCONFIRMED: grep the asset dump for "OnStartGlidingDelegate" and paste
+-- the real path. A wrong path never errors -- main.lua just logs the hook
+-- as pending forever.
+local PATH_ON_START_GLIDING =
+    "/Game/Pal/Blueprint/Character/Base/BP_PlayerBase.BP_PlayerBase_C:"
+    .. "BndEvt__BP_PlayerBase_BP_GliderComponent_K2Node_ComponentBoundEvent_0_"
+    .. "OnStartGlidingDelegate__DelegateSignature"
+
+-- Fraction of the carried horizontal velocity re-asserted during the hold.
+-- 1.0 = full preservation.
 local MOMENTUM_KEEP = 1.0
 
 -- Below this, the open is a near-standstill deploy and there is no
 -- momentum worth preserving.
-local MOMENTUM_SPEED_FLOOR = 50   -- uu/s
+local MOMENTUM_SPEED_FLOOR = 50    -- uu/s
+
+-- How long after the open the carried velocity keeps being asserted. Long
+-- enough to outlast a deploy montage, short enough that normal glide
+-- physics owns the flight.
+local DEPLOY_HOLD_TIME = 0.15      -- s
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -49,10 +63,20 @@ local MOMENTUM_SPEED_FLOOR = 50   -- uu/s
 local M = { name = "glider" }
 
 -- ---- frame cache ----
--- Written only on frames where the glider is NOT deployed, so across the
--- open edge these hold the last pre-glide velocity.
+-- Written only on frames where the glider is NOT deployed, so at hook time
+-- these hold the last pre-glide velocity.
 local prevVelocityX, prevVelocityY, prevVelocityZ = 0, 0, 0
-local wasGliderDeployedLastFrame = false
+
+-- ---- deploy state ----
+-- nil when no deploy is in progress. Built in StartDeployGlider, cleared in
+-- EndDeployGlider, and nowhere else.
+local initDeployGlider = nil
+
+-- ---- ownership guard ----
+-- The delegate can fire for any character carrying a glider component. Both
+-- names are cached because the bind site decides whether the hook's Context
+-- is the pawn or the component.
+local myPawnName, myGliderComponentName = nil, nil
 
 -- =========================================================================
 -- 3. UTILITIES
@@ -69,6 +93,13 @@ local function ReadOpt(obj, prop)
     return v
 end
 
+local function FullName(obj)
+    if obj == nil then return nil end
+    local ok, name = pcall(function() return obj:GetFullName() end)
+    if not ok then return nil end
+    return name
+end
+
 local function HorizontalSpeed(x, y)
     return math.sqrt(x * x + y * y)
 end
@@ -80,47 +111,108 @@ local function SetHorizVel(cmc, x, y)
     end)
 end
 
+-- True when the object the delegate fired for is ours, whichever of the two
+-- the bind site hands us.
+local function IsOurGliderEvent(contextObject)
+    local name = FullName(contextObject)
+    if name == nil then return false end
+    return name == myPawnName or name == myGliderComponentName
+end
+
 -- =========================================================================
--- 4. DEPLOY
+-- 4. DEPLOY SEQUENCE
 -- =========================================================================
 
--- Runs on the single frame the glider opens. prevVelocity* still holds the
--- last airborne frame before the deploy, because CacheFrameState skips its
--- write while gliding.
-local function OnGliderOpened(pawn, cmc, gliderComponent)
+local function EndDeployGlider(reason)
+    if initDeployGlider == nil then return end
+    initDeployGlider = nil
+    dbg("deploy end: %s", reason or "?")
+end
+
+-- Called from the OnStartGliding hook. Snapshots the momentum the player
+-- carried into the open; the drive below is what spends it.
+local function StartDeployGlider()
     local carriedSpeed = HorizontalSpeed(prevVelocityX, prevVelocityY)
-    if carriedSpeed < MOMENTUM_SPEED_FLOOR then return end
+    if carriedSpeed < MOMENTUM_SPEED_FLOOR then
+        dbg("deploy ignored: carried=%.1f below floor", carriedSpeed)
+        return
+    end
 
-    local restoredX = prevVelocityX * MOMENTUM_KEEP
-    local restoredY = prevVelocityY * MOMENTUM_KEEP
+    initDeployGlider = {
+        elapsed      = 0,
+        carriedX     = prevVelocityX * MOMENTUM_KEEP,
+        carriedY     = prevVelocityY * MOMENTUM_KEEP,
+        carriedSpeed = carriedSpeed * MOMENTUM_KEEP,
+    }
 
-    local speedAtOpen = HorizontalSpeed(cmc.Velocity.X, cmc.Velocity.Y)
-    SetHorizVel(cmc, restoredX, restoredY)
+    dbg("deploy start: carried=%.1f", carriedSpeed)
+end
 
-    if DEBUG then
-        local gliderObject   = ReadOpt(gliderComponent, "CurrentGlider")
-        local itemMaxSpeed   = ReadOpt(gliderObject, "GliderMaxSpeed")
-        local activeMaxSpeed = ReadOpt(cmc, "GliderMaxSpeed")
+-- Runs from the frame after the open until the hold expires or the glider
+-- closes. Only ever raises speed back toward what was carried in -- a
+-- player who is already going faster is left alone.
+local function TickDeployGlider(dt, pawn, cmc, isGliding)
+    local gliderComponent = pawn.BP_GliderComponent
 
-        dbg("open: carried=%.1f atOpen=%.1f restored=%.1f | "
+    if not isGliding then
+        EndDeployGlider("glider closed")
+        return
+    end
+    
+    initDeployGlider.elapsed = initDeployGlider.elapsed + dt
+
+    local currentSpeed = HorizontalSpeed(cmc.Velocity.X, cmc.Velocity.Y)
+    local hasLostSpeed = currentSpeed < initDeployGlider.carriedSpeed
+    if hasLostSpeed then
+        dbg("[glider.lua] I LOST speed upon deploy...")
+        SetHorizVel(cmc, initDeployGlider.carriedX, initDeployGlider.carriedY)
+    end
+
+    if DEBUG and initDeployGlider.elapsed <= dt * 1.5 then
+        dbg("first drive frame: current=%.1f carried=%.1f | "
             .. "cmc.GliderMaxSpeed=%s item.GliderMaxSpeed=%s",
-            carriedSpeed, speedAtOpen,
-            HorizontalSpeed(restoredX, restoredY),
-            tostring(activeMaxSpeed), tostring(itemMaxSpeed))
+            currentSpeed, initDeployGlider.carriedSpeed,
+            tostring(ReadOpt(cmc, "GliderMaxSpeed")),
+            tostring(ReadOpt(ReadOpt(gliderComponent, "CurrentGlider"), "GliderMaxSpeed")))
+    end
+
+    local holdHasExpired = initDeployGlider.elapsed >= DEPLOY_HOLD_TIME
+    if holdHasExpired then
+        EndDeployGlider("hold expired")
     end
 end
 
 -- =========================================================================
--- 5. LIFECYCLE
+-- 5. HOOKS
+-- Declared below the deploy functions on purpose: the callback closes over
+-- StartDeployGlider, which does not exist as a local any earlier in the
+-- file and would silently resolve as a global nil.
+-- =========================================================================
+
+M.Hooks = {
+    { name = "OnStartGlidingDelegate (BP bound)",
+        path = PATH_ON_START_GLIDING,
+        callback = function(Context)
+            local ok, obj = pcall(function() return Context:get() end)
+            if not ok or not obj then return end
+            if not IsOurGliderEvent(obj) then return end
+            StartDeployGlider()
+        end },
+}
+
+-- =========================================================================
+-- 6. LIFECYCLE
 -- =========================================================================
 
 function M.OnPlayerCached(pawn, cmc)
     prevVelocityX, prevVelocityY, prevVelocityZ = 0, 0, 0
-    wasGliderDeployedLastFrame = false
+    initDeployGlider = nil
 
     local gliderComponent = ReadOpt(pawn, "BP_GliderComponent")
-    dbg("glider component: %s",
-        gliderComponent and tostring(gliderComponent) or "NOT FOUND")
+    myPawnName            = FullName(pawn)
+    myGliderComponentName = FullName(gliderComponent)
+
+    dbg("glider component: %s", myGliderComponentName or "NOT FOUND")
 end
 
 -- Cache this frame's velocity for the next frame's comparison. Skipped
@@ -133,7 +225,6 @@ local function CacheFrameState(cmc, isGliding)
         prevVelocityY = velocity.Y
         prevVelocityZ = velocity.Z
     end
-    wasGliderDeployedLastFrame = isGliding
 end
 
 function M.OnTick(dt, pawn, cmc)
@@ -142,9 +233,8 @@ function M.OnTick(dt, pawn, cmc)
 
     local isGliding = gliderComponent.bIsGliding
 
-    local gliderJustOpened = (isGliding and not wasGliderDeployedLastFrame)
-    if gliderJustOpened then
-        OnGliderOpened(pawn, cmc, gliderComponent)
+    if initDeployGlider ~= nil then
+        TickDeployGlider(dt, pawn, cmc, isGliding)
     end
 
     -- Cache values for next frame comparisons. Must stay last.
