@@ -35,9 +35,11 @@
 -- =========================================================================
 
 local UEHelpers = require("UEHelpers")
+local CommonState = require("commonstate")
 
 -- CHANGED: jumpspot added.
 local Subsystems = {
+    require("input"),
     require("jump"),
     require("horizontalmove"),
     require("slide"),
@@ -63,6 +65,7 @@ end
 -- ---------------------------- player cache -------------------------------
 
 local function CachePlayer()
+    CommonState.Reset()
     local ok, p = pcall(function() return UEHelpers.GetPlayer() end)
     if not ok or not p or not p:IsValid() then return false end
     local ok2, c = pcall(function() return p.CharacterMovement end)
