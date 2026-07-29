@@ -13,7 +13,7 @@
 -- =========================================================================
 
 local JumpVel                  = 1050
-local LaunchMultiplier         = 2.5 -- This value perfectly counter's increased gravity back to vanilla launch feel
+local LaunchMultiplier         = 1.27 -- This value perfectly counter's increased gravity back to vanilla launch feel
 local TargetGravity            = 1.8
 local TargetGravityExtreme     = 4
 local VanillaGravity           = 2.6   -- original game vanilla is 1.6
