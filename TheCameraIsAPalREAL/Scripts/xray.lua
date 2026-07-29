@@ -13,17 +13,24 @@
 -- Runs once per session on first cache. Output is grep-able:
 --   grep "TheCameraIsAPal:xray" UE4SS.log
 -- Look for members whose value matches the vanilla numbers (400, 70) or
--- whose names suggest per-state distance/offset/interp control; those are
--- the candidates for a contention-free write channel.
+-- whose names suggest per-state distance/offset/interp control.
+--
+-- THIS IS THE TOOL THAT EXTENDS CHANNEL A. Every `<Prefix>CameraArmLength` /
+-- `<Prefix>CameraOffset` pair this dump reveals is another state the rig can
+-- steer without contention: add the prefix to config.framing.bank and press
+-- F10 — no code change required. Also worth hunting here: an FOV source
+-- parameter, which would move config.rig.channels.fov off Channel C.
+--
+-- Off by default (config.enabled.xray). Turn it on for one session, read the
+-- log, extend config.framing.bank, turn it back off.
 -- =========================================================================
+
+local Log = require("log")
 
 local M = { name = "xray" }
 
 local dumped = false
-
-local function dbg(fmt, ...)
-    print(string.format("[TheCameraIsAPal:xray] " .. fmt .. "\n", ...))
-end
+local dbg    = Log.MakeAlways("xray")
 
 local function PropName(prop)
     local ok, s = pcall(function() return prop:GetFName():ToString() end)
@@ -122,6 +129,8 @@ local function DumpLayers(obj, label)
     end
 end
 
+function M.RefreshConfig(c) end
+
 function M.OnCached(ctx)
     if dumped then return end
     dumped = true
@@ -133,9 +142,15 @@ function M.OnCached(ctx)
     local pcm = nil
     pcall(function() pcm = ctx.pc.PlayerCameraManager end)
     DumpLayers(pcm, "CameraManager")
-    dbg("======== xray complete ========")
+    dbg("======== xray complete: add any <Prefix>CameraArmLength /"
+     .. " <Prefix>CameraOffset pairs to config.framing.bank ========")
 end
 
 function M.OnTick(dt, ctx, sig) end
+
+function M.DumpState(out)
+    out("-- xray --")
+    out("  dumped this session: %s", tostring(dumped))
+end
 
 return M

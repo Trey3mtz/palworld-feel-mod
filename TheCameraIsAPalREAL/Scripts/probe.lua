@@ -1,54 +1,43 @@
 -- =========================================================================
--- TheCameraIsAPal subsystem: probe — passive camera / signal recon
+-- TheCameraIsAPal subsystem: probe — passive camera / signal recon (DEV)
 --
 -- Pass 1 (2026-07-21) confirmed:
 --   arm = PalShooterSpringArmComponent  (pawn.CameraBoom)
 --   cam = PalCharacterCameraComponent   (pawn.FollowCamera)
 --   vanilla: arm 400, SocketOffset (0,0,0), FOV 70, lag disabled
---   camera manager: BP_PalPlayerCameraManager_C with standard modifier
+--   camera manager: BP_PalPlayerCameraManager_C with the standard modifier
 --   stack (CameraAnimationCameraModifier, CameraModifier_CameraShake)
 --
--- IMPORTANT: keep WRITE_TEST = false permanently. The rig now writes
--- TargetArmLength / FieldOfView / SocketOffset every tick and carries its
--- own reassert detector, which supersedes the probe's write test — running
--- both would have them fight each other. This subsystem remains useful for
--- its [E] signal transition logging and the vanilla dump on each (re)spawn;
--- remove it from main.lua's Subsystems list when moving past the dev phase.
+-- PASSIVE ONLY. The old WRITE_TEST timeline is gone: it was permanently
+-- dormant, its own header said never to enable it, and the rig's contention
+-- tracking supersedes it entirely. Nothing in this file writes.
+--
+-- Off by default (config.enabled.probe). Turn it on when you need the [E]
+-- transition log or a fresh vanilla dump, then turn it back off — the
+-- transition lines are chatty enough to matter on the hot path.
 -- =========================================================================
 
-local WRITE_TEST      = false   -- keep false; superseded by rig (see header)
-local WRITE_AT        = 3.0
-local VERDICT_AT      = 9.0
-local ARM_DELTA       = 150.0
-local FOV_DELTA       = 10.0
-local SAMPLE_INTERVAL = 1.0
+local Log = require("log")
 
 local M = { name = "probe" }
 
-local t             = 0
-local nextSample    = 0
-local wroteTest     = false
-local verdictDone   = false
-local base          = {}
-local written       = {}
-local sockWritePath = "none"
-local C             = nil
+local dbg = Log.Make("probe", "signals")
 
+-- ==== configuration ======================================================
+
+local CFG = nil
+
+-- ==== state ==============================================================
+
+local C = nil
 local lastHolstered, lastSprint, lastMode, lastLooking = nil, nil, nil, nil
 
-local function dbg(fmt, ...)
-    print(string.format("[TheCameraIsAPal:probe] " .. fmt .. "\n", ...))
-end
+-- ==== read helpers =======================================================
 
 local function ReadOpt(obj, prop)
     local ok, v = pcall(function() return obj[prop] end)
-    if not ok or v == nil then return nil end
+    if not ok then return nil end
     return v
-end
-
-local function Num(obj, prop)
-    local v = ReadOpt(obj, prop)
-    return (type(v) == "number") and v or nil
 end
 
 local function VecStr(v)
@@ -75,7 +64,7 @@ local function ForEachUObjArray(arr, fn)
     end)
 end
 
--- ------------------------- [B] vanilla dump ------------------------------
+-- ==== dumps ==============================================================
 
 local ARM_PROPS = {
     "TargetArmLength", "SocketOffset", "TargetOffset",
@@ -85,38 +74,33 @@ local ARM_PROPS = {
 }
 local CAM_PROPS = { "FieldOfView", "bConstrainAspectRatio", "PostProcessBlendWeight" }
 
-local function DumpVanilla()
-    dbg("---- [B] vanilla camera values ----")
+local function DumpVanilla(out)
+    out("---- vanilla camera values ----")
     if C.arm then
         for _, p in ipairs(ARM_PROPS) do
             local v = ReadOpt(C.arm, p)
             if type(v) == "userdata" then v = VecStr(v) end
-            dbg("  arm.%-26s = %s", p, tostring(v))
+            out("  arm.%-26s = %s", p, tostring(v))
         end
-        base.arm = Num(C.arm, "TargetArmLength")
-        pcall(function() base.sockY = C.arm.SocketOffset.Y end)
     else
-        dbg("  no spring arm ref — check main.lua discovery output")
+        out("  no spring arm ref -- check main.lua discovery output")
     end
     if C.cam then
         for _, p in ipairs(CAM_PROPS) do
-            dbg("  cam.%-26s = %s", p, tostring(ReadOpt(C.cam, p)))
+            out("  cam.%-26s = %s", p, tostring(ReadOpt(C.cam, p)))
         end
-        base.fov = Num(C.cam, "FieldOfView")
     else
-        dbg("  no camera component ref — check main.lua discovery output")
+        out("  no camera component ref -- check main.lua discovery output")
     end
 end
 
--- ------------------------- [D] camera manager ----------------------------
-
-local function DumpCameraManager()
-    dbg("---- [D] camera manager ----")
+local function DumpCameraManager(out)
+    out("---- camera manager ----")
     local mgr = ReadOpt(C.pc, "PlayerCameraManager")
-    if not mgr then dbg("  PlayerCameraManager not readable"); return end
-    dbg("  class      : %s", mgr:GetFullName())
-    dbg("  DefaultFOV : %s", tostring(ReadOpt(mgr, "DefaultFOV")))
-    dbg("  Pitch range: %s .. %s",
+    if not mgr then out("  PlayerCameraManager not readable"); return end
+    out("  class      : %s", mgr:GetFullName())
+    out("  DefaultFOV : %s", tostring(ReadOpt(mgr, "DefaultFOV")))
+    out("  Pitch range: %s .. %s",
         tostring(ReadOpt(mgr, "ViewPitchMin")), tostring(ReadOpt(mgr, "ViewPitchMax")))
     local mods = ReadOpt(mgr, "ModifierList")
     if mods then
@@ -124,131 +108,59 @@ local function DumpCameraManager()
         ForEachUObjArray(mods, function(m)
             n = n + 1
             local okN, full = pcall(function() return m:GetFullName() end)
-            dbg("  modifier[%d]: %s", n, okN and full or "<unnamed>")
+            out("  modifier[%d]: %s", n, okN and full or "<unnamed>")
         end)
-        if n == 0 then dbg("  ModifierList: empty") end
+        if n == 0 then out("  ModifierList: empty") end
     else
-        dbg("  ModifierList: not readable")
+        out("  ModifierList: not readable")
     end
 end
 
--- ------------------------- [C] write test (dormant) ----------------------
+-- ==== subsystem interface ================================================
 
-local function ApplyWriteTest()
-    dbg("---- [C] applying test writes (stand still!) ----")
-    if C.arm and base.arm then
-        written.arm = base.arm + ARM_DELTA
-        local ok = pcall(function() C.arm.TargetArmLength = written.arm end)
-        dbg("  write arm.TargetArmLength %.1f -> %.1f : %s",
-            base.arm, written.arm, ok and "OK" or "FAILED")
-    end
-    if C.arm and base.sockY ~= nil then
-        written.sockY = 0.0
-        local ok1 = pcall(function() C.arm.SocketOffset.Y = 0.0 end)
-        local applied1 = false
-        pcall(function() applied1 = math.abs(C.arm.SocketOffset.Y) < 0.01 end)
-        if ok1 and applied1 then
-            sockWritePath = "field"
-        else
-            local x, z = 0, 0
-            pcall(function()
-                local so = C.arm.SocketOffset
-                x, z = so.X, so.Z
-            end)
-            local ok2 = pcall(function()
-                C.arm.SocketOffset = { X = x, Y = 0.0, Z = z }
-            end)
-            local applied2 = false
-            pcall(function() applied2 = math.abs(C.arm.SocketOffset.Y) < 0.01 end)
-            sockWritePath = (ok2 and applied2) and "struct" or "NONE WORKED"
-        end
-        dbg("  write arm.SocketOffset.Y %.1f -> 0 : path = %s",
-            base.sockY, sockWritePath)
-    end
-    if C.cam and base.fov then
-        written.fov = base.fov + FOV_DELTA
-        local ok = pcall(function() C.cam.FieldOfView = written.fov end)
-        if not ok then
-            ok = pcall(function() C.cam:SetFieldOfView(written.fov) end)
-            dbg("  FieldOfView property write failed; SetFieldOfView(): %s",
-                ok and "OK" or "FAILED")
-        end
-        dbg("  write cam.FieldOfView %.1f -> %.1f : %s",
-            base.fov, written.fov, ok and "OK" or "FAILED")
-    end
+function M.RefreshConfig(c)
+    if c == nil then return end
+    CFG = c
 end
-
-local function Verdict()
-    dbg("---- [C] VERDICT (%.0fs after writes) ----", VERDICT_AT - WRITE_AT)
-    local function judge(label, target, currentFn)
-        if target == nil then dbg("  %-22s: not tested", label); return end
-        local cur = nil
-        pcall(function() cur = currentFn() end)
-        if cur == nil then dbg("  %-22s: unreadable now", label); return end
-        local held = math.abs(cur - target) < 0.5
-        dbg("  %-22s: %s  (now %.1f, wrote %.1f)",
-            label, held and "HELD — writes stick" or "REASSERTED by game",
-            cur, target)
-    end
-    judge("arm.TargetArmLength", written.arm,
-          function() return C.arm.TargetArmLength end)
-    judge("arm.SocketOffset.Y",  written.sockY,
-          function() return C.arm.SocketOffset.Y end)
-    judge("cam.FieldOfView",     written.fov,
-          function() return C.cam.FieldOfView end)
-    dbg("  FVector write path    : %s", sockWritePath)
-end
-
--- ------------------------- subsystem interface ---------------------------
 
 function M.OnCached(ctx)
     C = ctx
-    t, nextSample, wroteTest, verdictDone = 0, 0, false, false
-    base, written, sockWritePath = {}, {}, "none"
     lastHolstered, lastSprint, lastMode, lastLooking = nil, nil, nil, nil
-
-    DumpVanilla()
-    DumpCameraManager()
-    dbg("probe armed. WRITE_TEST = %s", tostring(WRITE_TEST))
+    if CFG and CFG.dumpOnCache then
+        DumpVanilla(dbg)
+        DumpCameraManager(dbg)
+    end
 end
 
 function M.OnTick(dt, ctx, sig)
-    t = t + dt
-
-    -- [E] signal transition logging
+    if CFG == nil or not CFG.logSignals then return end
+    -- The gate above plus log.channels.signals means this costs two table
+    -- lookups when muted, and never reaches string.format.
     if sig.holstered ~= lastHolstered then
-        dbg("[E] holstered -> %s", tostring(sig.holstered))
         lastHolstered = sig.holstered
+        dbg("[E] holstered -> %s", tostring(sig.holstered))
     end
     if sig.sprinting ~= lastSprint then
-        dbg("[E] sprinting -> %s (speed2d %.0f)", tostring(sig.sprinting), sig.speed2d)
         lastSprint = sig.sprinting
+        dbg("[E] sprinting -> %s (speed2d %.0f)", tostring(sig.sprinting), sig.speed2d)
     end
     if sig.mode ~= lastMode then
-        dbg("[E] MovementMode -> %d (Vz %.0f)", sig.mode, sig.vz)
         lastMode = sig.mode
+        dbg("[E] MovementMode -> %d (Vz %.0f)", sig.mode, sig.vz)
     end
     if sig.userLooking ~= lastLooking then
-        dbg("[E] userLooking -> %s (mag %.3f)", tostring(sig.userLooking), sig.camInput)
         lastLooking = sig.userLooking
+        dbg("[E] userLooking -> %s (mag %.3f)", tostring(sig.userLooking), sig.camInput)
     end
+end
 
-    -- [C] write-test timeline (dormant while WRITE_TEST = false)
-    if WRITE_TEST and not wroteTest and t >= WRITE_AT then
-        wroteTest = true
-        ApplyWriteTest()
-    end
-    if WRITE_TEST and wroteTest and not verdictDone and t >= VERDICT_AT then
-        verdictDone = true
-        Verdict()
-    end
-    if WRITE_TEST and wroteTest and not verdictDone and t >= nextSample then
-        nextSample = t + SAMPLE_INTERVAL
-        local a = C.arm and Num(C.arm, "TargetArmLength") or nil
-        local f = C.cam and Num(C.cam, "FieldOfView") or nil
-        dbg("[C] sample t=%.1f  arm=%s  fov=%s", t,
-            a and string.format("%.1f", a) or "?",
-            f and string.format("%.1f", f) or "?")
+function M.DumpState(out)
+    out("-- probe (live camera values) --")
+    if C then
+        DumpVanilla(out)
+        DumpCameraManager(out)
+    else
+        out("  not cached yet")
     end
 end
 
