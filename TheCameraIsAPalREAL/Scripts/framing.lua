@@ -12,18 +12,30 @@
 -- feedback loop entirely of our own making, and it jittered before the game
 -- was involved at all. Framing now states a target and lets the rig write.
 --
--- Two findings still shape the design:
+-- Three findings shape the design:
 --   (1) The game uses the Walk fields for grounded locomotion regardless of
 --       holster state, so framing has to be holster-driven by us.
---   (2) The game re-reads the state bank ONLY on locomotion-state
---       transitions. Writing the bank while standing still changes nothing
---       until the next jump/aim/state switch. So each transition sends BOTH:
---         bank  -> Channel A, the destination, for the game's own interp
---         value -> Channel C, an eased glide, for immediate response
---       The rig routes and resolves contention; this file just shapes.
---
--- The glide is duration-based rather than an exponential chase, which is
--- what lets it use a real easing curve from easingfunctions.lua.
+--   (2) The bank does not take effect instantly, so each transition sends
+--       BOTH: the destination to Channel A (the bank, for the game's own
+--       interpolation) and an eased glide to Channel C (for the immediate
+--       move). The glide is duration-based rather than an exponential
+--       chase, which is what lets it use a real easing curve from
+--       easingfunctions.lua.
+--   (3) THE GAME NEVER STOPS OWNING THE OUTPUTS. The xray dump settled this:
+--         CameraInterpTime                 = 0.5
+--         LengthInterpCurve/OffsetInterpCurve -> CV_CameraInterpCurve
+--         OriginalTargetArmLength          = 330   (a stored restore target)
+--         SafetyNetArmLengthInterpSpeed    = 12
+--         SafetyNetSocketOffsetInterpSpeed = 10
+--         SafetyNetFoVInterpSpeed          = 12
+--       There is a "safety net" whose job is to drag TargetArmLength,
+--       SocketOffset and FOV back where the game wants them. Holding
+--       Channel C against it produces a ~1 Hz limit cycle -- yield, settle,
+--       resume, get dragged back -- which the player feels as the camera
+--       snapping back about once a second. So once the glide finishes this
+--       file RELEASES Channel C and holds the shot through the bank alone.
+--       config.framing.holdOnChannelC = true restores the old behaviour for
+--       A/B testing.
 --
 -- Holster truth: sig.holstered (see holsterlink.lua).
 -- =========================================================================
@@ -57,7 +69,7 @@ local glide = {
 local fOffset = { x = 0, y = 0, z = 0 }
 local bOffset = { x = 0, y = 0, z = 0 }
 local bank    = { arm = 0, offset = bOffset }
-local request = { arm = 0, offset = fOffset, bank = bank }
+local request = { arm = 0, offset = fOffset, bank = bank, applyNow = true }
 
 -- ==== helpers ============================================================
 
@@ -127,7 +139,7 @@ end
 function M.RefreshConfig(c)
     if c == nil then return end
     CFG = c
-    Rig.SetBankPrefixes(CFG.bank)
+    Rig.SetBankConfig(CFG)
     -- Re-apply latched, non-per-frame state and re-glide to the new framing.
     ApplyLag()
     ApplyExtras()
@@ -140,7 +152,7 @@ function M.OnCached(ctx)
     C = ctx
     lastHolstered, lagTimer, released = nil, 0, false
     glide.t = 1.0
-    Rig.SetBankPrefixes(CFG and CFG.bank)
+    Rig.SetBankConfig(CFG)
     ApplyLag()
     ApplyExtras()
     dbg("cached. lag: enable=%s speed=%.0f maxDist=%.0f rotation=%s | speedBlur=%s",
@@ -175,6 +187,15 @@ function M.OnTick(dt, ctx, sig)
     bOffset.x, bOffset.y, bOffset.z = o.x, o.y, o.z
 
     -- Channel C value: the eased position along the glide.
+    --
+    -- Once the glide settles we STOP asking for Channel C (unless
+    -- holdOnChannelC is set). Holding it is what caused the once-a-second
+    -- snap: the game's SafetyNet*InterpSpeed machinery drags those outputs
+    -- back toward OriginalTargetArmLength every frame, the rig correctly
+    -- yields, the value goes quiet, the rig resumes, and round it goes. The
+    -- bank we wrote through Channel A already aims the game's own
+    -- interpolation at these values, so letting go costs nothing and the
+    -- shot holds itself.
     if glide.t < 1.0 then
         local dur = (CFG.glide and CFG.glide.duration) or 0.45
         glide.t = (dur > 0) and math.min(1.0, glide.t + dt / dur) or 1.0
@@ -183,22 +204,30 @@ function M.OnTick(dt, ctx, sig)
         fOffset.x   = e(glide.fromX, o.x, glide.t)
         fOffset.y   = e(glide.fromY, o.y, glide.t)
         fOffset.z   = e(glide.fromZ, o.z, glide.t)
+        request.applyNow = true
         if glide.t >= 1.0 then
-            dbg("glide settled (arm=%.0f)", set.arm)
+            dbg("glide settled (arm=%.0f) — releasing channel C to the game",
+                set.arm)
         end
     else
         request.arm = set.arm
         fOffset.x, fOffset.y, fOffset.z = o.x, o.y, o.z
+        request.applyNow = CFG.holdOnChannelC and true or false
     end
 
     Rig.Framing(request)
 
-    -- Re-assert lag; the game restores its own values on some state changes.
-    local period = 1.0 / ((CFG.lag.reassertHz > 0) and CFG.lag.reassertHz or 1.0)
-    lagTimer = lagTimer + dt
-    if lagTimer >= period then
-        lagTimer = 0
-        ApplyLag()
+    -- Optional lag re-assert, OFF by default (reassertHz = 0). The game runs
+    -- SafetyNetCameraLagSpeedInterpSpeed = 12, so it pulls CameraLagSpeed
+    -- back within a few frames of any write. Re-asserting on a timer just
+    -- builds a sawtooth on the lag speed at exactly the re-assert rate,
+    -- which the player feels as a periodic lurch.
+    if CFG.lag.reassertHz and CFG.lag.reassertHz > 0 then
+        lagTimer = lagTimer + dt
+        if lagTimer >= 1.0 / CFG.lag.reassertHz then
+            lagTimer = 0
+            ApplyLag()
+        end
     end
 end
 
@@ -207,6 +236,8 @@ function M.DumpState(out)
     out("  holstered   : %s", tostring(lastHolstered))
     out("  glide       : t=%.2f (%s)", glide.t,
         glide.t >= 1.0 and "settled" or "in progress")
+    out("  channel C   : %s", request.applyNow and "held (holdOnChannelC)"
+        or "released to the game")
     out("  target      : arm=%.0f offset=(%.0f, %.0f, %.0f)",
         request.arm, fOffset.x, fOffset.y, fOffset.z)
     out("  bank fields : %s", CFG and table.concat(CFG.bank, ", ") or "?")

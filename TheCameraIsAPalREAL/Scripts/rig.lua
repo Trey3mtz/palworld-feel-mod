@@ -105,7 +105,8 @@ local obsArm, obsSockX, obsSockY, obsSockZ = nil, nil, nil, nil
 
 -- Channel A latch: last banked values, so we only write the bank on change.
 local bankArm, bankX, bankY, bankZ = nil, nil, nil, nil
-local vanillaBank = nil     -- captured once, restored by Release()
+local vanillaBank      = nil   -- captured once per pawn, restored by Release()
+local vanillaBankOwner = nil   -- which spring arm the snapshot came from
 
 -- Channel B shake class resolution.
 local shakeResolved, shakeClass, shakeWarned = false, nil, false
@@ -208,9 +209,12 @@ function M.Begin()
 end
 
 --- Absolute framing target. Already eased by the caller; not re-smoothed.
+--- `applyNow == false` banks the destination on Channel A but does NOT touch
+--- the outputs. framing.lua uses that to let go once its glide has settled,
+--- so we stop trading writes with the game's SafetyNet interpolators.
 function M.Framing(r)
     if not open then return end
-    req.framing = true
+    req.framing = (r.applyNow ~= false)
     req.fArm = r.arm or 0
     local o = r.offset
     if o then req.fX, req.fY, req.fZ = o.x or 0, o.y or 0, o.z or 0
@@ -264,8 +268,18 @@ local function BankFieldNames(prefix)
     return prefix .. "CameraArmLength", prefix .. "CameraOffset"
 end
 
+--- Snapshot the game's own bank values, ONCE per spring-arm component.
+---
+--- Keyed on the component so a re-cache cannot clobber it. The logs showed
+--- CacheAll running twice 450ms apart on the same pawn, with our holstered
+--- values already banked by the second run -- re-capturing there would have
+--- recorded arm=500 as "vanilla" and made the F11 restore a no-op.
 local function CaptureVanillaBank()
-    if vanillaBank ~= nil or not ValidArm() then return end
+    if not ValidArm() then return end
+    local owner = nil
+    pcall(function() owner = C.arm:GetFullName() end)
+    if vanillaBank ~= nil and owner == vanillaBankOwner then return end
+    vanillaBankOwner = owner
     local arm = C.arm
     local snap = {}
     for _, prefix in ipairs(CFG.bankPrefixes or {}) do
@@ -276,6 +290,12 @@ local function CaptureVanillaBank()
         if x then entry.x, entry.y, entry.z = x, y, z end
         if entry.len or entry.x then snap[prefix] = entry end
     end
+    -- The SafetyNet's restore targets, so Release() can put them back too.
+    local orig = {}
+    pcall(function() orig.len = arm.OriginalTargetArmLength end)
+    local ox, oy, oz = ReadVec(arm, "OriginalTargetOffset")
+    if ox then orig.x, orig.y, orig.z = ox, oy, oz end
+    if orig.len or orig.x then snap.__originals = orig end
     vanillaBank = snap
 end
 
@@ -293,17 +313,43 @@ local function WriteBank(armLen, x, y, z)
         if pcall(function() arm[lenName] = armLen end) then written = written + 1 end
         WriteVec(arm, offName, x, y, z)
     end
-    dbg("channel A bank -> arm=%.0f offset=(%.0f, %.0f, %.0f) [%d fields]",
-        armLen, x, y, z, written)
+
+    -- Point the SAFETY NET at our values too. OriginalTargetArmLength /
+    -- OriginalTargetOffset are what SafetyNetArmLengthInterpSpeed and
+    -- SafetyNetSocketOffsetInterpSpeed drag the live outputs back toward.
+    -- Writing the per-state bank alone is not enough: the safety net would
+    -- keep hauling the camera to the cached vanilla 330 and our framing would
+    -- never stick once Channel C lets go. With these written, the game's own
+    -- restore machinery holds OUR shot instead of fighting it -- which is the
+    -- whole point of Channel A.
+    if CFG.writeOriginals then
+        if pcall(function() arm.OriginalTargetArmLength = armLen end) then
+            written = written + 1
+        end
+        WriteVec(arm, "OriginalTargetOffset", x, y, z)
+    end
+
+    dbg("channel A bank -> arm=%.0f offset=(%.0f, %.0f, %.0f) [%d fields%s]",
+        armLen, x, y, z, written,
+        CFG.writeOriginals and " + originals" or "")
 end
 
 local function RestoreBank()
     if vanillaBank == nil or not ValidArm() then return end
     local arm = C.arm
     for prefix, entry in pairs(vanillaBank) do
-        local lenName, offName = BankFieldNames(prefix)
-        if entry.len then pcall(function() arm[lenName] = entry.len end) end
-        if entry.x then WriteVec(arm, offName, entry.x, entry.y, entry.z) end
+        if prefix == "__originals" then
+            if entry.len then
+                pcall(function() arm.OriginalTargetArmLength = entry.len end)
+            end
+            if entry.x then
+                WriteVec(arm, "OriginalTargetOffset", entry.x, entry.y, entry.z)
+            end
+        else
+            local lenName, offName = BankFieldNames(prefix)
+            if entry.len then pcall(function() arm[lenName] = entry.len end) end
+            if entry.x then WriteVec(arm, offName, entry.x, entry.y, entry.z) end
+        end
     end
     bankArm, bankX, bankY, bankZ = nil, nil, nil, nil
     dbg("channel A bank restored to vanilla")
@@ -471,9 +517,11 @@ function M.RefreshConfig(c)
         CFG.contention.quietFrames)
 end
 
---- Tell the rig which bank prefixes Channel A may write (from config.framing).
-function M.SetBankPrefixes(list)
-    if CFG then CFG.bankPrefixes = list or {} end
+--- Hand the rig framing's Channel A settings (called from framing.lua).
+function M.SetBankConfig(fcfg)
+    if CFG == nil or fcfg == nil then return end
+    CFG.bankPrefixes   = fcfg.bank or {}
+    CFG.writeOriginals = fcfg.writeOriginals ~= false
 end
 
 function M.OnCached(ctx)
@@ -501,8 +549,9 @@ function M.OnCached(ctx)
         pcall(function() baseFov = C.cam.FieldOfView end)
     end
 
-    -- Snapshot the vanilla bank BEFORE anything writes it, so F11 can restore.
-    vanillaBank = nil
+    -- Snapshot the vanilla bank BEFORE anything writes it, so F11 can
+    -- restore. Deliberately NOT cleared here: CaptureVanillaBank keys on the
+    -- component, so a second cache on the same pawn keeps the real snapshot.
     CaptureVanillaBank()
 
     dbg("bases: arm=%s fov=%s sock=(%.1f, %.1f, %.1f)",

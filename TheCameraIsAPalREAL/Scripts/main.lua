@@ -348,7 +348,20 @@ local function BuildSignals()
     -- unreadable or not the live sprint state) and its pcall silently
     -- disabled every sprint effect. Grounded speed above the walk cap (350)
     -- cannot fail silently.
-    sig.sprinting = sig.grounded and sig.speed2d > S.sprintMinSpeed
+    --
+    -- With HYSTERESIS: real speed hovers on the threshold, and a single
+    -- comparison made the effects flap -- captured in the logs as sprintfx
+    -- engaging at 610 and disengaging at 408 seventy-eight ms later, which
+    -- pumps the bob and the arm pull on and off. Enter above sprintMinSpeed,
+    -- leave only after dropping below sprintExitSpeed.
+    local exitSpeed = S.sprintExitSpeed or S.sprintMinSpeed
+    if not sig.grounded then
+        sig.sprinting = false
+    elseif sig.sprinting then
+        sig.sprinting = sig.speed2d > exitSpeed
+    else
+        sig.sprinting = sig.speed2d > S.sprintMinSpeed
+    end
 
     sig.holstered = HolsterLink.IsHolstered(ctx)
     sig.heading   = U.VelocityHeadingDeg(v.X, v.Y, S.headingMinSpeed)

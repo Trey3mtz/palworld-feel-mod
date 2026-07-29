@@ -38,15 +38,16 @@ local engaged  = false
 
 -- Hoisted request payload; the tick path allocates nothing.
 local jitter  = { x = 0, y = 0, z = 0 }
-local request = { fovAdd = 0, jitter = jitter }
+local request = { fovAdd = 0, jitter = jitter, armScale = 1.0 }
 
 -- ==== subsystem interface ================================================
 
 function M.RefreshConfig(c)
     if c == nil then return end
     CFG = c
-    dbg("config refreshed: fov=%.1f bob=(%.0f/%.0f) cadence=%.1f-%.1fHz",
-        CFG.fovAdd, CFG.bobLat, CFG.bobVert, CFG.stepLo, CFG.stepHi)
+    dbg("config refreshed: fov=%.1f armPull=%.2f bob=(%.0f/%.0f) cadence=%.1f-%.1fHz",
+        CFG.fovAdd, CFG.armPull or 1.0, CFG.bobLat, CFG.bobVert,
+        CFG.stepLo, CFG.stepHi)
 end
 
 function M.OnCached(ctx)
@@ -89,6 +90,12 @@ function M.OnTick(dt, ctx, sig)
              + U.Noise1D(nt * CFG.roughHz + 91.7) * CFG.roughZ * amp
     request.fovAdd = CFG.fovAdd * amp
 
+    -- Gears-style pull-in: the camera closes on the player as intensity
+    -- rises. Interpolated from 1.0 by `amp`, so it arrives and leaves with
+    -- the bob rather than snapping at the sprint threshold.
+    local pull = CFG.armPull or 1.0
+    request.armScale = 1.0 + (pull - 1.0) * amp
+
     Rig.Add(request)
 
     -- One rotational jolt per footfall, on the uncontested channel.
@@ -103,7 +110,8 @@ end
 
 function M.DumpState(out)
     out("-- sprintfx --")
-    out("  engaged     : %s  amp=%.2f", tostring(engaged), amp)
+    out("  engaged     : %s  amp=%.2f  armScale=%.3f",
+        tostring(engaged), amp, request.armScale)
     out("  phase       : %.2f steps", ph)
 end
 

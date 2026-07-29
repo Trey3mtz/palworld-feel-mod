@@ -69,10 +69,17 @@ function M.OnTick(dt, ctx, sig)
         engaged = (target > 0)
         dbg("%s (down=%.0f)", engaged and "engaged" or "disengaged", down)
         if not engaged then
-            -- Touchdown: one hard rotational jolt, scaled by the fall.
-            if CFG.landImpulse and peak >= CFG.landMinInt then
+            -- Fire ONLY on a real touchdown. The old test was "the effect
+            -- stopped", which is not the same thing: the logs caught it
+            -- firing at down=468, i.e. still falling fast, because the
+            -- movement mode had changed (glide/swim/mount). That is a jolt
+            -- from nothing, mid-air.
+            local landed = sig.grounded
+            if landed and CFG.landImpulse and peak >= CFG.landMinInt then
                 Rig.Impulse(CFG.landScale * peak)
                 dbg("landing impulse (peak=%.2f)", peak)
+            elseif not landed then
+                dbg("fall ended without touchdown (down=%.0f) — no impulse", down)
             end
             peak = 0.0
         end
