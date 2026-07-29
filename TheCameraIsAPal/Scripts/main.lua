@@ -33,10 +33,10 @@
 --     PlayerController:ClientRestart (fires on every mount swap), which
 --     is why that hook no longer exists here.
 -- =========================================================================
-
+ 
 local UEHelpers = require("UEHelpers")
 local CommonState = require("commonstate")
-
+ 
 -- CHANGED: jumpspot added.
 local Subsystems = {
     require("input"),
@@ -46,25 +46,25 @@ local Subsystems = {
     require("climb"),
     require("glider"),
 }
-
+ 
 local DEBUG = true
-
+ 
 local PATH_CONTROLLER_TICK =
     "/Game/Pal/Blueprint/Controller/BP_PalPlayerController.BP_PalPlayerController_C:ReceiveTick"
-
+ 
 -- Native base class of the player pawn. Its construction (CDO at class
 -- load, instance at spawn/respawn) is the load-complete signal.
 local PAWN_NATIVE_CLASS = "/Script/Pal.PalPlayerCharacter"
-
+ 
 local pawn, cmc = nil, nil
 local subErr = {}
-
+ 
 local function dbg(fmt, ...)
     if DEBUG then print(string.format("[PalFeel] " .. fmt .. "\n", ...)) end
 end
-
+ 
 -- ---------------------------- player cache -------------------------------
-
+ 
 local function CachePlayer()
     CommonState.Reset()
     local ok, p = pcall(function() return UEHelpers.GetPlayer() end)
@@ -79,12 +79,12 @@ local function CachePlayer()
     end
     return true
 end
-
+ 
 local function ValidRefs()
     if pawn and pawn:IsValid() and cmc and cmc:IsValid() then return true end
     return CachePlayer()
 end
-
+ 
 local function Tick(dt)
     if not ValidRefs() then return end
     for _, sub in ipairs(Subsystems) do
@@ -95,10 +95,10 @@ local function Tick(dt)
         end
     end
 end
-
+ 
 -- ---------------------------- hook registry ------------------------------
 -- The core tick hook plus everything declared by subsystems via M.Hooks.
-
+ 
 local HookList = {
     { name = "controller tick", path = PATH_CONTROLLER_TICK,
         callback = function(Context, DeltaSeconds)
@@ -106,9 +106,9 @@ local HookList = {
             Tick(ok and dt or 0.0083)
         end },
 }
-
+ 
 local NotifyList = {}
-
+ 
 for _, sub in ipairs(Subsystems) do
     for _, h in ipairs(sub.Hooks or {}) do
         HookList[#HookList + 1] = h
@@ -117,13 +117,13 @@ for _, sub in ipairs(Subsystems) do
         NotifyList[#NotifyList + 1] = n
     end
 end
-
+ 
 local function IsNativePath(path)
     return path:sub(1, 8) == "/Script/"
 end
-
+ 
 local function NoOp() end
-
+ 
 -- One registration attempt. On success stores the callback ids needed to
 -- unbind later. A /Game/ failure here is not an error condition: it means
 -- the class is not loaded yet, and the next construction event retries.
@@ -144,14 +144,14 @@ local function Register(h, context)
     end
     return ok
 end
-
+ 
 -- /Script/ paths exist from engine init: register once, at mod load.
 local function InstallNativeHooks()
     for _, h in ipairs(HookList) do
         if IsNativePath(h.path) then Register(h, "mod load") end
     end
 end
-
+ 
 local function InstallNotifications()
     for _, n in ipairs(NotifyList) do
         if not n.installed then
@@ -166,7 +166,7 @@ local function InstallNotifications()
         end
     end
 end
-
+ 
 -- /Game/ paths: (re)bind on demand. Previously stored ids are unregistered
 -- first, so a world reload (BP class GC'd and reloaded => old hook dead)
 -- rebinds cleanly, and a same-world refire never double-registers.
@@ -188,9 +188,9 @@ local function RefreshBlueprintHooks(context)
         end
     end
 end
-
+ 
 --\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\-- MOD ENTRY POINT --////////////////////////////////////--
-
+ 
 -- One notification per constructed player character: class load (CDO),
 -- first spawn, every respawn, every world (re)load. The CDO pass can run
 -- before the controller BP is loaded, in which case the tick hook logs as
@@ -210,17 +210,17 @@ NotifyList[#NotifyList + 1] = {
         RefreshBlueprintHooks("pawn constructed")
     end,
 }
-
+ 
 do
     local names = {}
     for _, s in ipairs(Subsystems) do names[#names + 1] = s.name end
     dbg("PalFeel loaded. Subsystems: %s  |  hooks declared: %d  |  notifications: %d",
         table.concat(names, ", "), #HookList, #NotifyList)
 end
-
+ 
 InstallNativeHooks()
 InstallNotifications()
-
+ 
 -- Hot-reload mid-session: the pawn already exists, so no construction
 -- notification is coming — bind immediately.
 ---@diagnostic disable-next-line: undefined-global
