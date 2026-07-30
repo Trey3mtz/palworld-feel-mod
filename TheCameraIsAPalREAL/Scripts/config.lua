@@ -80,6 +80,12 @@ tick = {
 rig = {
     channels = {
         framing = "A+C",   -- bank for transitions, glide for immediate effect
+        -- Sprint pull-in. "A" scales the state bank, so the game's own
+        -- interpolation (CameraInterpTime/LengthInterpCurve) carries the move
+        -- -- smooth, and nothing contests it. "C" writes TargetArmLength
+        -- directly instead: more immediate, but the game may revert it.
+        -- Never both: the scale would land twice.
+        armScale = "A",
         jitter  = "C",     -- B cannot carry a per-frame curve; see header
         fov     = "C",     -- no FOV source param found yet — run xray
         impulse = "B",
@@ -96,6 +102,10 @@ rig = {
     -- out and back in so neither handover is a visible pop.
     contention = {
         quietFrames   = 6,      -- stable frames before we take the channel back
+        -- Hard ceiling on standing down. This game moves the camera
+        -- properties every frame, so "wait for quiet" can wait forever; a
+        -- feature silently off forever is worse than one that contends.
+        maxYieldSeconds = 2.0,
         releaseRate   = 30.0,   -- 1/s fade-OUT of our contribution (fast: get
                                 --      out of the way in ~9 frames)
         resumeRate    = 6.0,    -- 1/s fade-IN when the game lets go (gentle)
@@ -229,10 +239,13 @@ sprintfx = {
 -- ==== 7. fallfx ==========================================================
 -- Vertical-dominant heave while falling + one hard jolt on touchdown.
 fallfx = {
-    -- 200 uu/s is stepping off a curb -- the logs showed the effect arming
-    -- on every small hop (down=201..227) and then firing a full-strength
-    -- landing shake. 600 is a real fall.
-    vzStart   = 600,     -- uu/s downward before any effect
+    -- 200 uu/s is stepping off a curb; 600 was an over-correction. Captured
+    -- falls engage around 220 and peak near 920, and rampIn is 6/s, so a
+    -- 600 threshold left the effect only a fraction of a second to ramp and
+    -- it never became visible. The tiny-hop problem was the landing IMPULSE,
+    -- which landMinInt gates on its own. 350 clears a curb but arms on any
+    -- real drop.
+    vzStart   = 350,     -- uu/s downward before any effect
     vzMax     = 1400,    -- uu/s downward at full intensity
     fovMax    = 12.0,    -- deg at full intensity
 

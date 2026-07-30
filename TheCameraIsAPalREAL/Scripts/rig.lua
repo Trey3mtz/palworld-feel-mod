@@ -96,7 +96,9 @@ local lastSockX, lastSockY, lastSockZ = nil, nil, nil
 local haveLastSock = false
 local yielding     = false  -- the game currently owns the channel
 local quietFrames  = 0      -- consecutive frames the game left it alone
-local authority    = 1.0    -- 0..1 blend of our whole contribution
+local authority    = 1.0    -- 0..1 blend of the FRAMING contribution
+local yieldSeconds = 0      -- how long we have been standing down
+local yieldWarned  = false
 
 -- Values observed last frame, used to tell whether the GAME is still driving
 -- the channel while we are silent. A frame counter cannot tell that; this
@@ -303,7 +305,16 @@ local function WriteBank(armLen, x, y, z)
     if not ValidArm() then return end
     -- Latch: the bank is state, not a per-frame value. Writing it every
     -- frame is pure waste and floods the log on transitions.
-    if bankArm == armLen and bankX == x and bankY == y and bankZ == z then return end
+    if bankArm ~= nil
+       and math.abs(bankArm - armLen) < 0.01
+       and math.abs(bankX - x) < 0.01
+       and math.abs(bankY - y) < 0.01
+       and math.abs(bankZ - z) < 0.01 then return end
+    -- Log only on a meaningful move: with armScale riding channel A the bank
+    -- changes every frame while the pull-in ramps, and logging each write
+    -- would flood UE4SS.log on the hot path.
+    local worthLogging = bankArm == nil or math.abs(armLen - bankArm) > 1.0
+                      or math.abs(z - (bankZ or 0)) > 1.0
     bankArm, bankX, bankY, bankZ = armLen, x, y, z
 
     local arm = C.arm
@@ -329,9 +340,11 @@ local function WriteBank(armLen, x, y, z)
         WriteVec(arm, "OriginalTargetOffset", x, y, z)
     end
 
-    dbg("channel A bank -> arm=%.0f offset=(%.0f, %.0f, %.0f) [%d fields%s]",
-        armLen, x, y, z, written,
-        CFG.writeOriginals and " + originals" or "")
+    if worthLogging then
+        dbg("channel A bank -> arm=%.0f offset=(%.0f, %.0f, %.0f) [%d fields%s]",
+            armLen, x, y, z, written,
+            CFG.writeOriginals and " + originals" or "")
+    end
 end
 
 local function RestoreBank()
@@ -533,6 +546,7 @@ function M.OnCached(ctx)
     sSockX, sSockY, sSockZ = 0, 0, 0
     ClearWriteTracking()
     yielding, quietFrames, authority = false, 0, 1.0
+    yieldSeconds, yieldWarned = 0, false
     obsArm, obsSockX, obsSockY, obsSockZ = nil, nil, nil, nil
     bankArm, bankX, bankY, bankZ = nil, nil, nil, nil
     vecPath = nil
@@ -583,22 +597,39 @@ function M.Finish(dt, ctx)
         M.FireImpulse(req.impulse)
     end
 
-    -- ---- channel A: bank the framing destination ----
-    if req.framing and req.hasBank and RouteHas("framing", "A") then
-        WriteBank(req.bArm, req.bX, req.bY, req.bZ)
-    end
-
-    -- ---- channel C ----
-    if not ClassifyAndTrack() then return end
-    if baseArm == nil or baseFov == nil then return end
-
-    -- Smooth the additive layer even while yielding, so resuming does not snap.
+    -- ---- smoothing (needed by both channel A and channel C below) ----
     local sm = CFG.smooth
     sScale, vScale = U.SmoothDamp(sScale, req.armScale, vScale, sm.armTime, dt)
     sFov,   vFov   = U.SmoothDamp(sFov,   req.fovAdd,   vFov,   sm.fovTime, dt)
     sSockX = U.ExpApproach(sSockX, req.sockX, sm.sockRate, dt)
     sSockY = U.ExpApproach(sSockY, req.sockY, sm.sockRate, dt)
     sSockZ = U.ExpApproach(sSockZ, req.sockZ, sm.sockRate, dt)
+
+    -- ---- channel A: bank the framing destination ----
+    -- Deliberately NOT gated on req.framing. req.framing means "apply on
+    -- Channel C too"; framing.lua sets it false once its glide settles, and
+    -- gating the bank on it meant we stopped re-asserting Channel A the
+    -- moment we let go of the outputs -- the one channel that actually wins.
+    if req.hasBank and RouteHas("framing", "A") then
+        local bankArmOut = req.bArm
+        -- armScale on Channel A: scale the bank so the game's own
+        -- interpolation carries the pull-in. Smooth and uncontested. It must
+        -- NOT also be applied on Channel C or it lands twice.
+        if RouteHas("armScale", "A") then
+            -- Deadzone. SmoothDamp approaches 1.0 asymptotically and never
+            -- arrives, so without this the bank is rewritten every frame
+            -- forever with a value a ten-thousandth different -- endless
+            -- pointless writes to a channel whose whole virtue is that the
+            -- game is its only other writer.
+            local s = (math.abs(sScale - 1.0) <= CFG.neutral.scale) and 1.0 or sScale
+            bankArmOut = bankArmOut * s
+        end
+        WriteBank(bankArmOut, req.bX, req.bY, req.bZ)
+    end
+
+    -- ---- channel C ----
+    if not ClassifyAndTrack() then return end
+    if baseArm == nil or baseFov == nil then return end
 
     -- AUTHORITY: how much of our contribution is currently applied. It rides
     -- to 0 while the game owns the channel and back to 1 when it lets go, so
@@ -610,27 +641,56 @@ function M.Finish(dt, ctx)
     -- fading out is a frame we write a value the game immediately reverts,
     -- which is contention we chose to have. Coming back is slow, because a
     -- quick re-entry reads as a pop even when it is technically correct.
+    -- A bounded yield. "Wait until the property stops moving" is the right
+    -- test in principle, but in a game that touches these every frame it can
+    -- wait forever, and a feature that is silently off forever is worse than
+    -- one that occasionally contends. After maxYield seconds we take the
+    -- channel back regardless and say so.
+    if yielding then
+        yieldSeconds = yieldSeconds + dt
+        local maxYield = CFG.contention.maxYieldSeconds or 0
+        if maxYield > 0 and yieldSeconds >= maxYield then
+            yielding, quietFrames, yieldSeconds = false, 0, 0
+            if not yieldWarned then
+                yieldWarned = true
+                warn("channel C was yielded for %.1fs without the game going "
+                  .. "quiet -- taking it back. If framing looks contested, "
+                  .. "the game owns this property continuously; keep framing "
+                  .. "on channel A.", maxYield)
+            end
+        end
+    else
+        yieldSeconds = 0
+    end
+
     local rate = yielding and CFG.contention.releaseRate or CFG.contention.resumeRate
     authority = U.ExpApproach(authority, yielding and 0.0 or 1.0, rate, dt)
 
-    -- Fully yielded: the game owns this channel outright. Write nothing.
-    if authority < 0.01 then
-        ClearWriteTracking()
-        return
-    end
-
+    -- Authority gates FRAMING ONLY.
+    --
+    -- It used to gate the whole of Channel C, which was a serious mistake:
+    -- the additive layer (bob, heave, FOV, arm scale) is re-derived from the
+    -- CURRENT base every frame, so being overwritten costs it one frame, not
+    -- correctness -- there is no absolute target for it to oscillate against.
+    -- Framing is the opposite: a fixed value the game actively reverts, which
+    -- is what needs to stand down. Gating both meant that the first stomp
+    -- silenced every effect, and because this game moves those properties
+    -- continuously (safety net, interp curves, adaptive Z smoothing) the
+    -- "has it gone quiet" resume test could never pass -- so the suppression
+    -- was permanent and every feature simply stopped existing.
     local framingOnC = req.framing and RouteHas("framing", "C")
+                       and authority >= 0.01
 
     -- Neutrality: with nothing to say, write nothing and let the game own
     -- the channel outright.
     local jitterActive = req.jitterX ~= 0 or req.jitterY ~= 0 or req.jitterZ ~= 0
     local n = CFG.neutral
-    local active = framingOnC or jitterActive
-        or math.abs(sScale - 1.0) > n.scale
-        or math.abs(sFov)         > n.fov
-        or math.abs(sSockX)       > n.sock
-        or math.abs(sSockY)       > n.sock
-        or math.abs(sSockZ)       > n.sock
+    local scaleOnC = (not RouteHas("armScale", "A")) and math.abs(sScale - 1.0) > n.scale
+    local active = framingOnC or jitterActive or scaleOnC
+        or math.abs(sFov)   > n.fov
+        or math.abs(sSockX) > n.sock
+        or math.abs(sSockY) > n.sock
+        or math.abs(sSockZ) > n.sock
 
     if not active then
         ClearWriteTracking()
@@ -642,16 +702,19 @@ function M.Finish(dt, ctx)
     -- scaled by authority, and framing itself blends from the game's own
     -- value toward ours, so a partial authority is a partial effect rather
     -- than a half-applied jump.
+    -- Framing blends by authority; the additive layer does not.
     local a = authority
     local rootArm = framingOnC and (baseArm   + (req.fArm - baseArm)   * a) or baseArm
     local rootX   = framingOnC and (baseSockX + (req.fX   - baseSockX) * a) or baseSockX
     local rootY   = framingOnC and (baseSockY + (req.fY   - baseSockY) * a) or baseSockY
     local rootZ   = framingOnC and (baseSockZ + (req.fZ   - baseSockZ) * a) or baseSockZ
 
-    local outArm = rootArm * (1.0 + (sScale - 1.0) * a)
-    local outX   = rootX + (sSockX + req.jitterX) * a
-    local outY   = rootY + (sSockY + req.jitterY) * a
-    local outZ   = rootZ + (sSockZ + req.jitterZ) * a
+    -- armScale is applied here ONLY when it is not already riding Channel A.
+    local armMul = RouteHas("armScale", "A") and 1.0 or sScale
+    local outArm = rootArm * armMul
+    local outX   = rootX + sSockX + req.jitterX
+    local outY   = rootY + sSockY + req.jitterY
+    local outZ   = rootZ + sSockZ + req.jitterZ
 
     if pcall(function() C.arm.TargetArmLength = outArm end) then
         lastArm = outArm
@@ -701,9 +764,11 @@ function M.DumpState(out)
         tostring(bankArm), tostring(bankX), tostring(bankY), tostring(bankZ))
     out("  channel B   : shake=%s impulses=%d",
         shakeClass and "resolved" or "UNAVAILABLE", stats.impulses)
-    out("  channel C   : %s authority=%.2f quiet=%d vecPath=%s",
-        yielding and "YIELDING (game owns it)" or "active",
-        authority, quietFrames, tostring(vecPath))
+    out("  channel C   : %s authority=%.2f quiet=%d yielded=%.1fs vecPath=%s",
+        yielding and "YIELDING framing (game owns it)" or "active",
+        authority, quietFrames, yieldSeconds, tostring(vecPath))
+    out("  NOTE        : the additive layer (bob/heave/FOV) is NEVER gated by"
+     .. " authority; only framing stands down.")
     out("  contention  : arm w=%d s=%d | fov w=%d s=%d | sock w=%d s=%d",
         stats.arm.w, stats.arm.s, stats.fov.w, stats.fov.s,
         stats.sock.w, stats.sock.s)
