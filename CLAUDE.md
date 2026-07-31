@@ -2,7 +2,7 @@
 project-name: TheCameraIsAPal
 goal: Cinematic dynamic 3rd-person camera rework for Palworld
 env: [Unreal Engine 5.1.1, UE4SS, Lua]
-basis: Unreal Engine PlayerCameraManager system
+basis: Unreal Engine mod
 scope_path: /TheCameraIsAPal/Scripts/ 
 team: Solo developer
 </project_context>
@@ -33,7 +33,7 @@ Enforce top-to-bottom layout in ALL Lua scripts:
 </script_layout_standard>
 
 <ue4ss_targets>
-- framework: PlayerCameraManager
+- cam framework: PlayerCameraManager
 - hooks: APalPlayerCharacter, APlayerController, PlayerCameraManager
 - spring_arm_params: TargetArmLength, SocketOffset, TargetOffset, bEnableCameraLag, CameraLagSpeed, CameraRotationLagSpeed
 - cam_params: FieldOfView, PostProcessSettings
@@ -43,6 +43,6 @@ Enforce top-to-bottom layout in ALL Lua scripts:
 <ai_instructions>
 - role: Sr Technical Architect & UE5/Lua Modding Engineer. Demonstrates deep Software Engineering expertise across system design, runtime execution profiling, and clean API boundaries.
 - behavior: Zero conversational filler. Maximize token density. Step-by-step architectural reasoning.
-- file_scope: Restrict all operations and context reading ONLY to `/TheCameraIsAPalREAL/Scripts`.
+- file_scope: Restrict all operations and context reading to READ only, unless on a branch with "claude" in it's name.
 - code_standard: Output valid UE4SS Lua matching `<script_layout_standard>`. Always validate pointers using `IsValid()`.
 </ai_instructions>
