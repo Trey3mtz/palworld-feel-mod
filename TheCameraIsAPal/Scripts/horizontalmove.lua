@@ -22,8 +22,9 @@
 --                      on dot(inputDir, velDir) < TURN_DOT.
 -- Skid animation     : a one-shot montage on DefaultSlot fired once at the
 --                      turn trigger (the plant), classed walk/sprint by the
---                      same peak test as the launch. Placeholder clips
---                      until authored skids exist.
+--                      same peak test as the launch. Clips are authored in
+--                      Animation/SkidTurn and ship as AnimSequences, so the
+--                      play path wraps them in a dynamic montage.
 -- Air                : bUseSeparateBrakingFriction is GLOBAL, so it must be
 --                      toggled off while falling or the ground stop value
 --                      lands on the air as drag. See OnTick.
@@ -99,13 +100,20 @@ local LAUNCH_FRAC      = 0.85   -- sprint-class
 local LAUNCH_FRAC_WALK = 0.51   -- 60% of the sprint launch
  
 -- ---- skid animation ----
--- PLACEHOLDER clips (resident dodge montages) until authored skids exist.
--- Both target DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
--- come from the montage assets themselves.
+-- Authored in Animation/SkidTurn (see that README for the FBX -> AnimSequence
+-- -> pak pipeline). Class is decided by the same peak test as the launch.
+-- Either asset type works: an AnimMontage is played directly, an AnimSequence
+-- is wrapped in a dynamic montage on SKID_SLOT, which is what the build
+-- pipeline produces and needs no montage asset authored in-editor.
 local SKID_MONTAGES = {
-    sprint = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_FlipBwd.AM_Player_Female_FlipBwd",
-    walk   = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_RollFwd.AM_Player_Female_RollFwd",
+    sprint = "/Game/Pal/Animation/Character/Player/Female/Turn/AS_Player_Female_SkidTurn_Sprint.AS_Player_Female_SkidTurn_Sprint",
+    walk   = "/Game/Pal/Animation/Character/Player/Female/Turn/AS_Player_Female_SkidTurn_Walk.AS_Player_Female_SkidTurn_Walk",
 }
+ 
+local SKID_SLOT       = "DefaultSlot"
+local SKID_BLEND_IN   = 0.10   -- s; short, the plant must land on the trigger
+local SKID_BLEND_OUT  = 0.35   -- s; long, so the exit stride melts into locomotion
+local SKID_PLAY_RATE  = 1.00   -- clips are authored at the montage's real speed
  
 -- ---- debug ----
 local DEBUG      = true
@@ -148,7 +156,8 @@ local prevSpd = nil
 local wallT   = 0
  
 -- ---- skid animation state ----
-local skidMontageCache = {}    -- class -> montage handle
+local skidAssetCache = {}      -- class -> AnimSequence/AnimMontage handle
+local skidPlaying    = nil     -- montage actually playing (dynamic or asset)
  
 -- =========================================================================
 -- 3. UTILITIES
@@ -248,16 +257,18 @@ end
 -- =========================================================================
 -- 6. SKID ANIMATION
 -- One-shot montage at the turn trigger. Class ("walk"/"sprint") is decided
--- by the same peak test as the launch fraction.
+-- by the same peak test as the launch fraction. The authored clips ship as
+-- AnimSequences, so the play path wraps them in a dynamic montage; a real
+-- AnimMontage asset is still accepted and played as-is.
 -- =========================================================================
  
-local function GetSkidMontage(class)
-    local m = skidMontageCache[class]
-    if m and m:IsValid() then return m end
-    m = StaticFindObject(SKID_MONTAGES[class])
-    if m and not m:IsValid() then m = nil end
-    skidMontageCache[class] = m
-    return m
+local function GetSkidAsset(class)
+    local a = skidAssetCache[class]
+    if a and a:IsValid() then return a end
+    a = StaticFindObject(SKID_MONTAGES[class])
+    if a and not a:IsValid() then a = nil end
+    skidAssetCache[class] = a
+    return a
 end
  
 local function ResolveAnimInstance()
@@ -270,27 +281,47 @@ local function ResolveAnimInstance()
     return nil
 end
  
--- Either variant still playing suppresses a new play: both live in
--- DefaultGroup, so Montage_Play would cut the other mid-skid otherwise.
-local function IsAnySkidPlaying(anim)
-    for class in pairs(SKID_MONTAGES) do
-        local m = skidMontageCache[class]
-        if m and m:IsValid() then
-            local playing = false
-            pcall(function() playing = anim:Montage_IsPlaying(m) end)
-            if playing then return true end
-        end
-    end
-    return false
+-- A skid still running suppresses a new play: both classes share one slot, so
+-- starting the other would cut this one mid-plant. Tracked by the montage the
+-- play call handed back, because the dynamic-montage path creates its montage
+-- at play time and there is no asset to look it up by.
+local function IsSkidPlaying(anim)
+    if not (skidPlaying and skidPlaying:IsValid()) then return false end
+    local playing = false
+    pcall(function() playing = anim:Montage_IsPlaying(skidPlaying) end)
+    if not playing then skidPlaying = nil end
+    return playing
 end
  
 local function PlaySkidAnimation(class)
-    local m = GetSkidMontage(class)
-    if m == nil then return end
+    local asset = GetSkidAsset(class)
+    if asset == nil then return end
     local anim = ResolveAnimInstance()
     if anim == nil then return end
-    if IsAnySkidPlaying(anim) then return end
-    pcall(function() anim:Montage_Play(m, 1.0, 0, 0.0, true) end)
+    if IsSkidPlaying(anim) then return end
+ 
+    local played, isMontage = nil, false
+    local montageClass = StaticFindObject("/Script/Engine.AnimMontage")
+    if montageClass and montageClass:IsValid() then
+        pcall(function() isMontage = asset:IsA(montageClass) end)
+    end
+ 
+    if isMontage then
+        pcall(function()
+            anim:Montage_Play(asset, SKID_PLAY_RATE, 0, 0.0, true)
+            played = asset
+        end)
+    else
+        -- AnimSequence: slot, blends and rate come from the tuning block above
+        -- rather than from a montage asset that nobody has authored yet.
+        pcall(function()
+            played = anim:PlaySlotAnimationAsDynamicMontage(
+                asset, FName(SKID_SLOT), SKID_BLEND_IN, SKID_BLEND_OUT,
+                SKID_PLAY_RATE, 1, -1.0, 0.0)
+        end)
+    end
+    skidPlaying = (played and played:IsValid()) and played or nil
+    if skidPlaying == nil then dbg("skid play failed for %s", class) end
 end
  
 -- =========================================================================
@@ -559,6 +590,9 @@ function M.OnPlayerCached(pawn, cmc)
     phase, turnT, turnCool, peakSpeed = PHASE_NONE, 0, 0, 0
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
+    -- a dead pawn's montage handle would otherwise suppress the new pawn's
+    -- first skid until it happened to report itself finished
+    skidAssetCache, skidPlaying = {}, nil
  
     -- Report the sprint fields before touching anything (fills the baseline).
     dbg("vanilla: walk=%.0f  SprintMaxSpeed=%s  SprintMaxAcceleration=%s  SprintYawRate=%s",
