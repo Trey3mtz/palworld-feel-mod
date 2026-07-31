@@ -11,7 +11,7 @@ local Input       = require("input")
 -- 1. TUNING
 -- =========================================================================
 
-local DEBUG   = true
+local DEBUG   = false
 
 -- Per-frame logging, separated from DEBUG so it cannot be left on. print()
 -- feeds UE4SS's console buffer and log file, neither of which is trimmed.
@@ -43,9 +43,9 @@ local BLOCK_RATIO = 0.4
 -- return. Current average = 900 -> driveTime = 0.278s, same as the
 -- constant-speed build.
 local LEAP_SPEED_START = 2200
-local LEAP_SPEED_END   = 165
+local LEAP_SPEED_END   = 162
 local LEAP_EASE        = Easing.EaseOutCirc
-local LEAP_DIST     = 242    -- uu of travel before the attach check
+local LEAP_DIST     = 175    -- uu of travel before the attach check
 local LEAP_ANGLES   = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 }
 local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
 
@@ -57,7 +57,7 @@ local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
 local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 
 -- ---- init climb: launch schedule ----
-local INIT_CLIMB_LAUNCH_GRACE = 0.10   -- s to leave the ground before the jump counts as refused
+local INIT_CLIMB_LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
 local INIT_CLIMB_ATTACH_AT_GROUND  = 0.35   -- s of air time before the first attach attempt
 local INIT_CLIMB_ATTACH_AT_JUMP    = 0.25
 local INIT_CLIMB_LOCK_TIME    = 0.6   -- s of air time before giving up
