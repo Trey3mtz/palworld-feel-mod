@@ -3,7 +3,7 @@ project-name: TheCameraIsAPal
 goal: Cinematic dynamic 3rd-person camera rework for Palworld
 env: [Unreal Engine 5.1.1, UE4SS, Lua]
 basis: Unreal Engine PlayerCameraManager system
-scope_path: /TheCameraIsAPal/Scripts/horizontalmove 
+scope_path: /TheCameraIsAPal/Scripts/ 
 team: Solo developer
 </project_context>
 
