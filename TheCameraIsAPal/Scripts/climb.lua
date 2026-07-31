@@ -249,6 +249,25 @@ local KSL = nil             -- KismetSystemLibrary default object, lazy
 local hooksRegistered = false
 local lastGroundCheck = nil
 
+-- ---- tick-order diagnostic (read-only) ----
+-- Everything currently runs off BP_PalPlayerController_C:ReceiveTick. The
+-- controller and the climbing component both tick in TG_PrePhysics, and
+-- within a tick group UE orders nothing unless a prerequisite says so -- so
+-- which runs first is decided by registration order and can differ between
+-- sessions, respawns, or streaming states. That is enough on its own to make
+-- the same wall behave differently on different runs, and no tuning value
+-- here can fix it.
+--
+-- These sample whether the component's tick is even hookable, and if so
+-- whether it lands before or after our controller tick. Answering that is
+-- the prerequisite for moving the grab decision onto the component's tick.
+local compTickHookAlive   = false
+local compTickedBeforeUs  = false
+local tickOrderBefore     = 0
+local tickOrderAfter      = 0
+local tickOrderSamples    = 0
+local TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
+
 
 
 -- =========================================================================
@@ -1566,6 +1585,46 @@ local function RegisterComponentHooks()
     dbg("hook GroundCheck: %s",
         okGnd and "registered" or ("FAILED: " .. tostring(errGnd)))
 
+    -- DIAGNOSTIC ONLY -- changes no behaviour.
+    --
+    -- ReceiveTick is UActorComponent's BlueprintImplementableEvent "Tick".
+    -- It is only a hookable UFunction-with-script if this Blueprint actually
+    -- implements an Event Tick node; if the climb logic lives in native
+    -- UPalClimbingComponent::TickComponent then there is nothing here to
+    -- hook at all, because a C++ virtual never crosses ProcessEvent.
+    -- Registering against the BP class path (never the /Script/Engine base,
+    -- which would fire for every component in the world) answers that.
+    local okTick, errTick = pcall(function()
+        RegisterHook(clsPath .. ":ReceiveTick", function(Context)
+            if not IsOurComponent(Context) then return end
+            compTickHookAlive  = true
+            compTickedBeforeUs = true
+        end)
+    end)
+    dbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native "
+        .. "and the grab decision cannot be pre-empted this way",
+        okTick and "registered" or ("FAILED: " .. tostring(errTick)))
+
+    -- One-shot dump of the component's own BP functions. GroundCheck and
+    -- ClimbUpAtTopEvent were found by hand; if one of the others IS the grab
+    -- decision, pre-hooking that is far more surgical than a tick hook and
+    -- would let the suppression be conditional instead of held across a
+    -- whole approach.
+    local okDump = pcall(function()
+        local cls = comp:GetClass()
+        dbg("---- %s functions ----", clsPath)
+        cls:ForEachFunction(function(fn)
+            local n = nil
+            pcall(function() n = fn:GetName() end)
+            if n then dbg("  fn: %s", n) end
+        end)
+        dbg("---- end functions ----")
+    end)
+    if not okDump then
+        dbg("function dump unavailable on this UE4SS build "
+            .. "(ForEachFunction missing) -- names must be found by hand")
+    end
+
     hooksRegistered = true
 end
 
@@ -1593,6 +1652,8 @@ function M.OnPlayerCached(pawn, cmc)
     prevClimbZ     = nil
     gameClimbSuppressed = false   -- fresh component, fresh flag
     approachGuardArmed  = false
+    compTickedBeforeUs  = false
+    tickOrderBefore, tickOrderAfter, tickOrderSamples = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
@@ -1797,7 +1858,35 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
 end
 
 
+-- Reads the flag the component's tick hook sets, then clears it, so each
+-- controller tick learns whether the component ran ahead of it. Sampled for
+-- a few seconds and then silent. A split result is the finding: it means the
+-- order is not stable, and no probe range tuned from this file can fix that.
+local function SampleTickOrder()
+    if not DEBUG then return end
+    if not compTickHookAlive then return end
+    if tickOrderSamples >= TICK_ORDER_SAMPLE_MAX then return end
+
+    tickOrderSamples = tickOrderSamples + 1
+    if compTickedBeforeUs then
+        tickOrderBefore = tickOrderBefore + 1
+    else
+        tickOrderAfter = tickOrderAfter + 1
+    end
+    compTickedBeforeUs = false
+
+    if tickOrderSamples == TICK_ORDER_SAMPLE_MAX then
+        dbg("TICK ORDER over %d frames: component ran BEFORE our tick %d, "
+            .. "AFTER (or not at all) %d. Split = nondeterministic order, "
+            .. "which is on its own enough to make the same wall behave "
+            .. "differently between runs.",
+            tickOrderSamples, tickOrderBefore, tickOrderAfter)
+    end
+end
+
 function M.OnTick(dt, pawn, cmc)
+    SampleTickOrder()
+
     local movementMode    = cmc.MovementMode
     local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
     local isClimbing = (movementMode == 6 and customMovementMode == 5)
