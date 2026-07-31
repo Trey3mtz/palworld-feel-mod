@@ -40,7 +40,8 @@
 -- let the game's own physics produce the dip.
 -- =========================================================================
 
-local DEBUG = true
+local DEBUG = false
+local EasingOptions = require("easingfunctions")
 
 -- =========================================================================
 -- 1. TUNING
@@ -57,11 +58,29 @@ local PATH_ON_START_GLIDING =
     "/Game/Pal/Blueprint/Component/Glider/BP_GliderComponent.BP_GliderComponent_C:"
     .. "OnStartGliding"
 
+
+-- ---- swoop boost (horizontal speed increase after dip) ----
+
+-- Duration bounds (scaled by the magnitude of the dip)
+local SWOOP_MIN_DURATION = 1         -- s
+local SWOOP_MAX_DURATION = 2         -- s
+
+-- Peak velocity multipliers (+10% to +25% extra horizontal speed)
+local SWOOP_MIN_BOOST_PCT = 0.1
+local SWOOP_MAX_BOOST_PCT = 0.25
+
+-- The sink depth at which the boost magnitude hits 100%. 
+-- Because buoyancy.sinkDepth is negative while sinking, this must also be negative.
+local SWOOP_REFERENCE_DEPTH = -300     -- uu
+
+
 -- ---- momentum preservation ----
 
 -- Fraction of the carried horizontal velocity re-asserted during the hold.
 -- 1.0 = full preservation.
 local MOMENTUM_KEEP = 1.0
+local AIR_CONTROL = 0.5 -- Vanilla is 1.0
+local GLIDE_ROTATION_MULTIPLIER = 0.5
 
 -- Below this, the open is a near-standstill deploy and there is no
 -- momentum worth preserving.
@@ -77,35 +96,35 @@ local MOMENTUM_HOLD_TIME = 0.25    -- s
 -- Playback multiplier for the glider unfurl. Written to the montage
 -- assets, which are read when the montage starts -- so this must be
 -- applied before a deploy, never during one.
-local DEPLOY_ANIM_RATE = 2.0
+local DEPLOY_ANIM_RATE = 1.3
 
 -- ---- buoyant catch ----
 
 -- Fall speed the deploy must exceed before buoyancy engages. Below it the
 -- game's normal cap is left alone entirely.
-local BUOYANCY_MIN_FALL_SPEED = 400    -- uu/s
+local BUOYANCY_MIN_FALL_SPEED = 350    -- uu/s
 
 -- The preserved fall speed is clamped here. Dip depth scales with how far
 -- the initial descent sits from equilibrium, so this is the knob that
 -- bounds maximum dip depth.
-local BUOYANCY_MAX_FALL_SPEED = 1600   -- uu/s
+local BUOYANCY_MAX_FALL_SPEED = 4500   -- uu/s
 
 -- Steady-state descent rate of a normal glide, as a negative Z velocity.
 -- UNMEASURED: read cmc.Velocity.Z during a settled glide and plug in the
 -- real number. The oscillator below swings about this line, so a wrong
 -- value makes the character fight the game's descent rate indefinitely.
-local GLIDE_DESCENT_RATE = -250        -- uu/s
+local GLIDE_DESCENT_RATE = -200        -- uu/s
 
 -- How fast the catch resolves, in oscillations per second. The whole
 -- dip-and-recover takes roughly one period, so 1.0 Hz is about a second.
 -- This is the snappiness knob and it does NOT change the overshoot shape.
-local BUOYANCY_FREQUENCY = 1.0         -- Hz
+local BUOYANCY_FREQUENCY = 0.80         -- Hz
 
 -- Overshoot shape, dimensionless and independent of frequency. 1.0 is
 -- critically damped: the dip flattens out with no rise back. Lower values
 -- carry the character back PAST the glide line before settling, which is
 -- the visible catch. Below about 0.2 it starts to ring.
-local BUOYANCY_DAMPING_RATIO = 0.37
+local BUOYANCY_DAMPING_RATIO = 0.32
 
 -- Derived. Stated as frequency and ratio above because the raw pair is
 -- coupled -- raising stiffness alone silently changes the overshoot, since
@@ -116,11 +135,11 @@ local BUOYANCY_DAMPING   = 2 * BUOYANCY_DAMPING_RATIO * BUOYANCY_ANGULAR_FREQUEN
 
 -- Settle thresholds. Once the character is this close to the glide line in
 -- both position and rate, control goes back to the game.
-local BUOYANCY_SETTLE_DEPTH = 15       -- uu
-local BUOYANCY_SETTLE_SPEED = 40       -- uu/s
+local BUOYANCY_SETTLE_DEPTH = 10       -- uu
+local BUOYANCY_SETTLE_SPEED = 60       -- uu/s
 
 -- Hard ceiling on the settle, so a bad tune cannot own the whole flight.
-local BUOYANCY_MAX_TIME = 1.2          -- s
+local BUOYANCY_MAX_TIME = 2.25          -- s
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -132,6 +151,9 @@ local M = { name = "glider" }
 -- Written only on frames where the glider is NOT deployed, so at hook time
 -- these hold the last pre-glide velocity.
 local prevVelocityX, prevVelocityY, prevVelocityZ = 0, 0, 0
+
+local originalRotationRateYaw = nil
+local isRotationScaled = false
 
 -- ---- deploy state ----
 -- nil when no deploy is in progress. Built in StartDeployGlider, cleared in
@@ -247,7 +269,8 @@ local function ConfigureGliderObject(gliderObj, reason)
     if gliderObj == nil then return end
     if IsJetpackGlider(gliderObj) then return end
 
-    dbg("configuring glider (%s): %s", reason or "?", FullName(gliderObj))
+    --dbg("configuring glider (%s): %s", reason or "?", FullName(gliderObj))
+
     ApplyDeployAnimRate(gliderObj)
 end
 
@@ -293,12 +316,22 @@ local function StartDeployGlider()
         buoyancy = {
             active    = fallIsWorthCatching,
             elapsed   = 0,
-            -- How far below the glide line the character currently sits.
-            -- Negative while sinking. The restoring force reads this.
             sinkDepth = 0,
             preservedFallSpeed   = preservedFallSpeed,
             hasRestoredFallSpeed = false,
+            prevDescentError     = 0, -- NEW: Track for peak detection
         },
+        swoop = {                     -- NEW: Swoop drive sub-state
+            active = false,
+            triggered = false,
+            maxSinkDepth = 0,
+            elapsed = 0,
+            duration = 0,
+            peakBoostPct = 0,
+            currentBoostX = 0,
+            currentBoostY = 0,
+            baseMaxSpeed = nil
+        }
     }
 
     dbg("deploy start: carried=%.1f fall=%.1f preserved=%.1f "
@@ -327,6 +360,53 @@ local function DriveMomentumHold(dt, cmc)
     end
 end
 
+local function DriveSwoopBoost(dt, cmc)
+    local swoop = initDeployGlider.swoop
+    if not swoop.active then return end
+
+    -- Strip the boost applied in the previous frame to isolate the base horizontal velocity
+    SetHorizVel(cmc, cmc.Velocity.X - swoop.currentBoostX, cmc.Velocity.Y - swoop.currentBoostY)
+
+    swoop.elapsed = swoop.elapsed + dt
+    if swoop.elapsed >= swoop.duration then
+        swoop.active = false
+        swoop.currentBoostX = 0
+        swoop.currentBoostY = 0
+
+        if swoop.baseMaxSpeed then
+            pcall(function() cmc.GliderMaxSpeed = swoop.baseMaxSpeed end)
+        end
+
+        dbg("swoop finished")
+        return
+    end
+
+    local halfDuration = swoop.duration / 2
+    local envelope = 0
+
+    -- Ease up to the peak for the first half, ease down for the second half
+    if swoop.elapsed < halfDuration then
+        local t = swoop.elapsed / halfDuration
+        envelope = EasingOptions.EaseInOutQuad(0, 1, t)
+    else
+        local t = (swoop.elapsed - halfDuration) / halfDuration
+        envelope = EasingOptions.EaseInOutQuad(1, 0, t)
+    end
+
+    local currentMultiplier = swoop.peakBoostPct * envelope
+
+    if swoop.baseMaxSpeed then
+        pcall(function() cmc.GliderMaxSpeed = swoop.baseMaxSpeed * (1 + currentMultiplier) end)
+    end
+
+    -- Calculate and store the new added velocity based on the base velocity
+    swoop.currentBoostX = cmc.Velocity.X * currentMultiplier
+    swoop.currentBoostY = cmc.Velocity.Y * currentMultiplier
+
+    -- Re-apply the boost on top of the base velocity
+    SetHorizVel(cmc, cmc.Velocity.X + swoop.currentBoostX, cmc.Velocity.Y + swoop.currentBoostY)
+end
+
 -- Damped oscillator about the glide line. The first frame undoes the
 -- game's fall-speed cap; from then on the sink integrates and lift pushes
 -- back against it.
@@ -345,6 +425,29 @@ local function DriveBuoyantCatch(dt, cmc)
     -- Negative while sinking faster than a settled glide would.
     local descentError = cmc.Velocity.Z - GLIDE_DESCENT_RATE
     buoyancy.sinkDepth = buoyancy.sinkDepth + descentError * dt
+
+    -- Peak Detection Logic
+    local swoop = initDeployGlider.swoop
+    if not swoop.triggered then
+        -- Track the lowest point (most negative sink depth)
+        swoop.maxSinkDepth = math.min(swoop.maxSinkDepth, buoyancy.sinkDepth)
+
+        -- If descent error was negative (falling faster than glide) and crosses to positive (rising), we hit the bottom
+        if buoyancy.prevDescentError <= 0 and descentError > 0 then
+            swoop.triggered = true
+            swoop.active = true
+            swoop.baseMaxSpeed = ReadOpt(cmc, "GliderMaxSpeed")
+
+            -- Normalize the depth against our reference. Both are negative, so division gives a positive ratio.
+            local dipRatio = math.max(0, math.min(1, swoop.maxSinkDepth / SWOOP_REFERENCE_DEPTH))
+            
+            swoop.duration = SWOOP_MIN_DURATION + (SWOOP_MAX_DURATION - SWOOP_MIN_DURATION) * dipRatio
+            swoop.peakBoostPct = SWOOP_MIN_BOOST_PCT + (SWOOP_MAX_BOOST_PCT - SWOOP_MIN_BOOST_PCT) * dipRatio
+            
+            dbg("swoop triggered: ratio=%.2f dur=%.2f peakPct=%.2f", dipRatio, swoop.duration, swoop.peakBoostPct)
+        end
+    end
+    buoyancy.prevDescentError = descentError
 
     local restoringForce = -BUOYANCY_STIFFNESS * buoyancy.sinkDepth
     local dampingForce   = -BUOYANCY_DAMPING * descentError
@@ -375,6 +478,7 @@ local function TickDeployGlider(dt, cmc, gliderComponent, gliderObj)
 
     DriveMomentumHold(dt, cmc)
     DriveBuoyantCatch(dt, cmc)
+    DriveSwoopBoost(dt, cmc) 
 
     if DEBUG then
         dbg("  drive vXY=%7.1f vZ=%+8.1f sink=%+8.1f",
@@ -382,9 +486,12 @@ local function TickDeployGlider(dt, cmc, gliderComponent, gliderObj)
             cmc.Velocity.Z, initDeployGlider.buoyancy.sinkDepth)
     end
 
-    local bothDrivesFinished =
-        (not initDeployGlider.momentum.active) and (not initDeployGlider.buoyancy.active)
-    if bothDrivesFinished then
+    local allDrivesFinished =
+        (not initDeployGlider.momentum.active) and
+        (not initDeployGlider.buoyancy.active) and
+        (not initDeployGlider.swoop.active)
+        
+    if allDrivesFinished then
         EndDeployGlider("drives complete")
     end
 end
@@ -435,11 +542,15 @@ function M.OnPlayerCached(pawn, cmc)
     prevVelocityX, prevVelocityY, prevVelocityZ = 0, 0, 0
     initDeployGlider  = nil
     configuredMontages = {}
-
     local gliderComponent = ReadOpt(pawn, "BP_GliderComponent")
     myGliderComponentName = FullName(gliderComponent)
+    cmc.GliderAirControl = AIR_CONTROL
 
-    dbg("glider component: %s", myGliderComponentName or "NOT FOUND")
+    
+    -- Cache original rotation rate
+    local rotRate = ReadOpt(cmc, "RotationRate")
+    originalRotationRateYaw = rotRate and rotRate.Yaw or nil
+    isRotationScaled = false
 
     -- Covers hot-reload mid-session, where the equipped glider already
     -- exists and no construction notification is coming.
@@ -469,7 +580,18 @@ function M.OnTick(dt, pawn, cmc)
     if initDeployGlider ~= nil then
         TickDeployGlider(dt, cmc, gliderComponent, gliderObj)
     end
-
+-- Handle turning rate scaling
+    if isGliding and not isRotationScaled then
+        if originalRotationRateYaw then
+            pcall(function() cmc.RotationRate.Yaw = originalRotationRateYaw * GLIDE_ROTATION_MULTIPLIER end)
+        end
+        isRotationScaled = true
+    elseif not isGliding and isRotationScaled then
+        if originalRotationRateYaw then
+            pcall(function() cmc.RotationRate.Yaw = originalRotationRateYaw end)
+        end
+        isRotationScaled = false
+    end
     -- Cache values for next frame comparisons. Must stay last.
     CacheFrameState(cmc, isGliding)
 end
