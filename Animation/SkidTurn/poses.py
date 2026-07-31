@@ -98,7 +98,7 @@ ENTRY = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 2 -- PLANT (t = 0.067, two frames in)
+# beat 2 -- PLANT (t = 0.067, f2 -- the trigger frame's throw)
 # The right leg is thrown out ahead heel-first while the chest is still
 # travelling forward. Fastest change in the clip, and the frame the gameplay
 # skid actually starts on -- BeginTurn fires the montage here.
@@ -131,7 +131,7 @@ PLANT = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 3 -- SKID (t = 0.167)
+# beat 3 -- SKID (t = 0.133, f4 -- mid-pivot)
 # The hero pose. Hip lag, chest lead, back pitch and leg extension all peak
 # together, and the ground solve drops the hips onto the long plant leg for
 # the lowest frame in the clip. Hold-ish: the next beat only drifts out of it,
@@ -172,7 +172,7 @@ SKID = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 4 -- DRIFT (t = 0.233)
+# beat 4 -- DRIFT (t = 0.200, f6 -- late in the SKID phase)
 # The skate. Almost nothing changes except that the plant foot gets FURTHER
 # ahead of the hips (+39 -> +43) while the body stays behind it -- an in-place
 # montage cannot move the character, so a foot sliding out from under the
@@ -191,7 +191,7 @@ DRIFT = {
 
     # plant leg straightens further as it slides out ahead
     "thigh_r":     R.limb(swing=PLANT_REACH + 3, splay=PLANT_SPLAY, twist=-10, side="r"),
-    "calf_r":      R.limb(swing=-6, side="r"),
+    "calf_r":      R.limb(swing=-12, side="r"),
     "foot_r":      R.foot(pitch=9, yaw=-24, roll=-12),
     "ball_r":      R.foot(pitch=6),
     # trail leg starts to unfold toward the new heading
@@ -209,7 +209,7 @@ DRIFT = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 5 -- CATCH (t = 0.333)
+# beat 5 -- CATCH (t = 0.267, f8 -- just past the SKID -> LAUNCH handoff)
 # It bites. The slide stops, the hips come up and swing through over the plant,
 # the torso starts righting itself and the trail knee drives toward the new
 # heading. The beat that says "didn't slip after all".
@@ -223,8 +223,11 @@ CATCH = {
     "neck_01":     R.axial(lean=3, turn=7),
     "head":        R.axial(lean=4, turn=11, tilt=-3),
 
+    # knee folds hard here: the plant leg passes back under the body between
+    # this beat and PUSH, and a straight leg on the way through jacks the hip
+    # solve up 5cm for one frame -- a visible hop out of the recovery.
     "thigh_r":     R.limb(swing=22, splay=4, twist=-8, side="r"),
-    "calf_r":      R.limb(swing=-22, side="r"),
+    "calf_r":      R.limb(swing=-44, side="r"),
     "foot_r":      R.foot(pitch=4, yaw=-14, roll=-3),
     "thigh_l":     R.limb(swing=10, splay=7, side="l"),
     "calf_l":      R.limb(swing=-70, side="l"),
@@ -240,7 +243,7 @@ CATCH = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 6 -- PUSH (t = 0.400)
+# beat 6 -- PUSH (t = 0.367, f11 -- mid launch hold)
 # The plant leg extends and drives back down the old heading, the hips have
 # flipped from lagging to leading, the torso whips forward and the arms swap.
 # Lines up with the Lua launch phase, where the mod reasserts velocity along
@@ -274,7 +277,7 @@ PUSH = {
 }
 
 # ---------------------------------------------------------------------------
-# beat 7 -- EXIT (t = 0.500)
+# beat 7 -- EXIT (t = 0.467, f14 -- just past release)
 # A plain accelerating stride, deliberately close to neutral so the 0.35s
 # blend-out lands on the locomotion cycle without a second pop.
 # ---------------------------------------------------------------------------
@@ -308,53 +311,70 @@ EXIT = {
 # clips
 # ---------------------------------------------------------------------------
 
-def _keys(scale=1.0):
-    """Beat times, optionally compressed for the shorter walk clip.
+def _keys():
+    """Beat times, cut to the gameplay phases in horizontalmove.lua.
+
+    Easing carries as much of the read as the poses do:
+    The Lua runs SKID for SKID_TIME (0.25s, velocity held along the OLD
+    heading), then LAUNCH for LAUNCH_HOLD (0.20s, velocity reasserted along
+    the new input direction), then releases at 0.45s. The beats are placed on
+    those boundaries rather than on a rhythm of their own:
+
+      f0  entry   BeginTurn fires here
+      f2  plant   the throw, still early in the pivot
+      f4  skid    hero pose, mid-pivot
+      f6  drift   the skate, late in the SKID phase
+      f8  catch   just past the SKID -> LAUNCH handoff at 0.25s
+      f11 push    mid launch hold, where the mod is driving velocity out
+      f14 exit    just past release at 0.45s, blending back to locomotion
 
     Easing carries as much of the read as the poses do:
       ENTRY -> PLANT   OutQuad,   the leg is thrown and arrives early
       PLANT -> SKID    OutCubic,  slam into the extreme, then settle
       SKID  -> DRIFT   Linear,    constant-rate skate: no ease, it is a slide
       DRIFT -> CATCH   Linear,    the leg extends at a constant rate; easing
-                       here bunches the whole 14cm hip rise into one frame
+                       here bunches the whole hip rise into one frame
       CATCH -> PUSH    InCubic,   coil then release -- the snap of the clip
       PUSH  -> EXIT    OutQuad,   unwinding into locomotion
     """
     beats = [
         (0.000, ENTRY, "EaseLinear", "entry"),
         (0.067, PLANT, "EaseOutQuad", "plant"),
-        (0.167, SKID, "EaseOutCubic", "skid"),
-        (0.233, DRIFT, "EaseLinear", "drift"),
-        (0.333, CATCH, "EaseLinear", "catch"),
-        (0.400, PUSH, "EaseInCubic", "push"),
-        (0.500, EXIT, "EaseOutQuad", "exit"),
+        (0.133, SKID, "EaseOutCubic", "skid"),
+        (0.200, DRIFT, "EaseLinear", "drift"),
+        (0.267, CATCH, "EaseLinear", "catch"),
+        (0.367, PUSH, "EaseInCubic", "push"),
+        (0.467, EXIT, "EaseOutQuad", "exit"),
     ]
     hands = _hands()
     out = []
     for t, pose, ease, label in beats:
         merged = dict(pose)
         merged.update(hands)
-        out.append(Key(round(t * scale, 4), merged, ease, label))
+        out.append(Key(t, merged, ease, label))
     return out
 
 
 def sprint_clip():
     """Full-amplitude version, for reversals out of a sprint."""
-    return Clip("AS_Player_Female_SkidTurn_Sprint", _keys(1.0), fps=30.0,
-                duration=0.5,
-                notes="sprint-class reversal; covers SKID_TIME 0.32 + LAUNCH_HOLD 0.06")
+    return Clip("AS_Player_Female_SkidTurn_Sprint", _keys(), fps=30.0,
+                duration=0.4667,
+                notes="sprint-class reversal; covers SKID_TIME 0.25 + LAUNCH_HOLD 0.20")
 
 
 def walk_clip():
-    """Same performance at 62% amplitude and 79% duration.
+    """Same performance and the same LENGTH, at 62% amplitude.
 
-    A walking reversal has less momentum to fight, so the plant is shorter and
-    the body never gets as far behind its feet -- but it is the same move, and
-    sharing the data means retuning the sprint clip retunes both.
+    The clips differ in amplitude only. SKID_TIME and LAUNCH_HOLD are not
+    class-dependent in horizontalmove.lua -- a walk-class reversal owns
+    velocity for exactly as long as a sprint-class one -- so a shorter walk
+    clip would blend out while the mod was still driving the turn. What a
+    walking reversal actually has is less momentum to fight, which is
+    amplitude, not time.
     """
-    return Clip("AS_Player_Female_SkidTurn_Walk", _keys(0.786), fps=30.0,
-                duration=0.3933, amp=0.62,
-                notes="walk-class reversal; softer plant, quicker recovery")
+    return Clip("AS_Player_Female_SkidTurn_Walk", _keys(), fps=30.0,
+                duration=0.4667, amp=0.62,
+                notes="walk-class reversal; same timing, softer plant")
 
 
 CLIPS = {"sprint": sprint_clip, "walk": walk_clip}
