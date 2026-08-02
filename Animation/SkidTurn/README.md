@@ -92,6 +92,7 @@ No dependencies — standard library only. Outputs land in `out/`:
 - `preview.html` — self-contained scrubbable previewer, orbit + per-frame metrics
 - `<name>_side.png`, `<name>_front.png` — contact sheets
 - `report.txt` — per-frame hip height, torso pitch, separation, foot positions
+- `retargeting.txt` — the per-bone skeleton settings these clips assume
 
 `build.py` refuses to finish if the FBX fails its round-trip check: `verify.py`
 re-reads the file, applies the exact conversion Unreal's importer applies, runs
@@ -177,6 +178,44 @@ name inserted above `root`, so the hierarchies line up. The bone is keyed to
 (0,0,0) rotation and translation on every frame, and the round-trip check
 proves it moves no joint. Any skeleton without that bone just drops the track.
 Pass whatever your skeleton's root bone is actually called.
+
+### The mesh distorts into a stick figure instead of posing
+
+The clip is fine; the **skeleton's translation retargeting** is not set. This
+is the single most likely thing to go wrong on a re-imported skeleton, and it
+is a two-minute fix in the Skeleton asset.
+
+Every bone in an animation carries both a rotation and a translation. Which one
+Unreal actually uses is a per-bone setting on the *Skeleton*, not on the clip:
+
+| mode | where the bone's position comes from |
+|---|---|
+| `Skeleton` | the **mesh's** reference pose — the clip's translation is ignored |
+| `AnimationScaled` | the clip, scaled by the height ratio between the two |
+| `Animation` | the clip, verbatim |
+
+The shipped `SK_PalHuman_Skeleton` sets **61 of these 65 bones to `Skeleton`**:
+only `root` and `pelvis` (`AnimationScaled`) and the two `weapon_` bones
+(`Animation`) take position from the clip. That is why a normal Palworld
+animation poses any body it is played on — the mesh keeps its own bone
+lengths and the clip supplies rotations only.
+
+A skeleton freshly imported into Unreal defaults **every** bone to `Animation`.
+So all 65 bones take their position from the clip, the clip carries the master
+skeleton's reference-pose offsets, and every joint gets dragged to a position
+the skin was never bound for. The mesh stretches instead of posing.
+
+**Fix:** open the Skeleton asset, and in the Skeleton Tree right-click `root`
+-> *Recursively Set Translation Retargeting* -> **Skeleton**. Then set `root`
+and `pelvis` to **AnimationScaled**, and `weapon_l` / `weapon_r` to
+**Animation**. `out/retargeting.txt` is generated with that list.
+
+**Telling this apart from a bad rest pose:** scrub the imported AnimSequence to
+frame 0. If bone *positions* are wrong — limbs stretched, joints pulled away
+from the body — it is retargeting, and the fix above is it. If the proportions
+are intact and only the *angles* look wrong, the skeleton's rest pose no longer
+matches the one the clip was authored against, which is what a Blender round
+trip does to bone rolls; re-extract the skeleton without going through Blender.
 
 ## The pivot decides whether any of this reads
 

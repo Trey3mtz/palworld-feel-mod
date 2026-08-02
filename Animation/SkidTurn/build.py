@@ -16,6 +16,7 @@ Outputs per clip:
     out/<name>.json       joint positions per frame, for preview.html
     out/preview.html      self-contained scrubbable previewer for all clips
     out/report.txt        per-frame metrics for every clip
+    out/retargeting.txt   the skeleton settings the clips assume
 """
 
 import argparse
@@ -79,6 +80,40 @@ def build_clip(rig, c, args, report, previews):
         print("  preview  %s_side.png  %s_front.png" % (c.name, c.name))
 
 
+def write_retargeting(rig, path):
+    """The game skeleton's per-bone translation retargeting, as a checklist.
+
+    A skeleton freshly imported into Unreal defaults every bone to
+    `Animation`, which means it takes bone POSITIONS from the clip. These
+    clips carry the master skeleton's reference-pose offsets, so on a default
+    skeleton every joint is dragged off wherever the mesh was skinned and the
+    body distorts into a stick figure. The shipped skeleton sets almost
+    everything to `Skeleton` -- positions come from the mesh, only rotations
+    come from the clip -- and this file is that setting, bone by bone.
+    """
+    groups = {}
+    for b in rig.bones:
+        groups.setdefault(b["retarget"], []).append(b["name"])
+    lines = ["Translation retargeting on SK_PalHuman_Skeleton, for the 65 driven bones.",
+             "",
+             "Set these in the Skeleton asset: Skeleton Tree -> right-click a bone ->",
+             "Recursively Set Translation Retargeting. Without them the clip moves bones",
+             "that should only rotate, and the mesh distorts instead of posing.",
+             ""]
+    for mode in ("Skeleton", "AnimationScaled", "Animation"):
+        names = groups.get(mode, [])
+        lines.append("%s  (%d bones)" % (mode, len(names)))
+        if mode == "Skeleton":
+            lines.append("    everything not listed below -- set this recursively from `root` first,")
+            lines.append("    then fix up the handful of exceptions underneath")
+        else:
+            for n in names:
+                lines.append("    %s" % n)
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
 def _preview_data(rig, c, wts):
     """Compact joint-position dump the HTML previewer animates."""
     drawn = [i for i, n in enumerate(rig.names)
@@ -134,6 +169,7 @@ def main():
 
     with open(os.path.join(OUT, "report.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(report) + "\n")
+    write_retargeting(rig, os.path.join(OUT, "retargeting.txt"))
     if args.preview:
         preview.write(os.path.join(OUT, "preview.html"), rig, previews)
         print("\npreview  out/preview.html")

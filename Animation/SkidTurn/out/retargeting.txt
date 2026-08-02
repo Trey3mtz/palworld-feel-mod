@@ -1,0 +1,17 @@
+Translation retargeting on SK_PalHuman_Skeleton, for the 65 driven bones.
+
+Set these in the Skeleton asset: Skeleton Tree -> right-click a bone ->
+Recursively Set Translation Retargeting. Without them the clip moves bones
+that should only rotate, and the mesh distorts instead of posing.
+
+Skeleton  (61 bones)
+    everything not listed below -- set this recursively from `root` first,
+    then fix up the handful of exceptions underneath
+
+AnimationScaled  (2 bones)
+    root
+    pelvis
+
+Animation  (2 bones)
+    weapon_l
+    weapon_r
