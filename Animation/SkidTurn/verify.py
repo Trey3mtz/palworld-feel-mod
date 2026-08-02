@@ -75,16 +75,26 @@ def euler_xyz_to_quat(rx, ry, rz):
     return R.qmul(qz, R.qmul(qy, qx))
 
 
-def check(path, rig, frames, tol=0.05):
-    """frames: the baked (local_rots, local_trans) list. -> (ok, worst_cm)"""
+def check(path, rig, frames, tol=0.05, extra_root=None):
+    """frames: the baked (local_rots, local_trans) list. -> (ok, worst_cm)
+
+    extra_root, when the file was written with one, is expected to sit above
+    `root` and to be keyed to identity -- so it must not move any joint, which
+    is exactly what comparing the FK result against the baked pose proves.
+    """
     order, parent_of, tracks = parse(path)
 
     missing = [b["name"] for b in rig.bones if b["name"] not in tracks]
     if missing:
         raise AssertionError("FBX is missing tracks for: %s" % missing[:5])
+    if extra_root:
+        if extra_root not in tracks:
+            raise AssertionError("FBX has no track for extra root %r" % extra_root)
+        if parent_of.get(extra_root) is not None:
+            raise AssertionError("extra root %r is not the top of the hierarchy" % extra_root)
     for bone in rig.bones:
         name, parent = bone["name"], bone["parent"]
-        expect = rig.bones[parent]["name"] if parent >= 0 else None
+        expect = rig.bones[parent]["name"] if parent >= 0 else extra_root
         if parent_of.get(name) != expect:
             raise AssertionError("FBX parent of %s is %r, rig says %r"
                                  % (name, parent_of.get(name), expect))

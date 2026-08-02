@@ -102,11 +102,29 @@ def _fmt(v):
     return s.rstrip("0").rstrip(".")
 
 
-def write(path, rig, clip_name, frames, fps=30.0):
-    """frames: list of (local_rots, local_trans), one entry per frame."""
+def write(path, rig, clip_name, frames, fps=30.0, extra_root=None):
+    """frames: list of (local_rots, local_trans), one entry per frame.
+
+    extra_root: name of an identity bone to insert ABOVE `root`.
+
+    Unreal refuses an animation whose hierarchy does not start at the target
+    skeleton's root bone ("Mesh contains X bone as root but animation doesn't
+    contain the root track"). A skeleton round-tripped through Blender picks
+    up an extra bone named after the Armature object, so its root is that name
+    rather than `root`. Naming it here makes the clip importable onto such a
+    skeleton; the bone is keyed to identity on every frame, and any skeleton
+    that does not have it simply drops the track.
+    """
     ids = _Ids()
     n_frames = len(frames)
     n_bones = len(rig.bones)
+    bone_names = [b["name"] for b in rig.bones]
+    bone_parents = [b["parent"] for b in rig.bones]
+    if extra_root:
+        # prepended, so index 0 is the synthetic bone and every real bone
+        # shifts by one -- `root` is re-parented onto it
+        bone_names = [extra_root] + bone_names
+        bone_parents = [-1] + [(p + 1 if p >= 0 else 0) for p in bone_parents]
     tick = int(round(KTIME_PER_SECOND / fps))
     stop = tick * (n_frames - 1)
 
@@ -117,6 +135,10 @@ def write(path, rig, clip_name, frames, fps=30.0):
         eul = euler_track(quats)
         pos = [to_fbx_pos(f[1][b]) for f in frames]
         tracks.append((pos, eul))
+    if extra_root:
+        identity = [(0.0, 0.0, 0.0)] * n_frames
+        tracks.insert(0, (identity, identity))
+    n_nodes = len(bone_names)
 
     lines = []
     w = lines.append
@@ -165,17 +187,17 @@ def write(path, rig, clip_name, frames, fps=30.0):
     w("")
 
     # ---- definitions ------------------------------------------------------
-    n_curvenodes = n_bones * 2                  # translation + rotation
-    n_curves = n_bones * 6                      # x/y/z of each
-    total = 1 + n_bones * 2 + 2 + n_curvenodes + n_curves
+    n_curvenodes = n_nodes * 2                  # translation + rotation
+    n_curves = n_nodes * 6                      # x/y/z of each
+    total = 1 + n_nodes * 2 + 2 + n_curvenodes + n_curves
     w("; Object definitions")
     w(";------------------------------------------------------------------")
     w("")
     w("Definitions:  {")
     w("\tVersion: 100")
     w("\tCount: %d" % total)
-    for otype, count in (("GlobalSettings", 1), ("NodeAttribute", n_bones),
-                         ("Model", n_bones), ("AnimationStack", 1),
+    for otype, count in (("GlobalSettings", 1), ("NodeAttribute", n_nodes),
+                         ("Model", n_nodes), ("AnimationStack", 1),
                          ("AnimationLayer", 1), ("AnimationCurveNode", n_curvenodes),
                          ("AnimationCurve", n_curves)):
         w('\tObjectType: "%s" {' % otype)
@@ -191,8 +213,7 @@ def write(path, rig, clip_name, frames, fps=30.0):
     w("Objects:  {")
 
     attr_id, model_id = [], []
-    for b, bone in enumerate(rig.bones):
-        name = bone["name"]
+    for b, name in enumerate(bone_names):
         aid, mid = ids(), ids()
         attr_id.append(aid)
         model_id.append(mid)
@@ -239,7 +260,7 @@ def write(path, rig, clip_name, frames, fps=30.0):
     curve_nodes = []                            # (id, model_id, property)
     curves = []                                 # (id, curve_node_id, channel)
 
-    for b, bone in enumerate(rig.bones):
+    for b in range(n_nodes):
         pos, eul = tracks[b]
         for prop, label, values, defaults in (
                 ("Lcl Translation", "T", pos, pos[0]),
@@ -284,14 +305,13 @@ def write(path, rig, clip_name, frames, fps=30.0):
     w(";------------------------------------------------------------------")
     w("")
     w("Connections:  {")
-    for b, bone in enumerate(rig.bones):
-        parent = bone["parent"]
+    for b, name in enumerate(bone_names):
+        parent = bone_parents[b]
         pid = model_id[parent] if parent >= 0 else 0
-        w('\t;Model::%s, %s' % (bone["name"],
-                                "Model::" + rig.bones[parent]["name"] if parent >= 0
+        w('\t;Model::%s, %s' % (name, "Model::" + bone_names[parent] if parent >= 0
                                 else "Model::RootNode"))
         w('\tC: "OO",%d,%d' % (model_id[b], pid))
-        w('\t;NodeAttribute::%s, Model::%s' % (bone["name"], bone["name"]))
+        w('\t;NodeAttribute::%s, Model::%s' % (name, name))
         w('\tC: "OO",%d,%d' % (attr_id[b], model_id[b]))
     w('\t;AnimLayer::BaseLayer, AnimStack::%s' % clip_name)
     w('\tC: "OO",%d,%d' % (layer_id, stack_id))

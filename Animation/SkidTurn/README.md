@@ -86,6 +86,7 @@ python3 build.py --clip sprint
 No dependencies — standard library only. Outputs land in `out/`:
 
 - `<name>.fbx` — skeleton-only animation, the import path into Unreal
+- `root_<BONE>/` — only with `--extra-root`; same clips under a renamed root
 - `<name>.glb` — same motion on a blocky proxy body, drag into any glTF viewer
   or Blender to look at it without opening the editor
 - `preview.html` — self-contained scrubbable previewer, orbit + per-frame metrics
@@ -133,6 +134,49 @@ FBX carries no notifies. If you want footstep audio on the plant and the drive,
 add `BP_AnimNotify_FootStep` in the editor at frames 2 and 11 — those are the
 two ground impacts, and they are the same frames in both clips. The vanilla
 `AS_Player_Female_Sprint` uses the same notify class.
+
+## Troubleshooting the import
+
+### "Mesh contains SK_Player_Female bone as root but animation doesn't contain the root track"
+
+Unreal is telling you the **target skeleton's root bone is named
+`SK_Player_Female`**, not `root`. The clip's hierarchy starts at `root` (which
+is what the game's `SK_PalHuman_Skeleton` starts at), the two do not match, and
+the importer refuses.
+
+That extra bone comes from the Blender round trip: Blender exports the Armature
+**object** as a node, and Unreal turns it into a bone named after that object.
+So a skeleton exported FModel -> Blender -> Unreal ends up as
+
+```
+SK_Player_Female      <- the Blender Armature object
+└── root              <- where the game's skeleton actually starts
+    └── pelvis ...
+```
+
+**Fix the skeleton** (preferred). In Blender, rename the Armature *object* to
+exactly `Armature` and re-export: Unreal's importer strips a root node with
+that name, so the imported skeleton starts at `root` and matches the game's.
+Then import these clips unmodified.
+
+This is worth doing rather than working around, because the same mismatch
+decides whether the cooked AnimSequence binds to the real character at
+runtime. The montage plays on a mesh driven by the game's own
+`SK_PalHuman_Skeleton`; an animation built against a skeleton with a different
+hierarchy is not the same asset, and the convention in the Palworld modding kit
+is that the skeleton keeps the game's name and folder for exactly this reason.
+
+**Or unblock now.** If you would rather not redo the skeleton yet:
+
+```
+python3 build.py --extra-root SK_Player_Female
+```
+
+writes to `out/root_SK_Player_Female/` a variant with an identity bone of that
+name inserted above `root`, so the hierarchies line up. The bone is keyed to
+(0,0,0) rotation and translation on every frame, and the round-trip check
+proves it moves no joint. Any skeleton without that bone just drops the track.
+Pass whatever your skeleton's root bone is actually called.
 
 ## The pivot decides whether any of this reads
 

@@ -6,6 +6,7 @@ Build the skid-turn clips.
     python3 build.py --mirror        # ...plus the right-turn mirrors
     python3 build.py --clip sprint   # one clip
     python3 build.py --no-preview    # FBX only, skip the PNG sheets
+    python3 build.py --extra-root SK_Player_Female   # for a Blender-round-tripped skeleton
 
 Outputs per clip:
     out/<name>.fbx        skeleton-only animation, import onto SK_PalHuman_Skeleton
@@ -47,28 +48,32 @@ def build_clip(rig, c, args, report, previews):
     metrics.report(rig, c, wqs, wts, stream=_Sink(report))
     report.append("")
 
-    fbx_path = os.path.join(OUT, c.name + ".fbx")
-    fbx_ascii.write(fbx_path, rig, c.name, frames, c.fps)
-    ok, worst = verify.check(fbx_path, rig, frames)
+    out_dir = OUT if not args.extra_root else os.path.join(OUT, "root_" + args.extra_root)
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+
+    fbx_path = os.path.join(out_dir, c.name + ".fbx")
+    fbx_ascii.write(fbx_path, rig, c.name, frames, c.fps, extra_root=args.extra_root)
+    ok, worst = verify.check(fbx_path, rig, frames, extra_root=args.extra_root)
     print("  fbx      %s   round-trip %s (worst joint error %.4f cm)"
           % (os.path.basename(fbx_path), "OK" if ok else "FAILED", worst))
     if not ok:
         raise SystemExit("FBX round-trip check failed for %s" % c.name)
 
-    glb_path = os.path.join(OUT, c.name + ".glb")
+    glb_path = os.path.join(out_dir, c.name + ".glb")
     glb.write(glb_path, rig, c.name, frames, c.fps)
     print("  glb      %s" % os.path.basename(glb_path))
 
     data = _preview_data(rig, c, wts)
     previews.append(data)
-    with open(os.path.join(OUT, c.name + ".json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_dir, c.name + ".json"), "w", encoding="utf-8") as fh:
         json.dump(data, fh, separators=(",", ":"))
 
     if args.preview:
         labels = c.frame_labels()
         cols = min(8, c.frame_count)
         for view in ("side", "front"):
-            render.contact_sheet(rig, wts, os.path.join(OUT, "%s_%s.png" % (c.name, view)),
+            render.contact_sheet(rig, wts, os.path.join(out_dir, "%s_%s.png" % (c.name, view)),
                                  view=view, cols=cols, cell=(210, 270),
                                  labels=labels, title="%s  %s" % (c.name, view))
         print("  preview  %s_side.png  %s_front.png" % (c.name, c.name))
@@ -105,6 +110,11 @@ def main():
                     help="also emit right-turn mirrors of each clip")
     ap.add_argument("--no-preview", dest="preview", action="store_false",
                     help="skip PNG contact sheets")
+    ap.add_argument("--extra-root", metavar="BONE", default=None,
+                    help="insert an identity bone of this name above `root`, for "
+                         "skeletons whose root bone is not `root` (a Blender "
+                         "round trip names it after the Armature object). "
+                         "Writes to out/root_<BONE>/ so the plain build stays put.")
     args = ap.parse_args()
 
     if not os.path.isdir(OUT):
