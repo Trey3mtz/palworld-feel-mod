@@ -287,6 +287,22 @@ local tickOrderSamples    = 0
 local compTicks           = 0   -- engine ticks a component once per frame
 local grabWasClimbingPre  = false
 local grabInsideTick      = 0
+
+-- ---- CanClimbingStart gate ----
+-- The component's own predicate for "may a climb begin". Holding CanClimbing
+-- off across a whole 130uu approach is a blunt instrument: it suppresses
+-- legitimate climbing over a wide area and needs the guard-arming state
+-- machine to decide when to stop. Vetoing this one call instead is
+-- per-decision and needs no area at all.
+--
+-- Off until a session proves the hook fires and the return slot is what this
+-- assumes -- the last vararg, same shape GroundCheck already relies on.
+-- Enabling it before that is how the last two regressions happened.
+local CANSTART_VETO_ENABLED = false
+local canStartFires     = 0
+local canStartVetoes    = 0
+local canStartLogged    = 0
+local CANSTART_LOG_MAX  = 8
 local TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
 
 
@@ -1688,6 +1704,48 @@ local function RegisterComponentHooks()
         .. "and the grab decision cannot be pre-empted this way",
         okTick and "registered" or ("FAILED: " .. tostring(errTick)))
 
+    -- CanClimbingStart: the component's own "may a climb begin" predicate,
+    -- and the surgical alternative to holding CanClimbing off across an
+    -- entire approach. Post-hook because a return value only exists after
+    -- execution -- NoOp pre-slot, same shape GroundCheck uses.
+    --
+    -- This pass LOGS the call shape and only vetoes when CANSTART_VETO_ENABLED
+    -- is set, because "the last vararg is the return value" is an assumption
+    -- about this function's signature, not a fact. argc is logged so the shape
+    -- can be read off a session before anything relies on it.
+    local okStart, errStart = pcall(function()
+        RegisterHook(clsPath .. ":CanClimbingStart", NoOp, function(Context, ...)
+            if not IsOurComponent(Context) then return end
+            canStartFires = canStartFires + 1
+
+            local args = { ... }
+            local argc = #args
+            local ret  = nil
+            if argc > 0 then
+                pcall(function() ret = args[argc]:get() end)
+            end
+
+            -- Veto only while the guard actually wants this wall. Outside
+            -- that, the component's own answer stands untouched.
+            local vetoed = false
+            if CANSTART_VETO_ENABLED and wantClimbSuppressed and argc > 0 then
+                vetoed = pcall(function() args[argc]:set(false) end)
+                if vetoed then canStartVetoes = canStartVetoes + 1 end
+            end
+
+            if canStartLogged < CANSTART_LOG_MAX then
+                canStartLogged = canStartLogged + 1
+                ddbg("CanClimbingStart #%d: argc=%d ret=%s (%s) "
+                    .. "wantSuppressed=%s vetoed=%s",
+                    canStartFires, argc, tostring(ret), type(ret),
+                    tostring(wantClimbSuppressed), tostring(vetoed))
+            end
+        end)
+    end)
+    ddbg("hook CanClimbingStart: %s  (veto %s)",
+        okStart and "registered" or ("FAILED: " .. tostring(errStart)),
+        CANSTART_VETO_ENABLED and "ARMED" or "observing only")
+
     -- One-shot dump of the component's own BP functions. GroundCheck and
     -- ClimbUpAtTopEvent were found by hand; if one of the others IS the grab
     -- decision, pre-hooking that is far more surgical than a tick hook and
@@ -1793,6 +1851,7 @@ function M.OnPlayerCached(pawn, cmc)
     compTicks           = 0
     grabWasClimbingPre  = false
     grabInsideTick      = 0
+    canStartFires, canStartVetoes, canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
@@ -2034,6 +2093,12 @@ local function SampleTickOrder()
             .. "~1.0 is healthy; ~2.0 means the controller tick hook is "
             .. "double-registered and every duration here runs at 2x.",
             tickOrderSamples, compTicks, ratio)
+
+        ddbg("CanClimbingStart: %d calls in that window, %d vetoed. "
+            .. "0 calls means the organic grab does not route through it "
+            .. "and the veto cannot work; calls only while approaching a "
+            .. "face means it is the right lever.",
+            canStartFires, canStartVetoes)
     end
 end
 
