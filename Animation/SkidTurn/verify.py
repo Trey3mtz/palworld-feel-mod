@@ -24,7 +24,8 @@ def parse(path):
         text = fh.read()
 
     models = {}                                  # id -> name
-    for mid, name in re.findall(r'Model: (\d+), "Model::([^"]+)", "LimbNode"', text):
+    # any model type: a retargeted file also carries the Armature Null
+    for mid, name in re.findall(r'Model: (\d+), "Model::([^"]+)", "\w+"', text):
         models[int(mid)] = name
 
     # AnimationCurveNode id -> (model name, property)

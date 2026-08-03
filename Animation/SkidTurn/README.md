@@ -217,6 +217,72 @@ are intact and only the *angles* look wrong, the skeleton's rest pose no longer
 matches the one the clip was authored against, which is what a Blender round
 trip does to bone rolls; re-extract the skeleton without going through Blender.
 
+### The mesh shrinks and faces the wrong way
+
+The clip assumes an **identity root**: it keys `root` to zero translation,
+zero rotation and unit scale on every frame, which is a no-op on the shipped
+skeleton because that skeleton's root reference pose is exactly identity.
+
+A skeleton exported from Blender does not have one. Read out of the real file
+this pipeline was tested against, the top node carries:
+
+```
+Armature   Null   scale (100, 100, 100)   rotation (0, 0, -90)
+```
+
+That is Blender's unit conversion (metres to centimetres, "Apply Scalings: All
+Local" puts it on the node instead of into the geometry) and its up-axis fix.
+The mesh is skinned expecting both. Overwrite them with identity and the model
+collapses to 1/100th and un-rotates to face down the Z axis -- which is exactly
+what it looks like.
+
+That skeleton also differs in three more ways that no import setting fixes:
+its bones are in **metres**, Blender has **re-derived every bone's local axes**
+(bones run along local X, so a rotation authored against the game rig means
+something else entirely), and it rests in a **T-pose** where the game skeleton
+rests in an **A-pose** -- a 34cm difference at the hand.
+
+## Retargeting onto a skeleton that is not the game's
+
+```
+python3 retarget.py path/to/SK_Player_Female.fbx     # -> out/retargeted/
+```
+
+`retarget.py` reads the target skeleton straight out of its FBX (`fbx_binary.py`
+is a small binary FBX reader written for this) and rebuilds the clips against
+it. Three steps:
+
+1. **G, the space map.** Fitted from joint positions, on the bones whose rest
+   is identical in both rigs -- pelvis, spine, legs. On the measured file it
+   comes out as scale 1.000000, rotation exactly 90 degrees about Z, residual
+   0.000005 cm. Fitting it on the arms instead would let the A/T-pose
+   difference contaminate it.
+2. **Rest alignment.** Per bone, the rotation its rest needs in order to
+   reproduce the game rig's rest. This is what separates "Blender renamed my
+   axes" from "this rig rests in a T-pose"; only the first should be corrected
+   for. Solved root-downwards, each bone re-aimed at where the game rig puts
+   its children, with a Procrustes fit on bones whose children pin the roll
+   down too.
+3. **Per frame**, each bone is placed at the world orientation the clip asks
+   for, and its POSITION follows from the target rig's own bone offsets -- the
+   same rotation-driven rule the shipped skeleton gets from `Skeleton`
+   translation retargeting.
+
+The obvious alternative -- transferring the pose as a deformation delta from
+each rig's own bind -- is wrong when the rests differ, because it preserves
+motion relative to rest: a T-pose rig plays the arms 45 degrees high. Measured
+at 49cm of drift at the fingertips before this was fixed.
+
+Output is written in the **target file's own conventions**: its axis header,
+its units, its node tree, including the Armature node with its scale and
+rotation intact. Unreal then applies the same import conversion to the
+animation as it did to the skeleton, so the two cannot disagree.
+
+`retarget.py` re-runs forward kinematics on what it wrote and refuses to finish
+unless every joint lands where the clip puts it. Current worst case is 0.16cm,
+on an eyeball bone that is itself 0.21cm out of place between the two rigs;
+every other bone is exact.
+
 ## The pivot decides whether any of this reads
 
 `TickPivot` drives the actor's yaw explicitly with `PIVOT_FN` over
@@ -273,6 +339,9 @@ speed class, and picking the side at `BeginTurn` from the sign of
 
 ```
 extract_rig.py    FModel JSON dumps -> rig_palhuman.json (run once, already done)
+fbx_binary.py     binary FBX reader, for loading someone else's skeleton
+foreign_rig.py    that skeleton as a rig, plus the similarity solver
+retarget.py       rebuild the clips against a non-game skeleton
 rig_palhuman.json the 65-bone player rig: names, parents, reference pose
 rig.py            quaternion math, FK, mesh-space pose evaluation, contacts
 clip.py           keyframes -> baked frames: channel interpolation, hip solve, mirroring
