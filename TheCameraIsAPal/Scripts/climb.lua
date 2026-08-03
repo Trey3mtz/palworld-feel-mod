@@ -79,18 +79,23 @@ local LEAP_DIST     = 175    -- uu of travel before the attach check
 local LEAP_ANGLES   = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 }
 local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
 
+-- Init-climb tuning lives in one table rather than ~27 separate locals:
+-- the file was at Lua's 200-local ceiling for a main chunk, and the project
+-- standard is to expose tuning through config tables anyway.
+local InitClimb = {}
+
 -- ---- init climb: wall detection ----
-local INIT_CLIMB_CONE_DEG    = 40    -- max angle between input and into-wall
+InitClimb.CONE_DEG    = 40    -- max angle between input and into-wall
 -- Gap (from the capsule SURFACE) at which a GROUNDED walk-in commits.
-local INIT_CLIMB_MAX_GAP     = 21
+InitClimb.MAX_GAP     = 21
 -- Minimum |Acceleration.XY| that counts as holding a direction. Deliberately
 -- an absolute floor and deliberately tiny: Acceleration's scale here depends
 -- on MaxAcceleration and AnalogInputModifier, neither of which is verified,
 -- and a threshold expressed as a fraction of MaxAcceleration silently
 -- rejects every input if the real scale is lower than assumed. Detection
 -- must never be the thing that fails.
-local INIT_CLIMB_INPUT_FLOOR = 0.6
-local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
+InitClimb.INPUT_FLOOR = 0.6
+InitClimb.CONE_COS    = math.cos(math.rad(InitClimb.CONE_DEG))
 local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 
 -- ---- init climb: winning the race against the game's own grab ----
@@ -103,12 +108,15 @@ local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 -- CanClimbing while closing, buying the frames needed to run our own hop.
 -- Deliberately generous: over-reaching only starts the guard early, while
 -- under-reaching loses the race outright.
-local INIT_CLIMB_GUARD_GAP = 130   -- uu from capsule surface: start suppressing
-local INIT_CLIMB_HOP_GAP   = 55    -- uu from capsule surface: commit the hop
+InitClimb.GUARD_GAP = 130   -- uu from capsule surface: start suppressing
+-- Committing further out than the hop needs, because the approach hold
+-- below spends time closing the rest. InitClimb.IN_MAX caps the closing
+-- speed, so this is roughly what the hold can actually cover.
+InitClimb.HOP_GAP   = 80    -- uu from capsule surface: commit + lock out
 -- Suppression is conditioned on ASCENDING, not merely airborne. Falling into
 -- a face must still reach the component's organic grab, or the wall slide
 -- (VZ_TRIGGER) loses its entry and a fast fall just splats.
-local INIT_CLIMB_GUARD_VZ_MIN = 5  -- uu/s of rise required to suppress
+InitClimb.GUARD_VZ_MIN = 5  -- uu/s of rise required to suppress
 
 -- The guard holds the vanilla grab off while closing. If our own commit then
 -- never fires, the player gets neither -- they walk into the face and nothing
@@ -116,15 +124,15 @@ local INIT_CLIMB_GUARD_VZ_MIN = 5  -- uu/s of rise required to suppress
 -- guard is time-boxed: hold it off only as long as an approach could still
 -- plausibly be converging, then hand the wall back and stay out of the way
 -- for a moment so it cannot immediately re-arm and re-suppress.
-local INIT_CLIMB_GUARD_TIMEOUT  = 0.45  -- s armed without committing -> give up
-local INIT_CLIMB_GUARD_COOLDOWN = 0.80  -- s of vanilla ownership after giving up
+InitClimb.GUARD_TIMEOUT  = 0.45  -- s armed without committing -> give up
+InitClimb.GUARD_COOLDOWN = 0.80  -- s of vanilla ownership after giving up
 
 -- Below this multiple of the commit gap the probe upgrades to the vertical
 -- fan. Arming stays a single ray (it runs while merely walking near a face,
 -- and each trace costs three UE4SS log lines), but the commit decision is
 -- worth three: a face recessed at capsule-centre height is exactly the
 -- "some walls are finicky" case, and by then it is only the last few frames.
-local INIT_CLIMB_FAN_NEAR_MULT = 2.5
+InitClimb.FAN_NEAR_MULT = 2.5
 
 -- Small penetration is normal: UE resolves overlap over several frames and
 -- a capsule pressed into a wall routinely reads a hair inside it. Only a
@@ -141,13 +149,13 @@ local PROBE_FAN_HEIGHT_FRAC = 0.45
 local PROBE_FAN_HEIGHT_PAD  = 4    -- uu kept clear of the capsule's end caps
 
 -- ---- init climb: launch ----
-local INIT_CLIMB_LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
+InitClimb.LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
 -- Overwrites whatever the game's jump produced so the arc is identical every
 -- time. nil keeps the game's launch (and with it the game's variance).
-local INIT_CLIMB_LAUNCH_VZ    = 900
+InitClimb.LAUNCH_VZ    = 1050
 -- Owned for the whole ascent: jump.lua is gated off by ClimbHasPriority, so
 -- its velocity bands and its jump-cut can no longer reshape this arc.
-local INIT_CLIMB_GRAVITY      = 2.2
+InitClimb.GRAVITY      = 2.2
 
 -- ---- init climb: mini hop (airborne entry) ----
 -- Written directly rather than routed through RequestJump. DoJump takes
@@ -155,33 +163,44 @@ local INIT_CLIMB_GRAVITY      = 2.2
 -- exactly the case this move exists for -- and CanJump refuses outright
 -- when falling with JumpCurrentCount == 0. ADD is the kick, MIN guarantees
 -- the pop is visible even out of a dive, MAX keeps it a hop and not a jump.
-local INIT_CLIMB_HOP_VZ_ADD   = 420
-local INIT_CLIMB_HOP_VZ_MIN   = 380
-local INIT_CLIMB_HOP_VZ_MAX   = 900
-local INIT_CLIMB_HOP_IN_SPEED = 220    -- uu/s into the wall on the hop frame
+InitClimb.HOP_VZ_ADD   = 500
+InitClimb.HOP_VZ_MIN   = 460
+InitClimb.HOP_VZ_MAX   = 1000
+InitClimb.HOP_IN_SPEED = 220    -- uu/s into the wall on the hop frame
+
+-- Airborne entry commits, locks the climb out, and then holds for this long
+-- while the closed loop drives the pawn at the face -- the hop only fires
+-- after. Committing at the old distance meant hopping the instant the wall
+-- came in range, which read as jumping too early. The lock is what makes the
+-- hold safe: the component cannot grab during it, so the extra time cannot
+-- be spent being latched by vanilla instead.
+InitClimb.APPROACH_HOLD = 0.12
 
 -- ---- init climb: attach schedule ----
 -- Attach the instant it is viable rather than on a fixed clock: air time and
 -- rise only exist to let the hop read as a hop before the latch lands.
-local INIT_CLIMB_MIN_AIR_TIME = 0.15   -- s aloft before the first attempt
-local INIT_CLIMB_MIN_RISE     = 80     -- uu above launch Z before the first attempt
-local INIT_CLIMB_LOCK_TIME    = 0.60   -- s of air time before giving up
-local INIT_CLIMB_RETRY_INTERVAL = 0.06 -- s between forced attaches that did not take
-local INIT_CLIMB_LOST_TICKS   = 5      -- consecutive all-miss probes -> abort
+-- Both windows carry +20% over the first tuning pass: the latch was landing
+-- before the jump had read as a jump. A bespoke animation is going in here
+-- eventually, which wants the room too.
+InitClimb.MIN_AIR_TIME = 0.18   -- s aloft before the first attempt
+InitClimb.MIN_RISE     = 95     -- uu above launch Z before the first attempt
+InitClimb.LOCK_TIME    = 0.72   -- s of air time before giving up
+InitClimb.RETRY_INTERVAL = 0.06 -- s between forced attaches that did not take
+InitClimb.LOST_TICKS   = 5      -- consecutive all-miss probes -> abort
 
 -- ---- init climb: hold against the wall ----
 -- Closed loop over the probed gap, same shape as the hug leap's. Without it
 -- the ascent coasts on whatever momentum survived the wall collision, which
 -- is why the latch used to depend on approach angle and surface shape.
-local INIT_CLIMB_HOLD_GAP  = 8      -- uu gap to hold while rising
+InitClimb.HOLD_GAP  = 8      -- uu gap to hold while rising
 -- Proportional, so a face that recedes as you rise (anything leaning back)
 -- holds a steady-state error of recessionRate/gain. At 10 degrees of lean
 -- and a 900uu/s launch the face retreats ~160uu/s, which a gain of 8 held at
 -- ~20uu of error -- half the attach budget spent on nothing. Discrete gain
 -- is gain*dt (~0.23 at 60fps), far below the oscillation threshold.
-local INIT_CLIMB_IN_GAIN   = 14.0   -- 1/s; inward vel = gain * (gap - target)
-local INIT_CLIMB_IN_MAX    = 320    -- uu/s inward correction cap
-local INIT_CLIMB_YAW_RATE  = 900    -- deg/s slew cap while tracking the face
+InitClimb.IN_GAIN   = 14.0   -- 1/s; inward vel = gain * (gap - target)
+InitClimb.IN_MAX    = 320    -- uu/s inward correction cap
+InitClimb.YAW_RATE  = 900    -- deg/s slew cap while tracking the face
 
 -- ---- climb jump: attach verification ----
 local ATTACH_MAX_TRIES = 3  -- attempts within the window; then free fall
@@ -658,7 +677,7 @@ local function GetInputDirection(cmc)
     if not readOk then return nil end
 
     local inputMagnitude = math.sqrt(inputX * inputX + inputY * inputY)
-    local noInputHeld = inputMagnitude < INIT_CLIMB_INPUT_FLOOR
+    local noInputHeld = inputMagnitude < InitClimb.INPUT_FLOOR
     if noInputHeld then return nil end
 
     return { X = inputX / inputMagnitude, Y = inputY / inputMagnitude }
@@ -782,26 +801,47 @@ end
 -- Single ray by design: this runs every frame the player is walking, and a
 -- wall you can walk into is present at capsule centre height. The fan is for
 -- the airborne re-probe, where the ray can end up over a lip or in a recess.
+-- Returns the wall, or nil plus a short reason. The reason exists because a
+-- session reported twelve consecutive "probe lost the face" give-ups and
+-- nothing distinguished "no input held" from "ray missed" from "surface is
+-- walkable" -- four very different problems wearing one label.
 local function WallInMovementPath(pawn, cmc, maxGap, useFan)
     local inputDirection = GetInputDirection(cmc)
-    if inputDirection == nil then return nil end
+    if inputDirection == nil then return nil, "no input held" end
 
     -- Ray length is derived from the grab distance, so "the ray hit" and
     -- "the wall is close enough" are one statement instead of two knobs.
     local rayLength = capsuleRadius + maxGap
-    local wall
+    local hit, wall
     if useFan then
         wall = ProbeWallFan(pawn, inputDirection, rayLength, maxGap)
+        if wall == nil then return nil, "fan found no climbable face" end
     else
-        wall = ClassifyWallHit(
-            TraceAlongDirection(pawn, inputDirection, rayLength, 0), maxGap)
+        hit  = TraceAlongDirection(pawn, inputDirection, rayLength, 0)
+        if hit == nil then return nil, "ray missed" end
+        wall = ClassifyWallHit(hit, maxGap)
+        if wall == nil then
+            -- Say which rule rejected it: a face that is merely walkable is
+            -- a tuning problem, one the trace started inside is a geometry
+            -- problem, and they need opposite fixes.
+            if hit.gap < -PROBE_PENETRATION_SLOP then
+                return nil, string.format("trace inside geometry (gap %.1f)", hit.gap)
+            elseif hit.gap > maxGap then
+                return nil, string.format("beyond reach (gap %.1f > %.0f)", hit.gap, maxGap)
+            elseif hit.normalZ >= walkableFloorZ then
+                return nil, string.format("surface walkable (normalZ %.2f >= %.2f)",
+                    hit.normalZ, walkableFloorZ)
+            end
+            return nil, "unclassifiable hit"
+        end
     end
-    if wall == nil then return nil end
 
     local approachAlignment =
         inputDirection.X * wall.faceDir.X + inputDirection.Y * wall.faceDir.Y
-    local isHeadOnApproach = approachAlignment >= INIT_CLIMB_CONE_COS
-    if not isHeadOnApproach then return nil end
+    if approachAlignment < InitClimb.CONE_COS then
+        return nil, string.format("outside cone (%.0f deg)",
+            math.deg(math.acos(Clamp(approachAlignment, -1, 1))))
+    end
 
     fdbg("[climb] Walking into wall!")
     return wall
@@ -904,7 +944,7 @@ end
 local function TryInitClimbAttach(pawn, cmc, wall, attachGap)
     ForceClimbAttach(cmc)
     initClimbState.tries         = initClimbState.tries + 1
-    initClimbState.retryCooldown = INIT_CLIMB_RETRY_INTERVAL
+    initClimbState.retryCooldown = InitClimb.RETRY_INTERVAL
 
     local movementMode       = cmc.MovementMode
     local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
@@ -927,6 +967,8 @@ local function BeginInitClimb(pawn, cmc, wall, entryType)
         hasLaunched = false,
         airTime    = 0,
         launchZ    = GetZ(pawn) or 0,
+        phase      = "ascend",
+        approachTime = 0,
         tries      = 0,
         retryCooldown = 0,
         framesWithoutWall = 0,
@@ -963,23 +1005,41 @@ end
 -- DoJump takes max(Velocity.Z, JumpZVelocity), a no-op while still rising,
 -- and CanJump refuses outright when falling with JumpCurrentCount == 0.
 -- Being already airborne, this launches on the spot.
-local function StartClimbFromAir(pawn, cmc, wall)
-    BeginInitClimb(pawn, cmc, wall, "air")
-
+-- The hop itself, once the approach hold has run its course.
+local function ApplyMiniHop(pawn, cmc)
     local entryVz = 0
     pcall(function() entryVz = cmc.Velocity.Z end)
-    local hopVz = Clamp(entryVz + INIT_CLIMB_HOP_VZ_ADD,
-        INIT_CLIMB_HOP_VZ_MIN, INIT_CLIMB_HOP_VZ_MAX)
+    local hopVz = Clamp(entryVz + InitClimb.HOP_VZ_ADD,
+        InitClimb.HOP_VZ_MIN, InitClimb.HOP_VZ_MAX)
 
     pcall(function() cmc.Velocity.Z = hopVz end)
     SetHorizVel(cmc,
-        wall.faceDir.X * INIT_CLIMB_HOP_IN_SPEED,
-        wall.faceDir.Y * INIT_CLIMB_HOP_IN_SPEED)
+        initClimbState.faceDir.X * InitClimb.HOP_IN_SPEED,
+        initClimbState.faceDir.Y * InitClimb.HOP_IN_SPEED)
 
+    initClimbState.phase       = "ascend"
     initClimbState.hasLaunched = true
+    initClimbState.airTime     = 0
+    initClimbState.launchZ     = GetZ(pawn) or initClimbState.launchZ
 
-    dbg("init climb from air: gap=%.1f face=(%+.2f,%+.2f) hop vz %.0f -> %.0f",
-        wall.gap, wall.faceDir.X, wall.faceDir.Y, entryVz, hopVz)
+    dbg("mini hop after %.2fs approach: vz %.0f -> %.0f",
+        initClimbState.approachTime, entryVz, hopVz)
+end
+
+-- Airborne entry. Commits further out than the hop needs and locks the climb
+-- out immediately, then spends INIT_CLIMB_APPROACH_HOLD driving the pawn at
+-- the face before hopping. Hopping the instant the wall came into range read
+-- as jumping too early; the lock is what makes waiting safe, since the
+-- component cannot grab during the hold.
+local function StartClimbFromAir(pawn, cmc, wall)
+    BeginInitClimb(pawn, cmc, wall, "air")
+    initClimbState.phase        = "approach"
+    initClimbState.approachTime = 0
+    initClimbState.hasLaunched  = true   -- already airborne; nothing to launch
+
+    dbg("init climb from air: gap=%.1f face=(%+.2f,%+.2f) -- locked out, "
+        .. "holding %.2fs before the hop",
+        wall.gap, wall.faceDir.X, wall.faceDir.Y, InitClimb.APPROACH_HOLD)
 end
 
 -- Ground entry only: hold until the character actually leaves the ground,
@@ -993,7 +1053,7 @@ local function ConfirmLaunch(dt, pawn, cmc)
     local hasLeftTheGround = (cmc.MovementMode == 3)
     if not hasLeftTheGround then
         local jumpWasRefused =
-            initClimbState.timeSinceRequest > INIT_CLIMB_LAUNCH_GRACE
+            initClimbState.timeSinceRequest > InitClimb.LAUNCH_GRACE
         if jumpWasRefused then
             EndInitClimb(pawn, cmc, "jump never executed")
         end
@@ -1002,8 +1062,8 @@ local function ConfirmLaunch(dt, pawn, cmc)
 
     initClimbState.hasLaunched = true
     initClimbState.launchZ     = GetZ(pawn) or initClimbState.launchZ
-    if INIT_CLIMB_LAUNCH_VZ ~= nil then
-        pcall(function() cmc.Velocity.Z = INIT_CLIMB_LAUNCH_VZ end)
+    if InitClimb.LAUNCH_VZ ~= nil then
+        pcall(function() cmc.Velocity.Z = InitClimb.LAUNCH_VZ end)
     end
     return true
 end
@@ -1015,7 +1075,7 @@ local function TrackInitClimbWall(dt, pawn, cmc, wall)
     if wall == nil then
         initClimbState.framesWithoutWall = initClimbState.framesWithoutWall + 1
         initClimbState.inVel = 0
-        if initClimbState.framesWithoutWall >= INIT_CLIMB_LOST_TICKS then
+        if initClimbState.framesWithoutWall >= InitClimb.LOST_TICKS then
             EndInitClimb(pawn, cmc, "wall lost during ascent")
             return false
         end
@@ -1026,23 +1086,23 @@ local function TrackInitClimbWall(dt, pawn, cmc, wall)
 
     initClimbState.currentYaw, initClimbState.faceDir = SlewYawToward(
         initClimbState.currentYaw, wall.faceDir.X, wall.faceDir.Y,
-        dt, INIT_CLIMB_YAW_RATE)
+        dt, InitClimb.YAW_RATE)
 
-    local gapError = wall.gap - INIT_CLIMB_HOLD_GAP
+    local gapError = wall.gap - InitClimb.HOLD_GAP
     initClimbState.inVel =
-        Clamp(gapError * INIT_CLIMB_IN_GAIN, -INIT_CLIMB_IN_MAX, INIT_CLIMB_IN_MAX)
+        Clamp(gapError * InitClimb.IN_GAIN, -InitClimb.IN_MAX, InitClimb.IN_MAX)
     return true
 end
 
 -- Air time and rise only exist so the hop reads as a hop before the latch
 -- lands. The apex clause guarantees the gate always opens: a minimum
--- strength hop peaks below INIT_CLIMB_MIN_RISE and would otherwise never
+-- strength hop peaks below InitClimb.MIN_RISE and would otherwise never
 -- qualify.
 local function AttachGateIsOpen(pawn, cmc)
-    if initClimbState.airTime < INIT_CLIMB_MIN_AIR_TIME then return false end
+    if initClimbState.airTime < InitClimb.MIN_AIR_TIME then return false end
 
     local rise = (GetZ(pawn) or 0) - initClimbState.launchZ
-    if rise >= INIT_CLIMB_MIN_RISE then return true end
+    if rise >= InitClimb.MIN_RISE then return true end
 
     local vz = 0
     pcall(function() vz = cmc.Velocity.Z end)
@@ -1052,23 +1112,28 @@ end
 local function DriveInitClimb(dt, pawn, cmc)
     if not ConfirmLaunch(dt, pawn, cmc) then return end
 
-    initClimbState.airTime = initClimbState.airTime + dt
+    local inApproach = initClimbState.phase == "approach"
+    if inApproach then
+        initClimbState.approachTime = initClimbState.approachTime + dt
+    else
+        initClimbState.airTime = initClimbState.airTime + dt
 
-    local windowHasClosed = initClimbState.airTime > INIT_CLIMB_LOCK_TIME
-    if windowHasClosed then
-        EndInitClimb(pawn, cmc, "window closed without a latch")
-        return
+        local windowHasClosed = initClimbState.airTime > InitClimb.LOCK_TIME
+        if windowHasClosed then
+            EndInitClimb(pawn, cmc, "window closed without a latch")
+            return
+        end
     end
 
     -- The ascent owns gravity outright (jump.lua is gated off by
     -- ClimbHasPriority), so the arc no longer changes with the velocity band
     -- the player happens to be in, or with a jump-cut fired mid-approach.
-    pcall(function() cmc.GravityScale = INIT_CLIMB_GRAVITY end)
+    pcall(function() cmc.GravityScale = InitClimb.GRAVITY end)
     DrainMoveInput(cmc)
 
     -- Tracks well past grab range so the hold loop can pull a drifting
     -- ascent back in instead of simply losing the face.
-    local trackMaxGap    = INIT_CLIMB_GUARD_GAP
+    local trackMaxGap    = InitClimb.GUARD_GAP
     local probeRayLength = capsuleRadius + trackMaxGap
     local wall = ProbeWallFan(pawn, initClimbState.faceDir, probeRayLength,
         trackMaxGap)
@@ -1079,6 +1144,17 @@ local function DriveInitClimb(dt, pawn, cmc)
     SetHorizVel(cmc,
         initClimbState.faceDir.X * initClimbState.inVel,
         initClimbState.faceDir.Y * initClimbState.inVel)
+
+    -- The approach hold: same tracking and the same closed loop driving the
+    -- pawn at the face, but no attach attempts. Its whole job is to spend a
+    -- moment closing the distance under the climb lock so the hop reads as a
+    -- deliberate move rather than a twitch the instant the wall came in range.
+    if inApproach then
+        if initClimbState.approachTime >= InitClimb.APPROACH_HOLD then
+            ApplyMiniHop(pawn, cmc)
+        end
+        return
+    end
 
     initClimbState.retryCooldown = math.max(0, initClimbState.retryCooldown - dt)
 
@@ -1903,7 +1979,7 @@ function M.OnPlayerCached(pawn, cmc)
         ddbg("geom: capsuleR=%.1f halfH=%.1f fanOffset=%.1f | attachGap=%.1f "
             .. "guardGap=%.1f hopGap=%.1f",
             capsuleRadius, capsuleHalfHeight, probeFanOffset,
-            ATTACH_MAX_GAP, INIT_CLIMB_GUARD_GAP, INIT_CLIMB_HOP_GAP)
+            ATTACH_MAX_GAP, InitClimb.GUARD_GAP, InitClimb.HOP_GAP)
         ddbg("component props: fwdRay=%s rayChannel=%s (UNVERIFIED units/origin)",
             tostring(ReadOpt(comp, "Const_ForwardRayLength")),
             tostring(ReadOpt(comp, "Const_RayChannel")))
@@ -1964,11 +2040,11 @@ local probeFrameCounter = 0
 -- descending approach is left alone so the organic grab still fires and the
 -- wall slide keeps its entry.
 local function IsRisingAtWall(cmc)
-    return cmc.MovementMode == 3 and cmc.Velocity.Z >= INIT_CLIMB_GUARD_VZ_MIN
+    return cmc.MovementMode == 3 and cmc.Velocity.Z >= InitClimb.GUARD_VZ_MIN
 end
 
 -- Runs every frame of an approach, before any sequence exists, and holds the
--- component off from INIT_CLIMB_GUARD_GAP out -- further than it can reach --
+-- component off from InitClimb.GUARD_GAP out -- further than it can reach --
 -- so the race is won during the approach rather than lost before this file's
 -- tick ever runs. Returns the wall once close enough to commit; nil otherwise.
 --
@@ -1997,11 +2073,11 @@ local function YieldWallToGame(pawn, reason, gap)
             .. "vanilla grab for %.2fs. Frequent lines here mean the commit "
             .. "conditions are too strict for the faces being walked into.",
             reason, gap and string.format("%.1f", gap) or "none",
-            INIT_CLIMB_GUARD_COOLDOWN)
+            InitClimb.GUARD_COOLDOWN)
     end
     approachGuardArmed = false
     guardArmedTime     = 0
-    guardCooldown      = INIT_CLIMB_GUARD_COOLDOWN
+    guardCooldown      = InitClimb.GUARD_COOLDOWN
     SuppressGameClimb(pawn, false)
 end
 
@@ -2033,10 +2109,21 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
     -- toward any climbable face within guard range, and each trace costs
     -- three UE4SS log lines (see PROBE_FRAME_INTERVAL) -- a fan here would
     -- be ~540 lines/sec just walking around.
-    local wall = WallInMovementPath(pawn, cmc, INIT_CLIMB_GUARD_GAP, false)
+    local wall, why = WallInMovementPath(pawn, cmc, InitClimb.GUARD_GAP, false)
+
+    -- Every give-up in a real session came through here, never through the
+    -- timeout: the guard armed and then the single centre ray stopped seeing
+    -- the face. That ray is blind to anything recessed at capsule-centre
+    -- height, and the fan was only ever reached AFTER it found something --
+    -- so a lost face never got the second look that would have recovered it.
+    if wall == nil and approachGuardArmed and why ~= "no input held" then
+        wall = WallInMovementPath(pawn, cmc, InitClimb.GUARD_GAP, true)
+        if wall ~= nil then why = nil end
+    end
+
     if wall == nil then
         if approachGuardArmed then
-            YieldWallToGame(pawn, "probe lost the face", nil)
+            YieldWallToGame(pawn, why or "probe lost the face", nil)
         else
             ReleaseApproachGuard(pawn)
         end
@@ -2050,14 +2137,14 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
     -- A walk-in commits close, where it reads as intent rather than as
     -- brushing past. An airborne approach commits as soon as the hop can
     -- still land before contact.
-    local commitGap = isWalking and INIT_CLIMB_MAX_GAP or INIT_CLIMB_HOP_GAP
+    local commitGap = isWalking and InitClimb.MAX_GAP or InitClimb.HOP_GAP
 
     -- Close in: re-probe with the vertical fan before deciding. The single
     -- centre ray is blind to a face recessed at waist height but present at
     -- chest or shin height, and committing on that reading is the difference
     -- between latching and walking into the wall doing nothing.
-    if wall.gap <= commitGap * INIT_CLIMB_FAN_NEAR_MULT then
-        local fanned = WallInMovementPath(pawn, cmc, INIT_CLIMB_GUARD_GAP, true)
+    if wall.gap <= commitGap * InitClimb.FAN_NEAR_MULT then
+        local fanned = WallInMovementPath(pawn, cmc, InitClimb.GUARD_GAP, true)
         if fanned ~= nil and fanned.gap < wall.gap then wall = fanned end
     end
 
@@ -2072,7 +2159,7 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
 
     -- Held the vanilla grab off long enough without converging: give the
     -- wall back rather than leave the player unable to climb it at all.
-    if guardArmedTime >= INIT_CLIMB_GUARD_TIMEOUT then
+    if guardArmedTime >= InitClimb.GUARD_TIMEOUT then
         YieldWallToGame(pawn, "no commit before timeout", wall.gap)
     end
     return nil
