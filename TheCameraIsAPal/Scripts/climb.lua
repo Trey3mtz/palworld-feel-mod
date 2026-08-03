@@ -17,6 +17,16 @@ local DEBUG   = false
 -- feeds UE4SS's console buffer and log file, neither of which is trimmed.
 local DEBUG_FRAME = false
 
+-- One-shot discovery output: component properties, class functions, hook
+-- results, and the tick-order summary. Separate from DEBUG and defaulted ON
+-- because it is bounded -- each line prints once per session and then goes
+-- quiet forever, so it cannot grow the log the way DEBUG_FRAME can. These
+-- answer questions this file cannot answer by reasoning (what the component
+-- actually exposes, what its reach values really are, which tick runs
+-- first), and gating them behind a per-frame flag meant a whole session
+-- produced none of them.
+local DEBUG_DISCOVERY = true
+
 -- Frames between init-climb wall probes. 1 = every frame (original
 -- behaviour). Each LineTraceSingle costs three UE4SS
 -- "[push_weakobjectproperty] Operation::Set is not supported" lines, because
@@ -266,6 +276,7 @@ local compTickedBeforeUs  = false
 local tickOrderBefore     = 0
 local tickOrderAfter      = 0
 local tickOrderSamples    = 0
+local compTicks           = 0   -- engine ticks a component once per frame
 local TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
 
 
@@ -280,6 +291,12 @@ end
 
 local function fdbg(fmt, ...)
     if DEBUG_FRAME then print(string.format("[PalFeel:climb] " .. fmt .. "\n", ...)) end
+end
+
+-- One-shot discovery lines. Prefixed distinctly so they are greppable out of
+-- a session log without the surrounding noise.
+local function ddbg(fmt, ...)
+    if DEBUG_DISCOVERY then print(string.format("[PalFeel:climb/DISCOVER] " .. fmt .. "\n", ...)) end
 end
 
 local function ReadOpt(obj, prop)
@@ -1557,7 +1574,7 @@ local function RegisterComponentHooks()
             dbg("ClimbUpAtTopEvent fired -- priority released")
         end)
     end)
-    dbg("hook ClimbUpAtTopEvent: %s",
+    ddbg("hook ClimbUpAtTopEvent: %s",
         okTop and "registered" or ("FAILED: " .. tostring(errTop)))
 
     -- Ground contact: the return value only exists post-execution, so
@@ -1582,7 +1599,7 @@ local function RegisterComponentHooks()
             end
         end)
     end)
-    dbg("hook GroundCheck: %s",
+    ddbg("hook GroundCheck: %s",
         okGnd and "registered" or ("FAILED: " .. tostring(errGnd)))
 
     -- DIAGNOSTIC ONLY -- changes no behaviour.
@@ -1599,9 +1616,10 @@ local function RegisterComponentHooks()
             if not IsOurComponent(Context) then return end
             compTickHookAlive  = true
             compTickedBeforeUs = true
+            compTicks          = compTicks + 1
         end)
     end)
-    dbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native "
+    ddbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native "
         .. "and the grab decision cannot be pre-empted this way",
         okTick and "registered" or ("FAILED: " .. tostring(errTick)))
 
@@ -1612,16 +1630,16 @@ local function RegisterComponentHooks()
     -- whole approach.
     local okDump = pcall(function()
         local cls = comp:GetClass()
-        dbg("---- %s functions ----", clsPath)
+        ddbg("---- %s functions ----", clsPath)
         cls:ForEachFunction(function(fn)
             local n = nil
             pcall(function() n = fn:GetName() end)
-            if n then dbg("  fn: %s", n) end
+            if n then ddbg("  fn: %s", n) end
         end)
-        dbg("---- end functions ----")
+        ddbg("---- end functions ----")
     end)
     if not okDump then
-        dbg("function dump unavailable on this UE4SS build "
+        ddbg("function dump unavailable on this UE4SS build "
             .. "(ForEachFunction missing) -- names must be found by hand")
     end
 
@@ -1654,6 +1672,7 @@ function M.OnPlayerCached(pawn, cmc)
     approachGuardArmed  = false
     compTickedBeforeUs  = false
     tickOrderBefore, tickOrderAfter, tickOrderSamples = 0, 0, 0
+    compTicks           = 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
@@ -1671,19 +1690,19 @@ function M.OnPlayerCached(pawn, cmc)
         capsuleHalfHeight - capsuleRadius - PROBE_FAN_HEIGHT_PAD))
 
     if comp == nil then
-        dbg("climbing component NOT FOUND")
+        ddbg("climbing component NOT FOUND")
     else
-        dbg("component: %s  ClimbMaxSpeed=%s  fwdRay=%s",
+        ddbg("component: %s  ClimbMaxSpeed=%s  fwdRay=%s",
             compName, tostring(ReadOpt(cmc, "ClimbMaxSpeed")),
             tostring(ReadOpt(comp, "Const_ForwardRayLength")))
         -- Everything the reach figures are guesses ABOUT. Read these off a
         -- real session before tying any tuning value to them, and turn on
         -- DEBUG_DRAW to confirm the rays match what is printed here.
-        dbg("geom: capsuleR=%.1f halfH=%.1f fanOffset=%.1f | attachGap=%.1f "
+        ddbg("geom: capsuleR=%.1f halfH=%.1f fanOffset=%.1f | attachGap=%.1f "
             .. "guardGap=%.1f hopGap=%.1f",
             capsuleRadius, capsuleHalfHeight, probeFanOffset,
             ATTACH_MAX_GAP, INIT_CLIMB_GUARD_GAP, INIT_CLIMB_HOP_GAP)
-        dbg("component props: fwdRay=%s rayChannel=%s (UNVERIFIED units/origin)",
+        ddbg("component props: fwdRay=%s rayChannel=%s (UNVERIFIED units/origin)",
             tostring(ReadOpt(comp, "Const_ForwardRayLength")),
             tostring(ReadOpt(comp, "Const_RayChannel")))
         CharacterizeTraceStruct(pawn)
@@ -1863,7 +1882,7 @@ end
 -- a few seconds and then silent. A split result is the finding: it means the
 -- order is not stable, and no probe range tuned from this file can fix that.
 local function SampleTickOrder()
-    if not DEBUG then return end
+    if not DEBUG_DISCOVERY then return end
     if not compTickHookAlive then return end
     if tickOrderSamples >= TICK_ORDER_SAMPLE_MAX then return end
 
@@ -1876,11 +1895,25 @@ local function SampleTickOrder()
     compTickedBeforeUs = false
 
     if tickOrderSamples == TICK_ORDER_SAMPLE_MAX then
-        dbg("TICK ORDER over %d frames: component ran BEFORE our tick %d, "
-            .. "AFTER (or not at all) %d. Split = nondeterministic order, "
-            .. "which is on its own enough to make the same wall behave "
-            .. "differently between runs.",
+        ddbg("TICK ORDER over %d of our ticks: component ran BEFORE us %d, "
+            .. "AFTER (or not at all) %d. A split means the order is not "
+            .. "stable, which on its own is enough to make the same wall "
+            .. "behave differently between runs.",
             tickOrderSamples, tickOrderBefore, tickOrderAfter)
+
+        -- The engine ticks a component exactly once per frame, so the
+        -- component's count is a reference clock for real frames. Our tick
+        -- comes from a hook on the controller's ReceiveTick, and a session
+        -- log showed that function registered TWICE. If both registrations
+        -- are live, every subsystem runs twice per frame on the same dt --
+        -- and every duration in this file (airTime, LOCK_TIME, retry
+        -- intervals) then advances at double real time, which no amount of
+        -- tuning would explain away.
+        local ratio = compTicks > 0 and (tickOrderSamples / compTicks) or 0
+        ddbg("TICK RATIO: our ticks %d vs component ticks %d = %.2fx. "
+            .. "~1.0 is healthy; ~2.0 means the controller tick hook is "
+            .. "double-registered and every duration here runs at 2x.",
+            tickOrderSamples, compTicks, ratio)
     end
 end
 
