@@ -110,6 +110,22 @@ local INIT_CLIMB_HOP_GAP   = 55    -- uu from capsule surface: commit the hop
 -- (VZ_TRIGGER) loses its entry and a fast fall just splats.
 local INIT_CLIMB_GUARD_VZ_MIN = 5  -- uu/s of rise required to suppress
 
+-- The guard holds the vanilla grab off while closing. If our own commit then
+-- never fires, the player gets neither -- they walk into the face and nothing
+-- happens, which is strictly worse than not running the mod at all. So the
+-- guard is time-boxed: hold it off only as long as an approach could still
+-- plausibly be converging, then hand the wall back and stay out of the way
+-- for a moment so it cannot immediately re-arm and re-suppress.
+local INIT_CLIMB_GUARD_TIMEOUT  = 0.45  -- s armed without committing -> give up
+local INIT_CLIMB_GUARD_COOLDOWN = 0.80  -- s of vanilla ownership after giving up
+
+-- Below this multiple of the commit gap the probe upgrades to the vertical
+-- fan. Arming stays a single ray (it runs while merely walking near a face,
+-- and each trace costs three UE4SS log lines), but the commit decision is
+-- worth three: a face recessed at capsule-centre height is exactly the
+-- "some walls are finicky" case, and by then it is only the last few frames.
+local INIT_CLIMB_FAN_NEAR_MULT = 2.5
+
 -- Small penetration is normal: UE resolves overlap over several frames and
 -- a capsule pressed into a wall routinely reads a hair inside it. Only a
 -- trace that starts genuinely inside geometry (where the returned normal
@@ -254,6 +270,10 @@ local JUMP_DIRECTIONS = {
 -- Latched by the approach guard; declared here rather than beside the guard
 -- itself because OnPlayerCached resets it and is defined earlier in the file.
 local approachGuardArmed = false
+local guardArmedTime     = 0
+local guardCooldown      = 0
+local guardGiveUps       = 0
+local GUARD_GIVEUP_LOG_MAX = 12
 
 -- Shadowed by M.InInitClimbState: the two are written together, in
 -- StartClimbFrom* and EndInitClimb, and nowhere else.
@@ -1846,6 +1866,9 @@ function M.OnPlayerCached(pawn, cmc)
     wantClimbSuppressed = false   -- fresh component, fresh flags
     climbSuppressionHeld = false
     approachGuardArmed  = false
+    guardArmedTime      = 0
+    guardCooldown       = 0
+    guardGiveUps        = 0
     compTickedBeforeUs  = false
     tickOrderBefore, tickOrderAfter, tickOrderSamples = 0, 0, 0
     compTicks           = 0
@@ -1965,9 +1988,32 @@ local function ReleaseApproachGuard(pawn)
     SuppressGameClimb(pawn, false)
 end
 
-local function TickApproachGuard(pawn, cmc, isWalking)
+-- Hands the wall back to the game and stays out of the way briefly, so a
+-- failed approach cannot immediately re-arm and re-suppress.
+local function YieldWallToGame(pawn, reason, gap)
+    if approachGuardArmed and guardGiveUps < GUARD_GIVEUP_LOG_MAX then
+        guardGiveUps = guardGiveUps + 1
+        ddbg("guard gave up (%s, lastGap=%s) -- wall handed back to the "
+            .. "vanilla grab for %.2fs. Frequent lines here mean the commit "
+            .. "conditions are too strict for the faces being walked into.",
+            reason, gap and string.format("%.1f", gap) or "none",
+            INIT_CLIMB_GUARD_COOLDOWN)
+    end
+    approachGuardArmed = false
+    guardArmedTime     = 0
+    guardCooldown      = INIT_CLIMB_GUARD_COOLDOWN
+    SuppressGameClimb(pawn, false)
+end
+
+local function TickApproachGuard(dt, pawn, cmc, isWalking)
     local vz = 0
     pcall(function() vz = cmc.Velocity.Z end)
+
+    if guardCooldown > 0 then
+        guardCooldown = math.max(0, guardCooldown - dt)
+        ReleaseApproachGuard(pawn)
+        return nil
+    end
 
     -- VZ_TRIGGER is the wall slide's own entry speed, so the two features
     -- hand off at exactly one boundary instead of contending for the frame.
@@ -1983,29 +2029,53 @@ local function TickApproachGuard(pawn, cmc, isWalking)
         return nil
     end
 
-    -- Single centre ray, not the fan. This runs every frame the player moves
+    -- Single centre ray for ARMING. This runs every frame the player moves
     -- toward any climbable face within guard range, and each trace costs
     -- three UE4SS log lines (see PROBE_FRAME_INTERVAL) -- a fan here would
-    -- be ~540 lines/sec just walking around. Arming only needs to know a
-    -- face is ahead; the fan is spent where it pays, on the ascent.
+    -- be ~540 lines/sec just walking around.
     local wall = WallInMovementPath(pawn, cmc, INIT_CLIMB_GUARD_GAP, false)
     if wall == nil then
-        ReleaseApproachGuard(pawn)
+        if approachGuardArmed then
+            YieldWallToGame(pawn, "probe lost the face", nil)
+        else
+            ReleaseApproachGuard(pawn)
+        end
         return nil
     end
 
     approachGuardArmed = true
+    guardArmedTime     = guardArmedTime + dt
     SuppressGameClimb(pawn, true)
 
     -- A walk-in commits close, where it reads as intent rather than as
     -- brushing past. An airborne approach commits as soon as the hop can
     -- still land before contact.
     local commitGap = isWalking and INIT_CLIMB_MAX_GAP or INIT_CLIMB_HOP_GAP
+
+    -- Close in: re-probe with the vertical fan before deciding. The single
+    -- centre ray is blind to a face recessed at waist height but present at
+    -- chest or shin height, and committing on that reading is the difference
+    -- between latching and walking into the wall doing nothing.
+    if wall.gap <= commitGap * INIT_CLIMB_FAN_NEAR_MULT then
+        local fanned = WallInMovementPath(pawn, cmc, INIT_CLIMB_GUARD_GAP, true)
+        if fanned ~= nil and fanned.gap < wall.gap then wall = fanned end
+    end
+
     local closeEnough = wall.gap <= commitGap
-    fdbg("guard: gap=%.1f vz=%.0f walk=%s commit=%s",
-        wall.gap, vz, tostring(isWalking), tostring(closeEnough))
-    if not closeEnough then return nil end
-    return wall
+    fdbg("guard: gap=%.1f vz=%.0f walk=%s armed=%.2fs commit=%s",
+        wall.gap, vz, tostring(isWalking), guardArmedTime, tostring(closeEnough))
+
+    if closeEnough then
+        guardArmedTime = 0
+        return wall
+    end
+
+    -- Held the vanilla grab off long enough without converging: give the
+    -- wall back rather than leave the player unable to climb it at all.
+    if guardArmedTime >= INIT_CLIMB_GUARD_TIMEOUT then
+        YieldWallToGame(pawn, "no commit before timeout", wall.gap)
+    end
+    return nil
 end
 
 local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
@@ -2031,6 +2101,12 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
     -- original exactly; the counter is primed whenever a start is
     -- impossible so the first eligible frame always probes.
     local canStartFromHere = isWalking or IsRisingAtWall(cmc) or approachGuardArmed
+    if guardCooldown > 0 then
+        -- Vanilla owns the wall for a moment after a failed approach.
+        guardCooldown = math.max(0, guardCooldown - dt)
+        ReleaseApproachGuard(pawn)
+        return
+    end
     if not canStartFromHere then
         -- Nothing to guard: make sure nothing is left suppressed. This covers
         -- every plain fall, including the one the wall slide needs.
@@ -2042,7 +2118,7 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
     if probeFrameCounter < PROBE_FRAME_INTERVAL then return end
     probeFrameCounter = 0
 
-    local wallAhead = TickApproachGuard(pawn, cmc, isWalking)
+    local wallAhead = TickApproachGuard(dt, pawn, cmc, isWalking)
     if wallAhead == nil then return end
 
     -- The guard hands off to whichever launch fits where the pawn is: on the
