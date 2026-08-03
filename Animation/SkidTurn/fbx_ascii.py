@@ -47,18 +47,20 @@ def to_fbx_quat(q):
     return (q[0], -q[1], q[2], -q[3])
 
 
-def euler_track(quats):
-    """Quaternion track -> continuous Euler XYZ degrees.
+def unwrap_euler(eulers):
+    """Euler XYZ track -> the same rotations, continuous frame to frame.
 
     Each frame picks between the two Euler solutions for the same rotation and
     any 360-degree shift of them, whichever is closest to the previous frame.
-    Without this a channel can jump +179 -> -179 and anything that resamples
-    the curve (Blender, a DCC round trip) sweeps the long way round.
+    Without this a channel can jump +179 -> -179, or flip to the other branch
+    entirely, and anything that reads the curve BETWEEN keys -- a resample, a
+    non-1.0 play rate, a DCC round trip -- sweeps the long way round or through
+    a pose that was never authored. Every key still decodes to the identical
+    quaternion, so this is free: it constrains only what happens between them.
     """
     out = []
     prev = None
-    for q in quats:
-        rx, ry, rz = R.quat_to_euler_xyz(q)
+    for rx, ry, rz in eulers:
         if prev is None:
             out.append((rx, ry, rz))
             prev = (rx, ry, rz)
@@ -79,6 +81,11 @@ def euler_track(quats):
         out.append(best)
         prev = best
     return out
+
+
+def euler_track(quats):
+    """Quaternion track -> continuous Euler XYZ degrees."""
+    return unwrap_euler([R.quat_to_euler_xyz(q) for q in quats])
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +358,14 @@ def write_generic(path, clip_name, names, parents, frames, fps=30.0, settings=No
     tick = int(round(KTIME_PER_SECOND / fps))
     stop = tick * (n_frames - 1)
     kinds = kinds or ["LimbNode"] * n_nodes
+
+    # The caller hands over per-frame Eulers solved one frame at a time, so
+    # adjacent frames can sit on opposite Euler branches -- same pose, curve
+    # that sweeps a full turn between them. Same fix the native writer applies.
+    rot = [unwrap_euler([frames[f][i][1] for f in range(n_frames)])
+           for i in range(n_nodes)]
+    frames = [[(frames[f][i][0], rot[i][f], frames[f][i][2])
+               for i in range(n_nodes)] for f in range(n_frames)]
 
     axis = {"UpAxis": 2, "UpAxisSign": 1, "FrontAxis": 1, "FrontAxisSign": -1,
             "CoordAxis": 0, "CoordAxisSign": 1, "UnitScaleFactor": 1.0}

@@ -32,10 +32,14 @@ and is wrong when the rests differ: it preserves motion relative to each rig's
 own rest, so a T-pose rig plays the arms 45 degrees high. Measured: 49cm at the
 fingertips. The rotation-driven route above lands every joint within 1.6mm.
 
-Output is written in the SKELETON FILE'S OWN conventions -- its axis header,
-its units, its node tree, including the Armature node and its transform -- so
-Unreal applies the same import conversion to the animation as it did to the
-skeleton, and the two cannot disagree.
+Output is written in the SKELETON FILE'S OWN axis conventions -- its up axis,
+its front axis -- so Unreal applies the same orientation conversion to the
+animation as it did to the skeleton. It is NOT written in the file's units or
+node tree: everything above `root` (Blender's Armature, carrying the metre ->
+centimetre conversion as a 100x scale and the up-axis fix as a -90 degree
+rotation) is folded into the root bone, and no scale is ever keyed. A clip that
+writes scale on every frame overrides whatever import scale the skeleton was
+brought in at; folding it away is what lets the skeleton win.
 """
 
 import argparse
@@ -290,6 +294,66 @@ def mat_scale_inverse(m):
     return inv
 
 
+
+def flatten_above_root(foreign, frames, top="root"):
+    """Fold everything above `top` into it, convert to centimetres, drop scale.
+
+    The source skeleton parks Blender's unit conversion and up-axis fix on an
+    Armature node as scale 100 and a -90 degree rotation. Emitting that node
+    means the CLIP dictates the rig's size: whatever scale the skeleton is
+    imported at, a scale-100 curve on every frame overrides it. Same story, more
+    quietly, for per-bone translations in metres.
+
+    So the ancestor chain is folded into the top bone's rotation, every local
+    translation is multiplied through by the accumulated scale, and scale is
+    pinned at 1 and never keyed. Joint positions come out identical -- the
+    conversion is a conjugation -- but nothing in the file can now argue with
+    the skeleton about how big it is.
+    """
+    ti = foreign.index[top]
+    above = FR.mat_identity()
+    node = foreign.parents[ti]
+    chain = []
+    while node >= 0:
+        chain.append(node)
+        node = foreign.parents[node]
+    for node in reversed(chain):
+        above = FR.mat_mul(above, foreign.local[node])
+    scale = FR.mat_scale(above)[0]
+    rot_above = FR.mat_to_quat(above)[0]
+
+    keep = []
+
+    def collect(i):
+        keep.append(i)
+        for j, p in enumerate(foreign.parents):
+            if p == i:
+                collect(j)
+
+    collect(ti)
+    keep = [i for i in keep if foreign.kind[i] != "Mesh"]
+    remap = {old: new for new, old in enumerate(keep)}
+
+    names = [foreign.names[i] for i in keep]
+    parents = [remap.get(foreign.parents[i], -1) for i in keep]
+    kinds = ["LimbNode"] * len(keep)
+
+    out = []
+    for frame in frames:
+        row = []
+        for i in keep:
+            t, e, _s = frame[i]
+            q = FR.euler_to_quat(e)
+            if i == ti:
+                q = R.qmul(rot_above, q)
+                t = FR.mat_point(above, t)
+            else:
+                t = tuple(c * scale for c in t)
+            row.append((t, R.quat_to_euler_xyz(q), (1.0, 1.0, 1.0)))
+        out.append(row)
+    return names, parents, kinds, out, scale
+
+
 def check(foreign, frames, game, wts, G, clip_name):
     """Re-run FK on the written locals and confirm EVERY joint lands where the
     clip puts it on the game rig, mapped through G. Checking only the bones G
@@ -344,27 +408,21 @@ def main():
         if key in foreign.raw["settings"]:
             settings[key] = foreign.raw["settings"][key]
 
-    names = sorted(poses.CLIPS) if args.clip == "all" else [args.clip]
-    for name in names:
+    wanted = sorted(poses.CLIPS) if args.clip == "all" else [args.clip]
+    for name in wanted:
         c = poses.CLIPS[name]()
         rots, trans, wqs, wts = c.bake(game)
         frames = retarget_clip(game, foreign, wqs, wts, G)
         worst = check(foreign, frames, game, wts, G, c.name)
-        # Emit the skeleton nodes only. The source file also carries the mesh
-        # node; an animation-only FBX has no business shipping geometry, and a
-        # Mesh node attribute in a skeleton hierarchy is malformed anyway.
-        keep = [i for i, k in enumerate(foreign.kind) if k != "Mesh"]
-        remap = {old_i: new_i for new_i, old_i in enumerate(keep)}
-        names = [foreign.names[i] for i in keep]
-        parents = [remap.get(foreign.parents[i], -1) for i in keep]
-        kinds = [foreign.kind[i] for i in keep]
-        kept_frames = [[fr[i] for i in keep] for fr in frames]
-
+        bones, parents, kinds, kept_frames, folded = flatten_above_root(foreign, frames)
+        emit = dict(settings)
+        emit["UnitScaleFactor"] = 1.0            # centimetres now, like Unreal
         path = os.path.join(out_dir, c.name + ".fbx")
-        fbx_ascii.write_generic(path, c.name, names, parents,
-                                kept_frames, c.fps, settings, kinds)
-        print("  %-34s %2d frames  round-trip %s (worst %.4f cm)"
-              % (c.name, c.frame_count, "OK" if worst < 0.5 else "FAILED", worst))
+        fbx_ascii.write_generic(path, c.name, bones, parents,
+                                kept_frames, c.fps, emit, kinds)
+        print("  %-34s %2d frames  round-trip %s (worst %.4f cm)  %d nodes, x%g folded away"
+              % (c.name, c.frame_count, "OK" if worst < 0.5 else "FAILED", worst,
+                 len(bones), folded))
         if worst >= 0.5:
             raise SystemExit("retarget verification failed")
     print("\nwrote %s" % out_dir)

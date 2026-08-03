@@ -273,15 +273,49 @@ each rig's own bind -- is wrong when the rests differ, because it preserves
 motion relative to rest: a T-pose rig plays the arms 45 degrees high. Measured
 at 49cm of drift at the fingertips before this was fixed.
 
-Output is written in the **target file's own conventions**: its axis header,
-its units, its node tree, including the Armature node with its scale and
-rotation intact. Unreal then applies the same import conversion to the
-animation as it did to the skeleton, so the two cannot disagree.
+Output is written in the **target file's axis conventions** -- its up axis and
+front axis -- so Unreal applies the same orientation conversion to the animation
+as it did to the skeleton, and the two cannot disagree about which way is up.
+
+It is deliberately **not** written in that file's units or node tree. See below.
 
 `retarget.py` re-runs forward kinematics on what it wrote and refuses to finish
 unless every joint lands where the clip puts it. Current worst case is 0.16cm,
 on an eyeball bone that is itself 0.21cm out of place between the two rigs;
 every other bone is exact.
+
+### The clip must not have an opinion about how big the rig is
+
+An earlier version of this emitted the Armature node with its transform intact,
+on the reasoning that the skeleton was imported with it so the animation should
+carry it too. That reasoning is wrong, and it produced a clip that ignored every
+import-scale setting the skeleton was brought in with:
+
+```
+Armature Lcl Scaling : 100,100,100     keyed on all 102 nodes, every frame
+```
+
+A curve is an assertion made once per frame. A scale curve of 100 does not mean
+"this rig is in metres", it means "make this rig 100x, now, and again next
+frame" -- and it wins over whatever scale the skeleton was imported at, because
+it is applied after. Same story, more quietly, for bone translations in metres.
+
+So `flatten_above_root()` folds the whole ancestor chain above `root` into the
+root bone's own rotation, multiplies every local translation through by the
+accumulated scale (metres to centimetres), pins scale at 1 and never keys it.
+Joint positions are unchanged -- the fold is a conjugation, and the round-trip
+check still passes at 0.16cm -- but nothing left in the file argues with the
+skeleton about its size.
+
+**The honest caveat.** FBX has no way to say "this bone has no translation":
+Unreal's importer evaluates each node's local transform per frame and bakes a
+translation track either way, which is why translation retargeting modes exist
+at all. What the retargeted build guarantees is that those translations are
+*that skeleton's own* rest offsets, in centimetres, rather than the game rig's.
+Setting the bones to `Skeleton` translation retargeting (see `out/retargeting.txt`)
+is still what makes the skeleton's proportions authoritative and the clip's
+translations ignored -- for the arms and legs it is the difference between the
+clip driving limb length and the skeleton driving it.
 
 ## The pivot decides whether any of this reads
 
