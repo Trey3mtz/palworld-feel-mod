@@ -27,6 +27,14 @@ local DEBUG_FRAME = false
 -- produced none of them.
 local DEBUG_DISCOVERY = true
 
+-- The function dump is a one-time question that has been answered (the class
+-- exposes CanClimbingStart, StartClimbing, ClimbingMainUpdate, CheckClimbingMode,
+-- DelayCanClimbing, ForceCancelClimb, GroundCheck, and the CenterRayCast /
+-- UpRayCast / SideRayCast / DiagonalRayCast family). Off by default: it costs
+-- a startup hitch and walks object graph edges that must each be IsValid()
+-- checked, which is where a crash-on-load came from once already.
+local DEBUG_DUMP_FUNCTIONS = false
+
 -- Frames between init-climb wall probes. 1 = every frame (original
 -- behaviour). Each LineTraceSingle costs three UE4SS
 -- "[push_weakobjectproperty] Operation::Set is not supported" lines, because
@@ -1685,53 +1693,72 @@ local function RegisterComponentHooks()
     -- decision, pre-hooking that is far more surgical than a tick hook and
     -- would let the suppression be conditional instead of held across a
     -- whole approach.
-    -- The previous attempt printed a header, a footer, and nothing between:
-    -- ForEachFunction ran without erroring but every name came back empty,
-    -- because a per-item pcall around a single accessor swallowed whatever
-    -- went wrong. So: count the callbacks separately from the names, try
-    -- several accessors, and walk up the class chain -- GroundCheck and
-    -- ReceiveTick may well be declared on a parent rather than the BP class.
-    local function DumpFunctions(cls, label)
-        local seen, named = 0, 0
-        local okEach = pcall(function()
-            cls:ForEachFunction(function(fn)
-                seen = seen + 1
-                local n = nil
-                pcall(function() n = fn:GetName() end)
-                if n == nil then pcall(function() n = fn:GetFullName() end) end
-                if n == nil then pcall(function() n = tostring(fn) end) end
-                if n ~= nil then
-                    named = named + 1
-                    ddbg("  [%s] fn: %s", label, tostring(n))
-                end
+    -- Dumping the class's functions answered what the component exposes, so
+    -- this is OFF by default now: the answer is recorded in the notes above
+    -- and re-running it costs a startup hitch for nothing.
+    --
+    -- It is also where a crash-on-load came from. The first version walked
+    -- the SuperStruct chain with only a `parent ~= nil` guard. Past
+    -- /Script/CoreUObject.Object, GetSuperStruct returns a NON-NIL but
+    -- INVALID wrapper (it printed as "nil" because GetFullName gave nothing),
+    -- and dereferencing that took a native access violation. pcall does not
+    -- protect against those -- FindClimbingComponent says exactly this a few
+    -- hundred lines up, and every dereference has to be IsValid()-checked
+    -- individually. So: IsLive() before every single dereference, and the
+    -- walk stops the moment a link fails to validate.
+    if DEBUG_DUMP_FUNCTIONS then
+        local function DumpFunctions(cls, label)
+            if not IsLive(cls) then
+                ddbg("  [%s] not a live object -- skipped", label)
+                return false
+            end
+            local seen, named = 0, 0
+            local okEach = pcall(function()
+                cls:ForEachFunction(function(fn)
+                    seen = seen + 1
+                    local n = nil
+                    pcall(function() n = fn:GetFullName() end)
+                    if n == nil then pcall(function() n = fn:GetName() end) end
+                    if n ~= nil then
+                        named = named + 1
+                        ddbg("  [%s] fn: %s", label, tostring(n))
+                    end
+                end)
             end)
-        end)
-        ddbg("  [%s] ForEachFunction: callable=%s visited=%d named=%d",
-            label, tostring(okEach), seen, named)
-        return okEach
-    end
-
-    pcall(function()
-        ddbg("---- functions on %s ----", clsPath)
-        local cls = comp:GetClass()
-        DumpFunctions(cls, "class")
-
-        -- Walk the SuperStruct chain: UPalClimbingComponent (native) is where
-        -- a grab decision would most plausibly live.
-        local parent, depth = nil, 0
-        pcall(function() parent = cls:GetSuperStruct() end)
-        while parent ~= nil and depth < 4 do
-            local pname = "?"
-            pcall(function() pname = parent:GetFullName() end)
-            ddbg("  -- super[%d]: %s", depth, tostring(pname))
-            DumpFunctions(parent, "super" .. depth)
-            local nxt = nil
-            pcall(function() nxt = parent:GetSuperStruct() end)
-            parent = nxt
-            depth = depth + 1
+            ddbg("  [%s] ForEachFunction: callable=%s visited=%d named=%d",
+                label, tostring(okEach), seen, named)
+            return okEach
         end
-        ddbg("---- end functions ----")
-    end)
+
+        pcall(function()
+            ddbg("---- functions on %s ----", clsPath)
+            local cls = comp:GetClass()
+            if not IsLive(cls) then return end
+            DumpFunctions(cls, "class")
+
+            local parent, depth = nil, 0
+            pcall(function() parent = cls:GetSuperStruct() end)
+            while IsLive(parent) and depth < 4 do
+                local pname = nil
+                pcall(function() pname = parent:GetFullName() end)
+                -- An unreadable name means the wrapper is not a real live
+                -- UStruct: stop rather than touch it again.
+                if type(pname) ~= "string" then
+                    ddbg("  -- super[%d]: unreadable, stopping walk", depth)
+                    break
+                end
+                ddbg("  -- super[%d]: %s", depth, pname)
+                DumpFunctions(parent, "super" .. depth)
+
+                local nxt = nil
+                pcall(function() nxt = parent:GetSuperStruct() end)
+                if not IsLive(nxt) then break end
+                parent = nxt
+                depth = depth + 1
+            end
+            ddbg("---- end functions ----")
+        end)
+    end
 
     hooksRegistered = true
 end
