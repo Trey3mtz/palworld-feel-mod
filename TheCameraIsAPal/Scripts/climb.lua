@@ -277,6 +277,8 @@ local tickOrderBefore     = 0
 local tickOrderAfter      = 0
 local tickOrderSamples    = 0
 local compTicks           = 0   -- engine ticks a component once per frame
+local grabWasClimbingPre  = false
+local grabInsideTick      = 0
 local TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
 
 
@@ -400,18 +402,44 @@ local function SetCanClimb(pawn, allowed)
     pcall(function() climbComp.CanClimbing = allowed end)
 end
 
--- Single writer for CanClimbing, edge-tracked. The component grabs the
--- instant its own ray finds a face, which is earlier than this script's
--- tick, so beating it means holding it off during the approach rather than
--- reacting after. Tracked because a suppression left standing would disable
--- climbing outright for the rest of the session.
-local gameClimbSuppressed = false
+-- Suppression is split into a WANT (decided by the approach guard, which
+-- needs velocity and probes and so lives on the controller tick) and an
+-- APPLY (the actual property write).
+--
+-- The split exists because of a measurement: over 240 consecutive frames the
+-- climbing component's tick ran before our controller tick 240 times and
+-- after it 0 times. The order is not a race -- the component always goes
+-- first. So a CanClimbing write issued from the controller tick cannot take
+-- effect until the NEXT frame, and the component gets first refusal on every
+-- frame in between. That is the whole reason the guard has to reach 130uu:
+-- it is buying frames of margin against a decision it always loses.
+--
+-- Applying from the component's own ReceiveTick pre-hook lands the write in
+-- the SAME frame, immediately before the component's logic runs.
+local wantClimbSuppressed  = false
+local climbSuppressionHeld = false
+
+-- Only ever writes to force suppression ON, or to release one it applied
+-- itself. It must not write `true` freely: the game sets CanClimbing false
+-- for its own reasons (stamina, water, state), and blanket-restoring it
+-- every frame would override those.
+local function ApplyClimbSuppression()
+    if not IsLive(comp) then return end
+    if wantClimbSuppressed then
+        pcall(function() comp.CanClimbing = false end)
+        climbSuppressionHeld = true
+    elseif climbSuppressionHeld then
+        pcall(function() comp.CanClimbing = true end)
+        climbSuppressionHeld = false
+    end
+end
 
 local function SuppressGameClimb(pawn, suppress)
-    if suppress == gameClimbSuppressed then return end
-    gameClimbSuppressed = suppress
-    SetCanClimb(pawn, not suppress)
-    dbg("game climb %s", suppress and "SUPPRESSED" or "restored")
+    if suppress ~= wantClimbSuppressed then
+        dbg("game climb %s", suppress and "SUPPRESSED" or "restored")
+    end
+    wantClimbSuppressed = suppress
+    ApplyClimbSuppression()
 end
 
 -- SetIgnoreMoveInput is a controller-level counter, and nothing guarantees
@@ -499,7 +527,10 @@ local function ForceClimbAttach(cmc)
     -- follow it or the next SuppressGameClimb(false) would be a no-op and
     -- leave the flag believing it is still holding the component off.
     local okCan  = pcall(function() comp.CanClimbing = true end)
-    if okCan then gameClimbSuppressed = false end
+    if okCan then
+        wantClimbSuppressed  = false
+        climbSuppressionHeld = false
+    end
     local okMode = pcall(function() cmc:SetMovementMode(6, 5) end)
     if not okMode then
         okMode = pcall(function()
@@ -1612,12 +1643,38 @@ local function RegisterComponentHooks()
     -- Registering against the BP class path (never the /Script/Engine base,
     -- which would fire for every component in the world) answers that.
     local okTick, errTick = pcall(function()
-        RegisterHook(clsPath .. ":ReceiveTick", function(Context)
-            if not IsOurComponent(Context) then return end
-            compTickHookAlive  = true
-            compTickedBeforeUs = true
-            compTicks          = compTicks + 1
-        end)
+        RegisterHook(clsPath .. ":ReceiveTick",
+            -- PRE: the only point in the frame that is provably ahead of the
+            -- component's own logic. Measured: component tick before our
+            -- controller tick on 240/240 frames, so this is where a
+            -- suppression has to be written to matter this frame.
+            function(Context)
+                if not IsOurComponent(Context) then return end
+                compTickHookAlive  = true
+                compTickedBeforeUs = true
+                compTicks          = compTicks + 1
+                grabWasClimbingPre = ReadOpt(comp, "IsClimbing") == true
+                ApplyClimbSuppression()
+            end,
+            -- POST: did the component decide to grab inside this call? A
+            -- false->true flip across the pre/post boundary proves the grab
+            -- happens AFTER the BP tick and can therefore be pre-empted from
+            -- the pre-hook. Zero flips would mean the decision lives in
+            -- native TickComponent ahead of ReceiveTick, and suppressing from
+            -- here is still a frame late.
+            function(Context)
+                if not IsOurComponent(Context) then return end
+                local nowClimbing = ReadOpt(comp, "IsClimbing") == true
+                if nowClimbing and not grabWasClimbingPre then
+                    grabInsideTick = grabInsideTick + 1
+                    if grabInsideTick <= 3 then
+                        ddbg("GRAB WINDOW: component went IsClimbing "
+                            .. "false->true INSIDE its own BP tick (#%d) -- "
+                            .. "a pre-hook suppression lands before it",
+                            grabInsideTick)
+                    end
+                end
+            end)
     end)
     ddbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native "
         .. "and the grab decision cannot be pre-empted this way",
@@ -1628,20 +1685,53 @@ local function RegisterComponentHooks()
     -- decision, pre-hooking that is far more surgical than a tick hook and
     -- would let the suppression be conditional instead of held across a
     -- whole approach.
-    local okDump = pcall(function()
-        local cls = comp:GetClass()
-        ddbg("---- %s functions ----", clsPath)
-        cls:ForEachFunction(function(fn)
-            local n = nil
-            pcall(function() n = fn:GetName() end)
-            if n then ddbg("  fn: %s", n) end
+    -- The previous attempt printed a header, a footer, and nothing between:
+    -- ForEachFunction ran without erroring but every name came back empty,
+    -- because a per-item pcall around a single accessor swallowed whatever
+    -- went wrong. So: count the callbacks separately from the names, try
+    -- several accessors, and walk up the class chain -- GroundCheck and
+    -- ReceiveTick may well be declared on a parent rather than the BP class.
+    local function DumpFunctions(cls, label)
+        local seen, named = 0, 0
+        local okEach = pcall(function()
+            cls:ForEachFunction(function(fn)
+                seen = seen + 1
+                local n = nil
+                pcall(function() n = fn:GetName() end)
+                if n == nil then pcall(function() n = fn:GetFullName() end) end
+                if n == nil then pcall(function() n = tostring(fn) end) end
+                if n ~= nil then
+                    named = named + 1
+                    ddbg("  [%s] fn: %s", label, tostring(n))
+                end
+            end)
         end)
+        ddbg("  [%s] ForEachFunction: callable=%s visited=%d named=%d",
+            label, tostring(okEach), seen, named)
+        return okEach
+    end
+
+    pcall(function()
+        ddbg("---- functions on %s ----", clsPath)
+        local cls = comp:GetClass()
+        DumpFunctions(cls, "class")
+
+        -- Walk the SuperStruct chain: UPalClimbingComponent (native) is where
+        -- a grab decision would most plausibly live.
+        local parent, depth = nil, 0
+        pcall(function() parent = cls:GetSuperStruct() end)
+        while parent ~= nil and depth < 4 do
+            local pname = "?"
+            pcall(function() pname = parent:GetFullName() end)
+            ddbg("  -- super[%d]: %s", depth, tostring(pname))
+            DumpFunctions(parent, "super" .. depth)
+            local nxt = nil
+            pcall(function() nxt = parent:GetSuperStruct() end)
+            parent = nxt
+            depth = depth + 1
+        end
         ddbg("---- end functions ----")
     end)
-    if not okDump then
-        ddbg("function dump unavailable on this UE4SS build "
-            .. "(ForEachFunction missing) -- names must be found by hand")
-    end
 
     hooksRegistered = true
 end
@@ -1668,11 +1758,14 @@ function M.OnPlayerCached(pawn, cmc)
     initClimbState     = nil
     M.InInitClimbState = false
     prevClimbZ     = nil
-    gameClimbSuppressed = false   -- fresh component, fresh flag
+    wantClimbSuppressed = false   -- fresh component, fresh flags
+    climbSuppressionHeld = false
     approachGuardArmed  = false
     compTickedBeforeUs  = false
     tickOrderBefore, tickOrderAfter, tickOrderSamples = 0, 0, 0
     compTicks           = 0
+    grabWasClimbingPre  = false
+    grabInsideTick      = 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
