@@ -56,6 +56,15 @@ local PROBE_FRAME_INTERVAL = 1
 local DEBUG_DRAW      = 0
 local DEBUG_DRAW_TIME = 0.0   -- seconds; only meaningful for mode 2
 
+-- Draws the climbing checks as world-space geometry every frame: the probe
+-- rays at each fan height, and rings at each distance threshold the feature
+-- switches behaviour on. The thresholds are the whole temperament of this
+-- system -- when the guard arms, when it commits, how far a grab reaches --
+-- and they have been tuned so far by inference from give-up logs rather than
+-- by looking at them. Set to true, walk at a face, and the numbers become a
+-- picture.
+local DEBUG_VOLUMES = false
+
 -- ---- slide ----
 local VZ_TRIGGER  = -600
 local VZ_CAP      = 1600
@@ -126,6 +135,9 @@ InitClimb.GUARD_VZ_MIN = 5  -- uu/s of rise required to suppress
 -- for a moment so it cannot immediately re-arm and re-suppress.
 InitClimb.GUARD_TIMEOUT  = 0.45  -- s armed without committing -> give up
 InitClimb.GUARD_COOLDOWN = 0.80  -- s of vanilla ownership after giving up
+-- Probe loss can be a single bad frame on uneven geometry. Tolerating a few
+-- costs nothing and stops one unlucky trace from surrendering the wall.
+InitClimb.GUARD_LOST_TICKS = 6
 
 -- Below this multiple of the commit gap the probe upgrades to the vertical
 -- fan. Arming stays a single ray (it runs while merely walking near a face,
@@ -201,6 +213,22 @@ InitClimb.HOLD_GAP  = 8      -- uu gap to hold while rising
 InitClimb.IN_GAIN   = 14.0   -- 1/s; inward vel = gain * (gap - target)
 InitClimb.IN_MAX    = 320    -- uu/s inward correction cap
 InitClimb.YAW_RATE  = 900    -- deg/s slew cap while tracking the face
+
+-- ---- climb jump: catching the top-out ----
+-- A leap up a face that ends mid-leap currently sails past the lip and free
+-- falls. The component already owns a vault (ClimbUpAtTopEvent); this is
+-- about noticing the lip in time to hand off to it.
+--
+-- Detection is a two-ray disagreement: the face is still there at shoulder
+-- height and gone above it, which is what a top edge IS. Both rays are cast
+-- along the leap's own facing, so a wall that merely gets thinner does not
+-- read as a top.
+local TopOut = {}
+TopOut.ENABLED    = true
+TopOut.LOW_OFFSET  = -10   -- uu from capsule centre: must still find wall
+TopOut.HIGH_OFFSET = 46    -- uu above centre: must find nothing
+TopOut.MAX_GAP     = 60    -- uu; lip must be within grabbing distance
+TopOut.CALL_EVENT  = true  -- also fire the component's own vault event
 
 -- ---- climb jump: attach verification ----
 local ATTACH_MAX_TRIES = 3  -- attempts within the window; then free fall
@@ -289,6 +317,7 @@ local JUMP_DIRECTIONS = {
 -- Latched by the approach guard; declared here rather than beside the guard
 -- itself because OnPlayerCached resets it and is defined earlier in the file.
 local approachGuardArmed = false
+local guardLostFrames    = 0
 local guardArmedTime     = 0
 local guardCooldown      = 0
 local guardGiveUps       = 0
@@ -916,6 +945,85 @@ local function FaceYaw(pawn, faceDir)
 end
 
 -- =========================================================================
+--  DEBUG VISUALISATION
+-- Everything here is inert unless DEBUG_VOLUMES is on, and every call is
+-- pcall-wrapped: a missing DrawDebug* on some UE4SS build must never take
+-- gameplay down with it.
+-- =========================================================================
+
+local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- arm range
+local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- commit range
+local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- grabbable
+local COLOR_HIT     = { R = 1.0,  G = 1.0,  B = 0.10, A = 1.0 }  -- what we found
+local COLOR_RAY     = { R = 0.55, G = 0.55, B = 0.60, A = 1.0 }  -- probe rays
+
+local function DrawLine(pawn, from, to, color, thickness)
+    pcall(function()
+        KSL:DrawDebugLine(pawn, from, to, color, DEBUG_DRAW_TIME, thickness or 1.5)
+    end)
+end
+
+local function DrawRing(pawn, centre, radius, color)
+    pcall(function()
+        KSL:DrawDebugCircle(pawn, centre, radius, 24, color,
+            DEBUG_DRAW_TIME, 1.5,
+            { X = 1, Y = 0, Z = 0 }, { X = 0, Y = 1, Z = 0 }, false)
+    end)
+end
+
+local function DrawMarker(pawn, centre, radius, color)
+    pcall(function()
+        KSL:DrawDebugSphere(pawn, centre, radius, 8, color, DEBUG_DRAW_TIME, 1.5)
+    end)
+end
+
+-- Rings on the ground at each threshold, probe rays at each fan height, and a
+-- marker on whatever the probe actually found. Drawn from the direction the
+-- player is asking to go, because that -- not the facing -- is what every
+-- check in this file traces along.
+local function VisualiseClimbChecks(pawn, cmc)
+    if not DEBUG_VOLUMES or not IsLive(KSL) then return end
+
+    local origin = GetLoc(pawn)
+    if origin == nil then return end
+
+    local dir = GetInputDirection(cmc) or WallFwd(pawn)
+    if dir == nil then return end
+
+    -- Distance rings, measured from the capsule surface exactly as the
+    -- thresholds are, so what is drawn is what is compared.
+    local footZ = origin.Z - capsuleHalfHeight + 2
+    local foot  = { X = origin.X, Y = origin.Y, Z = footZ }
+    DrawRing(pawn, foot, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD)
+    DrawRing(pawn, foot, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT)
+    DrawRing(pawn, foot, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT)
+    DrawRing(pawn, foot, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH)
+
+    -- The probe rays themselves, at the heights the fan actually uses.
+    local reach = capsuleRadius + InitClimb.GUARD_GAP
+    local heights = { 0 }
+    if probeFanOffset > 0 then
+        heights[#heights + 1] =  probeFanOffset
+        heights[#heights + 1] = -probeFanOffset
+    end
+    for _, h in ipairs(heights) do
+        local from = { X = origin.X, Y = origin.Y, Z = origin.Z + h }
+        local to   = { X = origin.X + dir.X * reach,
+                       Y = origin.Y + dir.Y * reach,
+                       Z = origin.Z + h }
+        DrawLine(pawn, from, to, COLOR_RAY, 1.0)
+
+        local hit = TraceAlongDirection(pawn, dir, reach, h)
+        if hit ~= nil then
+            local d = capsuleRadius + hit.gap
+            DrawMarker(pawn, { X = origin.X + dir.X * d,
+                               Y = origin.Y + dir.Y * d,
+                               Z = origin.Z + h }, 6, COLOR_HIT)
+        end
+    end
+end
+
+-- =========================================================================
 --  INIT CLIMB SEQUENCE
 -- Walk or fly into a climbable face -> hop -> latch. One state machine for
 -- both entries; they differ only in how the hop is produced.
@@ -1357,6 +1465,43 @@ local function ApplyHugVelocity(pawn, cmc)
     FaceYaw(pawn, faceDir)
 end
 
+-- Is the face about to end just above us? Low ray still finds wall, high ray
+-- finds nothing: that gap between them is the lip. Only meaningful while
+-- rising, so callers gate on that rather than paying for two traces a frame
+-- on a sideways or downward leap.
+local function SenseTopEdge(pawn, faceDir)
+    local reach = capsuleRadius + TopOut.MAX_GAP
+
+    local low = TraceAlongDirection(pawn, faceDir, reach, TopOut.LOW_OFFSET)
+    if low == nil or low.gap > TopOut.MAX_GAP then return false end
+    -- A walkable-normal hit is a slope rolling over, not a face with a lip.
+    if low.normalZ >= walkableFloorZ then return false end
+
+    local high = TraceAlongDirection(pawn, faceDir, reach, TopOut.HIGH_OFFSET)
+    return high == nil
+end
+
+-- Latch at the lip and hand off to the game's own top-out. The attach is the
+-- part that matters -- it stops the leap sailing past -- so the event call is
+-- attempted after it and its failure is not fatal.
+local function TryTopOut(pawn, cmc)
+    ForceClimbAttach(cmc)
+
+    local movementMode       = cmc.MovementMode
+    local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
+    local latched = (movementMode == 6 and customMovementMode == 5)
+    if not latched then return false end
+
+    local firedEvent = false
+    if TopOut.CALL_EVENT and IsLive(comp) then
+        firedEvent = pcall(function() comp:ClimbUpAtTopEvent() end)
+    end
+
+    dbg("top-out caught mid-leap: latched=%s vaultEvent=%s",
+        tostring(latched), tostring(firedEvent))
+    return true
+end
+
 -- The leap's scheduled end: both sensors must confirm a wall before the
 -- attach is forced. Gives up once the window closes.
 local function TryAttachToWall(pawn, cmc, wallHit) 
@@ -1560,6 +1705,17 @@ local function TickHugWall(dt, pawn, cmc, mode, isClimbing)
         dbg("I have stopped falling after climb jump..?")
         EndClimbJumpState(pawn, cmc)
         return
+    end
+
+    -- Catch the top-out before anything else: a leap that is about to clear
+    -- the lip should hand off to the vault rather than sail over it and fall.
+    -- Only while rising, so a sideways or downward leap pays nothing.
+    if TopOut.ENABLED and climbJumpState.dirUp > 0
+       and SenseTopEdge(pawn, climbJumpState.faceDir) then
+        if TryTopOut(pawn, cmc) then
+            EndClimbJumpState(pawn, cmc)
+            return
+        end
     end
 
     local isWithinLeapWindow = climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW
@@ -1942,6 +2098,7 @@ function M.OnPlayerCached(pawn, cmc)
     wantClimbSuppressed = false   -- fresh component, fresh flags
     climbSuppressionHeld = false
     approachGuardArmed  = false
+    guardLostFrames     = 0
     guardArmedTime      = 0
     guardCooldown       = 0
     guardGiveUps        = 0
@@ -2061,6 +2218,8 @@ end
 -- (approachGuardArmed is declared with the rest of the state, above.)
 local function ReleaseApproachGuard(pawn)
     approachGuardArmed = false
+    guardArmedTime     = 0
+    guardLostFrames    = 0
     SuppressGameClimb(pawn, false)
 end
 
@@ -2122,13 +2281,28 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
     end
 
     if wall == nil then
-        if approachGuardArmed then
-            YieldWallToGame(pawn, why or "probe lost the face", nil)
-        else
+        if not approachGuardArmed then
             ReleaseApproachGuard(pawn)
+            return nil
         end
+
+        -- Releasing the stick is not a failure to converge, it is the
+        -- absence of a request. Taking the give-up cooldown here was the
+        -- ground-entry regression: a momentary dip below the input floor
+        -- locked our own entry out for 0.8s, and 7 of 8 give-ups in a
+        -- session came through this path. Release, and stay ready to re-arm
+        -- the instant input returns.
+        if why == "no input held" then
+            ReleaseApproachGuard(pawn)
+            return nil
+        end
+
+        guardLostFrames = guardLostFrames + 1
+        if guardLostFrames < InitClimb.GUARD_LOST_TICKS then return nil end
+        YieldWallToGame(pawn, why or "probe lost the face", nil)
         return nil
     end
+    guardLostFrames = 0
 
     approachGuardArmed = true
     guardArmedTime     = guardArmedTime + dt
@@ -2267,6 +2441,7 @@ end
 
 function M.OnTick(dt, pawn, cmc)
     SampleTickOrder()
+    VisualiseClimbChecks(pawn, cmc)
 
     local movementMode    = cmc.MovementMode
     local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
