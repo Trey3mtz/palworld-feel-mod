@@ -6,6 +6,7 @@
 local CommonState = require("commonstate")
 local Easing = require("easingfunctions")
 local Input       = require("input")
+local TraceVis    = require("TraceVisualizer")
 
 -- =========================================================================
 -- 1. TUNING
@@ -64,6 +65,9 @@ local DEBUG_DRAW_TIME = 0.0   -- seconds; only meaningful for mode 2
 -- by looking at them. Set to true, walk at a face, and the numbers become a
 -- picture.
 local DEBUG_VOLUMES = false
+-- How long each drawn frame persists. 0 = one frame (cleanest while moving);
+-- a small value leaves a short trail, which is easier to read in a screenshot.
+local DEBUG_VOLUME_TIME = 0.0
 
 -- ---- slide ----
 local VZ_TRIGGER  = -600
@@ -954,35 +958,35 @@ end
 local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- arm range
 local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- commit range
 local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- grabbable
-local COLOR_HIT     = { R = 1.0,  G = 1.0,  B = 0.10, A = 1.0 }  -- what we found
-local COLOR_RAY     = { R = 0.55, G = 0.55, B = 0.60, A = 1.0 }  -- probe rays
+local COLOR_HIT     = { R = 1.0,  G = 1.0,  B = 0.10, A = 1.0 }  -- impact points
+local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- capsule sweep
 
-local function DrawLine(pawn, from, to, color, thickness)
-    pcall(function()
-        KSL:DrawDebugLine(pawn, from, to, color, DEBUG_DRAW_TIME, thickness or 1.5)
-    end)
-end
-
+-- Ground rings marking each distance the feature changes behaviour at. Not a
+-- trace, so it goes straight to KismetSystemLibrary rather than through the
+-- visualizer.
 local function DrawRing(pawn, centre, radius, color)
     pcall(function()
         KSL:DrawDebugCircle(pawn, centre, radius, 24, color,
-            DEBUG_DRAW_TIME, 1.5,
+            DEBUG_VOLUME_TIME, 1.5,
             { X = 1, Y = 0, Z = 0 }, { X = 0, Y = 1, Z = 0 }, false)
     end)
 end
 
-local function DrawMarker(pawn, centre, radius, color)
-    pcall(function()
-        KSL:DrawDebugSphere(pawn, centre, radius, 8, color, DEBUG_DRAW_TIME, 1.5)
-    end)
-end
-
--- Rings on the ground at each threshold, probe rays at each fan height, and a
--- marker on whatever the probe actually found. Drawn from the direction the
--- player is asking to go, because that -- not the facing -- is what every
--- check in this file traces along.
+-- Draws every check this file makes, in world space.
+--
+-- The probe rays go through TraceVisualizer on the COMPONENT'S OWN CHANNEL,
+-- not the library default. A ray drawn on channel 0 while the real checks run
+-- on Const_RayChannel would hit different geometry -- a confident picture of
+-- something nobody is testing, which is worse than no picture.
+--
+-- The capsule sweep is the one that answers the finicky-wall question
+-- directly: the line rays show where the FACE is, the capsule shows how close
+-- the player can actually GET to it. When the capsule stops outside the green
+-- commit ring, the commit distance is simply unreachable on that geometry, and
+-- no amount of probe tuning will fix it.
 local function VisualiseClimbChecks(pawn, cmc)
-    if not DEBUG_VOLUMES or not IsLive(KSL) then return end
+    if not DEBUG_VOLUMES then return end
+    if not IsLive(KSL) then return end
 
     local origin = GetLoc(pawn)
     if origin == nil then return end
@@ -990,16 +994,18 @@ local function VisualiseClimbChecks(pawn, cmc)
     local dir = GetInputDirection(cmc) or WallFwd(pawn)
     if dir == nil then return end
 
-    -- Distance rings, measured from the capsule surface exactly as the
-    -- thresholds are, so what is drawn is what is compared.
-    local footZ = origin.Z - capsuleHalfHeight + 2
-    local foot  = { X = origin.X, Y = origin.Y, Z = footZ }
+    local channel = ReadOpt(comp, "Const_RayChannel") or 0
+
+    -- Thresholds, measured from the capsule surface exactly as the checks
+    -- measure them, so what is drawn is what is compared.
+    local foot = { X = origin.X, Y = origin.Y,
+                   Z = origin.Z - capsuleHalfHeight + 2 }
     DrawRing(pawn, foot, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD)
     DrawRing(pawn, foot, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT)
     DrawRing(pawn, foot, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT)
     DrawRing(pawn, foot, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH)
 
-    -- The probe rays themselves, at the heights the fan actually uses.
+    -- Probe rays at the heights the fan actually uses.
     local reach = capsuleRadius + InitClimb.GUARD_GAP
     local heights = { 0 }
     if probeFanOffset > 0 then
@@ -1011,16 +1017,21 @@ local function VisualiseClimbChecks(pawn, cmc)
         local to   = { X = origin.X + dir.X * reach,
                        Y = origin.Y + dir.Y * reach,
                        Z = origin.Z + h }
-        DrawLine(pawn, from, to, COLOR_RAY, 1.0)
-
-        local hit = TraceAlongDirection(pawn, dir, reach, h)
-        if hit ~= nil then
-            local d = capsuleRadius + hit.gap
-            DrawMarker(pawn, { X = origin.X + dir.X * d,
-                               Y = origin.Y + dir.Y * d,
-                               Z = origin.Z + h }, 6, COLOR_HIT)
-        end
+        pcall(function()
+            TraceVis:DrawLineTrace(pawn, from, to, DEBUG_VOLUME_TIME,
+                channel, COLOR_GUARD, COLOR_HIT)
+        end)
     end
+
+    -- Where the capsule can actually reach.
+    local sweepTo = { X = origin.X + dir.X * InitClimb.GUARD_GAP,
+                      Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
+                      Z = origin.Z }
+    pcall(function()
+        TraceVis:DrawCapsuleTrace(pawn, origin, sweepTo,
+            capsuleRadius, capsuleHalfHeight, DEBUG_VOLUME_TIME,
+            channel, COLOR_CAPSULE, COLOR_HIT)
+    end)
 end
 
 -- =========================================================================
