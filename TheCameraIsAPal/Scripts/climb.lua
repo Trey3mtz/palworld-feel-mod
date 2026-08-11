@@ -232,7 +232,24 @@ TopOut.ENABLED    = true
 TopOut.LOW_OFFSET  = -10   -- uu from capsule centre: must still find wall
 TopOut.HIGH_OFFSET = 46    -- uu above centre: must find nothing
 TopOut.MAX_GAP     = 60    -- uu; lip must be within grabbing distance
-TopOut.CALL_EVENT  = true  -- also fire the component's own vault event
+
+-- DO NOT ENABLE. Calling ClimbUpAtTopEvent directly teleported the player
+-- across the map and into the ocean.
+--
+-- It is the component's vault, and the component fires it from its own state
+-- machine only AFTER CheckUpToTop and UpToTopUpdate have worked out where the
+-- top actually is. Called cold it runs against whatever destination happens
+-- to be stored -- uninitialised, or left over from a different climb
+-- somewhere else entirely -- and moves the player there.
+--
+-- The original guard here was a pcall, which only catches the call ERRORING.
+-- A function that relocates the player succeeding with garbage state is the
+-- risk that mattered, and pcall does nothing about it.
+--
+-- The latch alone is what stops the leap sailing past the lip; once latched
+-- at the top the component runs its own vault, with its own state, correctly.
+-- Nothing here needs to invoke it by hand.
+TopOut.CALL_EVENT  = false
 
 -- ---- climb jump: attach verification ----
 local ATTACH_MAX_TRIES = 3  -- attempts within the window; then free fall
@@ -357,6 +374,18 @@ local tickOrderBefore     = 0
 local tickOrderAfter      = 0
 local tickOrderSamples    = 0
 local compTicks           = 0   -- engine ticks a component once per frame
+-- ---- teleport watchdog ----
+-- This file writes movement modes, velocities and component flags, and any of
+-- those can hand the pawn to game code that relocates it. A displacement this
+-- large in a single frame is not movement, it is a teleport, and it should be
+-- attributable to a frame and a state rather than to noticing you are in the
+-- sea. Sprinting is ~10uu/frame and terminal velocity ~50uu/frame, so this
+-- sits far above anything legitimate.
+local TELEPORT_JUMP_UU  = 1500
+local teleportLastLoc   = nil
+local teleportReports   = 0
+local TELEPORT_LOG_MAX  = 6
+
 local grabWasClimbingPre  = false
 local grabInsideTick      = 0
 
@@ -1503,6 +1532,8 @@ local function TryTopOut(pawn, cmc)
     local latched = (movementMode == 6 and customMovementMode == 5)
     if not latched then return false end
 
+    -- See TopOut.CALL_EVENT: this is off, and is kept only so the reason is
+    -- attached to the code rather than living in a commit message.
     local firedEvent = false
     if TopOut.CALL_EVENT and IsLive(comp) then
         firedEvent = pcall(function() comp:ClimbUpAtTopEvent() end)
@@ -2118,6 +2149,8 @@ function M.OnPlayerCached(pawn, cmc)
     compTicks           = 0
     grabWasClimbingPre  = false
     grabInsideTick      = 0
+    teleportLastLoc     = nil
+    teleportReports     = 0
     canStartFires, canStartVetoes, canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
@@ -2450,8 +2483,36 @@ local function SampleTickOrder()
     end
 end
 
+-- Reports any single-frame displacement large enough to be a teleport,
+-- naming the state this file was in when it happened.
+local function WatchForTeleport(pawn, cmc)
+    local here = GetLoc(pawn)
+    if here == nil then teleportLastLoc = nil return end
+
+    local last = teleportLastLoc
+    teleportLastLoc = here
+    if last == nil then return end
+
+    local dx, dy, dz = here.X - last.X, here.Y - last.Y, here.Z - last.Z
+    local moved = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if moved < TELEPORT_JUMP_UU then return end
+    if teleportReports >= TELEPORT_LOG_MAX then return end
+    teleportReports = teleportReports + 1
+
+    ddbg("TELEPORT: moved %.0fuu in one frame (%.0f,%.0f,%.0f) -> "
+        .. "(%.0f,%.0f,%.0f) | initClimb=%s phase=%s climbJump=%s "
+        .. "suppressed=%s mode=%d/%d",
+        moved, last.X, last.Y, last.Z, here.X, here.Y, here.Z,
+        tostring(M.InInitClimbState),
+        initClimbState and tostring(initClimbState.phase) or "-",
+        climbJumpState and tostring(climbJumpState.mode) or "-",
+        tostring(wantClimbSuppressed),
+        cmc.MovementMode, ReadOpt(cmc, "CustomMovementMode") or 0)
+end
+
 function M.OnTick(dt, pawn, cmc)
     SampleTickOrder()
+    WatchForTeleport(pawn, cmc)
     VisualiseClimbChecks(pawn, cmc)
 
     local movementMode    = cmc.MovementMode
