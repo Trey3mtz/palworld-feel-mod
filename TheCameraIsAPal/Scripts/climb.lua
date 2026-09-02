@@ -442,6 +442,22 @@ Diag.teleportReports   = 0
 Diag.TELEPORT_LOG_MAX  = 6
 Diag.SEQ_LOG_MAX       = 16
 Diag.capsuleTraceOk    = nil    -- nil = untested, true/false after self-test
+Diag.grappleCallable   = nil    -- TryClimbAfterGrappling takes no args (from the signature dump)
+Diag.latchLogged       = 0
+
+-- ---- latch watch ----
+-- Forcing MovementMode 6/5 and flipping IsClimbing puts the pawn in climb
+-- mode, but the component's own entry routine never ran, and its update can
+-- exit a state it did not set up -- in-game that is a hop, a fraction of a
+-- second on the wall, and a drop back to the base, repeating. So a forced
+-- latch is WATCHED: for HOLD seconds after it, a drop back to falling while
+-- the face is still in reach is answered by (once) the component's own
+-- external entry point, then by re-forcing, a bounded number of times.
+-- Every drop is logged with what the component's GroundCheck last said.
+local Latch = {}
+Latch.HOLD        = 0.40   -- s after a forced latch to guard it
+Latch.MAX_REFORCE = 6
+Latch.watch       = nil
 Diag.seqStarts, Diag.seqEnds = 0, 0
 
 -- bOrientRotationToMovement as it was at spawn, and whether this file has
@@ -1037,6 +1053,17 @@ local function UsingCapsuleCheck()
     return WallDetect.SHAPE == "capsule" and Diag.capsuleTraceOk ~= false
 end
 
+-- The component's purpose-built external entry: "try to start climbing
+-- now". Designed for the moment after a grapple lands the player against a
+-- face, which is the same situation as the end of our hop. Only called when
+-- the signature dump has shown it takes no arguments -- a function on this
+-- component was once called with unset state and moved the player into the
+-- ocean, so nothing here is invoked on a guess.
+local function TryComponentClimbEntry()
+    if Diag.grappleCallable ~= true or not IsLive(comp) then return false end
+    return pcall(function() comp:TryClimbAfterGrappling() end)
+end
+
 -- The two tests that separate a wall from something merely in the way. Both
 -- probe along the APPROACH direction, not the wall normal, so what they ask
 -- is "would the player, going this way, meet a face here" -- the question
@@ -1363,12 +1390,91 @@ local function TryInitClimbAttach(pawn, cmc, wall, attachGap)
     local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
     local latched = (movementMode == 6 and customMovementMode == 5)
 
-    dbg("attach try %d: gap=%.1f/%.1f (reach %.1f) rise=%.0f air=%.2fs -> %s",
-        initClimbState.tries, attachGap, wall.gap, ATTACH_MAX_GAP,
-        (GetZ(pawn) or 0) - initClimbState.launchZ,
-        initClimbState.airTime, latched and "LATCHED" or "refused")
+    local rise = (GetZ(pawn) or 0) - initClimbState.launchZ
+    if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+        Diag.latchLogged = Diag.latchLogged + 1
+        ddbg("attach try %d: gap=%.1f (reach %.1f) rise=%.0f air=%.2fs "
+            .. "groundCheck=%s -> %s",
+            initClimbState.tries, attachGap, ATTACH_MAX_GAP, rise,
+            initClimbState.airTime, tostring(lastGroundCheck),
+            latched and "LATCHED" or "refused")
+    end
 
+    if latched then
+        Latch.watch = { left = Latch.HOLD, faceDir = initClimbState.faceDir,
+                        launchZ = initClimbState.launchZ, reforces = 0,
+                        rescued = false, drops = 0 }
+    end
     return latched
+end
+
+-- Runs every tick while a forced latch is under watch. A drop while the
+-- face is still in reach is the component rejecting a state it did not set
+-- up; a drop with the face gone, or onto the ground, is legitimate.
+local function TickLatchWatch(dt, pawn, cmc, isClimbing)
+    local w = Latch.watch
+    if w == nil then return end
+
+    w.left = w.left - dt
+    if w.left <= 0 then
+        if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+            ddbg("latch watch over: %s after %d drop(s), %d re-force(s), rescue=%s",
+                isClimbing and "HELD" or "not climbing", w.drops, w.reforces,
+                tostring(w.rescued))
+        end
+        Latch.watch = nil
+        return
+    end
+    if isClimbing then return end
+
+    -- Dropped. Was it for a reason this file should respect?
+    if cmc.MovementMode ~= 3 then
+        Latch.watch = nil                       -- landed, or some other mode: theirs
+        return
+    end
+    local face
+    if UsingCapsuleCheck() then
+        face = CapsuleSweepAhead(pawn, w.faceDir, ATTACH_MAX_GAP)
+    else
+        face = TraceAlongDirection(pawn, w.faceDir, capsuleRadius + ATTACH_MAX_GAP, 0)
+    end
+    if face == nil or face.gap > ATTACH_MAX_GAP then
+        Latch.watch = nil                       -- face genuinely gone
+        return
+    end
+
+    w.drops = w.drops + 1
+    local rise = (GetZ(pawn) or 0) - w.launchZ
+
+    -- First the component's own entry, once. If it takes, its state is set
+    -- up the way its update expects and the drops should stop.
+    if not w.rescued then
+        w.rescued = true
+        if TryComponentClimbEntry() then
+            local m, c = cmc.MovementMode, ReadOpt(cmc, "CustomMovementMode") or 0
+            if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+                ddbg("latch DROPPED (#%d, rise=%.0f gap=%.1f groundCheck=%s): "
+                    .. "component entry -> %s", w.drops, rise, face.gap,
+                    tostring(lastGroundCheck),
+                    (m == 6 and c == 5) and "CLIMBING" or "no effect")
+            end
+            if m == 6 and c == 5 then return end
+        end
+    end
+
+    if w.reforces >= Latch.MAX_REFORCE then
+        if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+            ddbg("latch DROPPED #%d: re-force budget spent, letting it go", w.drops)
+        end
+        Latch.watch = nil
+        return
+    end
+    w.reforces = w.reforces + 1
+    ForceClimbAttach(cmc)
+    if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+        ddbg("latch DROPPED (#%d, rise=%.0f gap=%.1f groundCheck=%s): re-forced #%d",
+            w.drops, rise, face.gap, tostring(lastGroundCheck), w.reforces)
+    end
 end
 
 local function BeginInitClimb(pawn, cmc, wall, entryType)
@@ -2230,7 +2336,9 @@ local function RegisterComponentHooks()
             end
             if ret ~= lastGroundCheck then
                 lastGroundCheck = ret
-                dbg("GroundCheck -> %s", tostring(ret))
+                if Diag.latchLogged < Diag.SEQ_LOG_MAX then
+                    ddbg("GroundCheck -> %s", tostring(ret))
+                end
             end
             if ret == true and CommonState.ClimbHasPriority then
                 CommonState.ClimbHasPriority = false
@@ -2402,6 +2510,45 @@ local function RegisterComponentHooks()
         end)
     end
 
+    -- Signatures of the component's own entry/exit functions, read from the
+    -- UFunction objects without calling anything. Decides whether
+    -- TryClimbAfterGrappling is provably no-arg, which is the only condition
+    -- under which the latch watch is allowed to invoke it.
+    pcall(function()
+        for _, fname in ipairs({ "TryClimbAfterGrappling", "StartClimbing",
+                                 "StartClimb", "StartClimbByNetwork",
+                                 "RequestEndClimbing" }) do
+            local fn = nil
+            for _, base in ipairs({ clsPath, "/Script/Pal.PalClimbingComponent" }) do
+                if not IsLive(fn) then
+                    pcall(function() fn = StaticFindObject(base .. ":" .. fname) end)
+                end
+            end
+            if not IsLive(fn) then
+                ddbg("sig %s: not found", fname)
+            else
+                local params = {}
+                pcall(function()
+                    fn:ForEachProperty(function(prop)
+                        local n, t = "?", "?"
+                        pcall(function() n = prop:GetFName():ToString() end)
+                        pcall(function() t = prop:GetClass():GetFName():ToString() end)
+                        params[#params + 1] = n .. ":" .. t
+                    end)
+                end)
+                ddbg("sig %s(%s)", fname, table.concat(params, ", "))
+                if fname == "TryClimbAfterGrappling" then
+                    local noArgs = (#params == 0)
+                        or (#params == 1 and params[1]:sub(1, 11) == "ReturnValue")
+                    Diag.grappleCallable = noArgs
+                    ddbg("TryClimbAfterGrappling: %s",
+                        noArgs and "no-arg, latch watch may use it"
+                               or "has parameters, latch watch will NOT call it")
+                end
+            end
+        end
+    end)
+
     hooksRegistered = true
 end
 
@@ -2445,6 +2592,8 @@ function M.OnPlayerCached(pawn, cmc)
     defaultOrientToMovement  = ReadOpt(cmc, "bOrientRotationToMovement")
     Diag.seqStarts, Diag.seqEnds = 0, 0
     Diag.capsuleTraceOk = nil
+    Diag.latchLogged    = 0
+    Latch.watch         = nil
     Diag.canStartFires, Diag.canStartVetoes, Diag.canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
@@ -2812,6 +2961,8 @@ function M.OnTick(dt, pawn, cmc)
     end
     WatchForTeleport(pawn, cmc)
     VisualiseClimbChecks(pawn, cmc)
+    TickLatchWatch(dt, pawn, cmc,
+        cmc.MovementMode == 6 and (ReadOpt(cmc, "CustomMovementMode") or 0) == 5)
 
     local movementMode    = cmc.MovementMode
     local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0

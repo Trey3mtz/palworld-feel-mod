@@ -296,6 +296,47 @@ do
 end
 
 -- =========================================================================
+print("\n[7c] A forced latch the component drops is re-forced while the face is there")
+-- The in-game failure: hop, a fraction of a second on the wall, drop, hop.
+-- Modelled as a component that kicks the pawn back to falling on the frame
+-- after each forced attach, twice, then accepts. The watch must re-force it
+-- each time and the player must end up climbing, not on the ground.
+-- =========================================================================
+do
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local dt, dir = 1 / 60, { X = 1, Y = 0, Z = 0 }
+    local dropsLeft, wasClimbing, reattaches, latched = 2, false, 0, false
+    for _ = 1, 240 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        local climbing = (w.cmc.MovementMode == 6 and w.cmc.CustomMovementMode == 5)
+        if climbing and not wasClimbing then
+            reattaches = reattaches + 1
+            if dropsLeft > 0 then
+                -- The component rejects the state it did not set up.
+                dropsLeft = dropsLeft - 1
+                w.cmc.MovementMode, w.cmc.CustomMovementMode = 3, 0
+                w.climbComp.IsClimbing = false
+                climbing = false
+            end
+        end
+        wasClimbing = climbing
+        if climbing then latched = true break end
+        H.Step(w, dt, dir)
+    end
+    Check("component drops twice: watch re-forces and the latch holds", latched,
+          string.format("never held (attaches seen: %d)", reattaches))
+    Check("re-forced at least twice", reattaches >= 3,
+          string.format("attaches seen: %d", reattaches))
+    Check("no guessed call to the component entry (signature unknown here)",
+          w.climbComp.grappleCalls == 0,
+          string.format("called %d times without a verified signature", w.climbComp.grappleCalls))
+end
+
+-- =========================================================================
 print("\n[8] Yaw is ours while we own the wall, and the player's again after")
 -- OrientRotationToMovement left on spins the character toward the stick every
 -- frame -- the "rotates away right before the latch" report. Restoring it

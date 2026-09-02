@@ -89,6 +89,8 @@ function M.MakeWorld(wall, opts)
         UpAtTopMode = false,
         vaultEvents = 0,
         ClimbUpAtTopEvent = function(self) self.vaultEvents = self.vaultEvents + 1 end,
+        grappleCalls = 0,
+        TryClimbAfterGrappling = function(self) self.grappleCalls = self.grappleCalls + 1 end,
         Const_RayChannel = 0,
         Const_ForwardRayLength = opts.forwardRay or 80,
         IsValid = function() return true end,
@@ -225,7 +227,12 @@ local KSL = {
         return true
     end,
 }
-function StaticFindObject() return KSL end
+-- Only the Kismet default object exists here; function-object lookups (the
+-- signature dump) come back nil, as they would for a name that is not there.
+function StaticFindObject(path)
+    if path == "/Script/Engine.Default__KismetSystemLibrary" then return KSL end
+    return nil
+end
 
 package.preload["UEHelpers"] = function()
     return {
