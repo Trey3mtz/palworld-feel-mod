@@ -122,7 +122,11 @@ local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
 -- CanClimbing while closing, buying the frames needed to run our own hop.
 -- Deliberately generous: over-reaching only starts the guard early, while
 -- under-reaching loses the race outright.
-InitClimb.GUARD_GAP = 130   -- uu from capsule surface: start suppressing
+-- 130 -> 87, a third off, tuned by eye from the drawn sweeps. This is the
+-- reach the indicators show, so the indicators shortened with it rather than
+-- being drawn shorter than the truth. It is also the outer edge of jump
+-- hijacking: a jump near a face inside this distance is taken over.
+InitClimb.GUARD_GAP = 87    -- uu from capsule surface: start suppressing
 -- Committing further out than the hop needs, because the approach hold
 -- below spends time closing the rest. InitClimb.IN_MAX caps the closing
 -- speed, so this is roughly what the hold can actually cover.
@@ -1085,6 +1089,7 @@ local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- gate: commit
 local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- gate: grabbable
 local COLOR_PROBE   = { R = 1.0,  G = 0.0,  B = 0.0,  A = 1.0 }  -- every sweep, hit or miss
 local COLOR_HIT     = { R = 0.0,  G = 1.0,  B = 0.0,  A = 1.0 }  -- contact spheres, climb point
+local COLOR_RANGE   = { R = 0.35, G = 0.85, B = 1.0,  A = 0.8 }  -- detection-range ghost
 
 -- Radius the sweeps are DRAWN with. When detection runs on line traces
 -- (PROBE_RADIUS = 0) this is purely cosmetic and the drawn sweep reaches
@@ -1180,6 +1185,21 @@ local function VisualiseClimbChecks(pawn, cmc)
                 3.0, DEBUG_VOLUME_TIME, cat)
         end)
     end
+
+    -- A ghost of the player's own capsule, stood at the edge of detection.
+    -- Its front face is exactly where the sweeps end (capsuleRadius +
+    -- GUARD_GAP from the player's centre), so "a wall touching the ghost is
+    -- at the limit of what the guard can see" reads directly, in the same
+    -- shape the player already occupies.
+    pcall(function()
+        Viz.DrawCapsule(
+            { X = origin.X + dir.X * InitClimb.GUARD_GAP,
+              Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
+              Z = origin.Z },
+            capsuleHalfHeight, capsuleRadius,
+            { Pitch = 0, Yaw = 0, Roll = 0 },
+            16, COLOR_RANGE, 1.0, DEBUG_VOLUME_TIME, cat)
+    end)
 
     if DEBUG_VOLUME_GATES then
         DrawGate(origin, dir, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD,  cat)

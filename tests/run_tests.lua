@@ -57,15 +57,21 @@ print("\n[1] The mod must win the wall from the vanilla grab")
 -- The component grabs from its own ray, between our ticks. If it wins, our
 -- sequence never runs and the mini hop is never seen.
 -- =========================================================================
-for _, case in ipairs({ { "airborne, rising", "air", 300 },
-                        { "airborne, slow rise", "air", 60 },
-                        { "walk-in", "ground", nil } }) do
+-- The slow-rise case starts closer. Arming needs "rising AND in range" by
+-- design (a plain fall must reach the vanilla grab), and at 60uu/s the rise
+-- lasts two frames -- so the wall has to already be inside GUARD_GAP when
+-- the jump peaks, or there is nothing for this file to do. Starting it
+-- outside the guard range would test the hand-off to vanilla, not the arm.
+for _, case in ipairs({ { "airborne, rising", "air", 300, 60 },
+                        { "airborne, slow rise", "air", 60, 110 },
+                        { "walk-in", "ground", nil, 60 } }) do
     local ran, total = 0, 0
     for _, s in ipairs(SHAPES) do
         for _, ang in ipairs(ANGLES) do
             for _, reach in ipairs(REACHES) do
                 local r = Run({ wall = Wall(s[3], s[2]), angle = ang,
                                 entry = case[2], entryVz = case[3],
+                                startX = case[4],
                                 reach = reach, organicGrab = true,
                                 approachSpeed = 550 })
                 total = total + 1
