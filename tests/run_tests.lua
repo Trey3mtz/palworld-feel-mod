@@ -428,5 +428,86 @@ do
 end
 
 -- =========================================================================
+print("\n[10] The guard hands off to the sequence and stays off afterwards")
+-- The arm flag was never cleared at the hand-off, so after every sequence the
+-- guard was still "armed" with no wall behind it. Two consequences, both seen
+-- as noise or lockout in session logs: a failed hop chained straight into an
+-- airborne one while falling (a plain fall is meant to be vanilla's), and a
+-- climb exit ate a bogus "probe lost the face" give-up plus its 0.8s lockout.
+-- =========================================================================
+do
+    -- A: the sequence fails mid-air because something holds the capsule off
+    -- the face once airborne. The player then falls at the wall with the
+    -- stick held. Falling is not an approach: no airborne re-entry.
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local dt, dir = 1 / 60, { X = 1, Y = 0, Z = 0 }
+    local wasInInit, airborneStarts, groundStarts = false, 0, 0
+    for _ = 1, 240 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        local inInit = Climb.InInitClimbState == true
+        if inInit and not wasInInit then
+            if w.cmc.MovementMode == 3 then
+                airborneStarts = airborneStarts + 1
+            else
+                groundStarts = groundStarts + 1
+            end
+        end
+        wasInInit = inInit
+        if w.cmc.MovementMode == 3 then w.standoff = 70 end
+        H.Step(w, dt, dir)
+    end
+    Check("failed hop: the walk-in sequence ran", groundStarts >= 1, "never started")
+    Check("failed hop: no airborne re-entry while falling", airborneStarts == 0,
+          string.format("%d sequence(s) started mid-fall", airborneStarts))
+
+    -- B: a climb exit. Latch through our own sequence, climb a moment, then
+    -- the game ends the climb with the player dropping away from the face,
+    -- stick still held toward it. Nothing is in reach, so an armed guard
+    -- would "lose the face" and give up -- against a wall it never had.
+    Climb = H.LoadClimb(CLIMB)
+    w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local latched = false
+    for _ = 1, 240 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        if w.cmc.MovementMode == 6 and w.cmc.CustomMovementMode == 5 then
+            latched = true break
+        end
+        H.Step(w, dt, dir)
+    end
+    for _ = 1, 10 do pcall(Climb.OnTick, dt, w.pawn, w.cmc); H.Step(w, dt, dir) end
+
+    w.pawn.pos.X, w.pawn.pos.Z = -34, 100          -- 166uu off the face, in the air
+    w.cmc.MovementMode, w.cmc.CustomMovementMode = 3, 0
+    w.cmc.Velocity.X, w.cmc.Velocity.Y, w.cmc.Velocity.Z = 0, 0, 0
+    w.climbComp.IsClimbing = false
+
+    local realPrint, giveUps = print, {}
+    print = function(s)
+        if type(s) == "string" and s:find("guard gave up", 1, true) then giveUps[#giveUps + 1] = s end
+    end
+    local exitT, seqAt = w.t, nil
+    for _ = 1, 120 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        if Climb.InInitClimbState and seqAt == nil then seqAt = w.t - exitT end
+        H.Step(w, dt, dir)
+    end
+    print = realPrint
+
+    Check("climb exit: latched through our sequence first", latched, "never latched")
+    Check("climb exit: no give-up against a wall the guard never had",
+          #giveUps == 0, (giveUps[1] or ""):sub(1, 80))
+    Check("climb exit: the next walk-in starts without the give-up lockout",
+          seqAt ~= nil and seqAt < 0.75,
+          string.format("next sequence at %s", seqAt and string.format("%.2fs", seqAt) or "never"))
+end
+
+-- =========================================================================
 print(string.format("\n%d/%d checks passed", checks - failures, checks))
 os.exit(failures == 0 and 0 or 1)

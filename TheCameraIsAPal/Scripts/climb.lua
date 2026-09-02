@@ -1371,11 +1371,24 @@ local function EndInitClimb(pawn, cmc, reason)
     EnableForInitClimb(pawn, cmc)
     dbg("init climb end: %s", reason or "?")
 
+    -- A sequence that spent its jump without a latch hands the wall to the
+    -- vanilla grab for the same cooldown a guard give-up takes. Without it a
+    -- player still pushing at the face re-armed on the next frame and
+    -- jumped again, and again -- the bobbing at the base of a wall -- and
+    -- the component never got a turn at a face this file could not take.
+    local climbing = (reason == "latched")
+        or (reason == "climb reached outside the sequence")
+    if not climbing then
+        guardCooldown = InitClimb.GUARD_COOLDOWN
+    end
+
     Diag.seqEnds = Diag.seqEnds + 1
     if Diag.seqEnds <= Diag.SEQ_LOG_MAX then
         ddbg("SEQUENCE #%d end: %s (%s entry, %.2fs aloft)%s",
             Diag.seqEnds, reason or "?", kind, air,
-            (reason == "latched") and "" or "   <-- a jump spent without a latch")
+            climbing and "" or string.format(
+                "   <-- a jump spent without a latch; wall handed to vanilla for %.2fs",
+                InitClimb.GUARD_COOLDOWN))
     end
 end
 
@@ -2703,10 +2716,22 @@ end
 -- approach, releasing only when the face is gone or the fall has become
 -- fast enough that the wall slide is the move that should catch it.
 -- (approachGuardArmed is declared with the rest of the state, above.)
-local function ReleaseApproachGuard(pawn)
+--
+-- Arming bookkeeping only; says nothing about suppression. Split out because
+-- the hand-off to a sequence must clear the arm WITHOUT touching the
+-- suppression the sequence is about to take over. Left armed across a
+-- sequence, the guard came out the far side still "armed" against a wall it
+-- no longer had: a failed hop re-entered from mid-air on the very next
+-- frame, and every climb exit spent six frames losing a face that was never
+-- there, then took the give-up cooldown for it.
+local function DisarmApproachGuard()
     approachGuardArmed = false
     guardArmedTime     = 0
     guardLostFrames    = 0
+end
+
+local function ReleaseApproachGuard(pawn)
+    DisarmApproachGuard()
     SuppressGameClimb(pawn, false)
 end
 
@@ -2721,9 +2746,8 @@ local function YieldWallToGame(pawn, reason, gap)
             reason, gap and string.format("%.1f", gap) or "none",
             InitClimb.GUARD_COOLDOWN)
     end
-    approachGuardArmed = false
-    guardArmedTime     = 0
-    guardCooldown      = InitClimb.GUARD_COOLDOWN
+    DisarmApproachGuard()
+    guardCooldown = InitClimb.GUARD_COOLDOWN
     SuppressGameClimb(pawn, false)
 end
 
@@ -2868,6 +2892,11 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
 
     local wallAhead = TickApproachGuard(dt, pawn, cmc, isWalking)
     if wallAhead == nil then return end
+
+    -- The guard's job ends here. The sequence takes the suppression over in
+    -- BeginInitClimb and releases it in EndInitClimb; the arm must not
+    -- outlive the hand-off or it is still set when the sequence is long gone.
+    DisarmApproachGuard()
 
     -- The guard hands off to whichever launch fits where the pawn is: on the
     -- ground the game's own jump carries the animation, in the air the hop
