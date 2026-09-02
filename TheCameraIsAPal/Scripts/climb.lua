@@ -1157,7 +1157,11 @@ local function VisualiseClimbChecks(pawn, cmc)
     local channel = ReadOpt(comp, "Const_RayChannel") or 0
     local radius  = math.max(WallDetect.PROBE_RADIUS, VIZ_MIN_PROBE_RADIUS)
     local reach   = capsuleRadius + InitClimb.GUARD_GAP
-    local far     = reach + WallDetect.SLACK
+    -- Every sweep is drawn to the same reach. Detection gives the eye and
+    -- width probes +WallDetect.SLACK on top of it, but that is a tolerance
+    -- for a rough face once the waist probe has ALREADY hit, not extra
+    -- range -- and drawn, it read as the probes reaching further than the
+    -- guard does. So the picture ends where the guard's reach ends.
 
     local function Sweep(h, lateral, len)
         local sx = origin.X - dir.Y * lateral
@@ -1172,9 +1176,9 @@ local function VisualiseClimbChecks(pawn, cmc)
     local w     = WallDetect.WIDTH_HALF
     local waist = Sweep(0, 0, reach)
     local low   = (probeFanOffset > 0) and Sweep(-probeFanOffset, 0, reach) or nil
-    local eye   = Sweep(eyeZ, 0, far)
-    local left  = Sweep(0,  w, far)
-    local right = Sweep(0, -w, far)
+    local eye   = Sweep(eyeZ, 0, reach)
+    local left  = Sweep(0,  w, reach)
+    local right = Sweep(0, -w, reach)
 
     -- The reference's big green marker: only when this would actually be
     -- accepted as a wall, at the point the waist probe touched.
@@ -1186,17 +1190,18 @@ local function VisualiseClimbChecks(pawn, cmc)
         end)
     end
 
-    -- A ghost of the player's own capsule, stood at the edge of detection.
-    -- Its front face is exactly where the sweeps end (capsuleRadius +
-    -- GUARD_GAP from the player's centre), so "a wall touching the ghost is
-    -- at the limit of what the guard can see" reads directly, in the same
-    -- shape the player already occupies.
+    -- The detection range, as a capsule over the player: from the player's
+    -- centre forward to the edge of the guard's reach, at the player's own
+    -- height. Its front face is exactly where every sweep ends, so the
+    -- endpoint spheres sit on it, and "a wall touching this is at the limit
+    -- of what the guard can see" reads at a glance.
+    local half = reach * 0.5
     pcall(function()
         Viz.DrawCapsule(
-            { X = origin.X + dir.X * InitClimb.GUARD_GAP,
-              Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
+            { X = origin.X + dir.X * half,
+              Y = origin.Y + dir.Y * half,
               Z = origin.Z },
-            capsuleHalfHeight, capsuleRadius,
+            capsuleHalfHeight, half,
             { Pitch = 0, Yaw = 0, Roll = 0 },
             16, COLOR_RANGE, 1.0, DEBUG_VOLUME_TIME, cat)
     end)
