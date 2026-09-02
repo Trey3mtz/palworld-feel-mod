@@ -173,7 +173,40 @@ local KSL = {
                                     startV.Z + dir.Z * t)
         return true
     end,
-    CapsuleTraceSingle = function() return false, nil end,
+    -- Upright capsule sweep. Against the wall: the volume only meets the
+    -- face if the face exists somewhere in the capsule's vertical span, and
+    -- the sweep stops one radius before the line would. Straight down: the
+    -- floor at z=0 is found when the capsule's bottom reaches it.
+    CapsuleTraceSingle = function(self, actor, startV, endV, radius, halfH,
+                                  channel, complex, ignore, drawType, hitResult)
+        local w = activeWorld
+        local d = Vec(endV.X - startV.X, endV.Y - startV.Y, endV.Z - startV.Z)
+        local len = math.sqrt(dot3(d, d))
+        if len < 1e-6 then return false end
+        local dir = { X = d.X / len, Y = d.Y / len, Z = d.Z / len }
+
+        if dir.Z < -0.9 then
+            local travel = (startV.Z - halfH) - 0
+            if travel < 0 or travel > len then return false end
+            hitResult.Distance = travel
+            hitResult.ImpactNormal = Vec(0, 0, 1)
+            hitResult.ImpactPoint = Vec(startV.X, startV.Y, 0)
+            return true
+        end
+
+        -- Does the face occupy any of the capsule's span?
+        local zLo, zHi = startV.Z - halfH, startV.Z + halfH
+        local wall = w.wall
+        if wall.topZ ~= nil and zLo > wall.topZ then return false end
+        local probeZ = math.min(zHi, wall.topZ or zHi)
+        local o = Vec(startV.X, startV.Y, probeZ)
+        local t = RayHit(wall, o, dir, len + radius)
+        if t == nil or t - radius > len then return false end
+        hitResult.Distance = math.max(0, t - radius)
+        hitResult.ImpactNormal = Vec(wall.n.X, wall.n.Y, wall.n.Z)
+        hitResult.ImpactPoint = Vec(startV.X + dir.X * t, startV.Y + dir.Y * t, probeZ)
+        return true
+    end,
     -- A sphere sweep against a plane contacts one radius before the line
     -- would, so Distance is the line distance minus the radius.
     SphereTraceSingle = function(self, actor, startV, endV, radius, channel,

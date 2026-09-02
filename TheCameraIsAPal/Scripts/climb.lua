@@ -196,6 +196,24 @@ WallDetect.SLACK           = 30
 -- wall. Verify with DEBUG_VOLUMES before leaving it on.
 WallDetect.PROBE_RADIUS    = 0
 
+-- The primary "wall in front" check is a capsule sweep, as in the reference
+-- climbing pattern: the player's own radius, swept forward along the input
+-- direction, spanning from just above step height up to eye level. A drawn
+-- capsule that is not a trace is decoration; this one IS the check, and the
+-- visualiser draws the sweep that actually ran.
+--
+-- The bottom starts above MaxStepHeight so a rock or a rise the player would
+-- simply walk over is not inside the volume at all -- the failure the first
+-- capsule sweep had. Anything taller than a step but shorter than a wall is
+-- then rejected by the eye-level filter.
+--
+-- "capsule" needs CapsuleTraceSingle to fill the hit struct on this UE4SS
+-- build, which only line traces are proven to do. So it is self-tested on
+-- the first grounded frame (a sweep down into the floor must report a
+-- readable distance) and falls back to "line" if that fails, loudly.
+WallDetect.SHAPE               = "capsule"   -- "capsule" | "line"
+WallDetect.CAPSULE_FOOT_CLEARANCE = 48       -- uu above the feet; > MaxStepHeight (45)
+
 -- ---- init climb: launch ----
 InitClimb.LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
 -- Overwrites whatever the game's jump produced so the arc is identical every
@@ -423,6 +441,7 @@ Diag.teleportLastLoc   = nil
 Diag.teleportReports   = 0
 Diag.TELEPORT_LOG_MAX  = 6
 Diag.SEQ_LOG_MAX       = 16
+Diag.capsuleTraceOk    = nil    -- nil = untested, true/false after self-test
 Diag.seqStarts, Diag.seqEnds = 0, 0
 
 -- bOrientRotationToMovement as it was at spawn, and whether this file has
@@ -927,6 +946,97 @@ end
 -- Single ray by design: this runs every frame the player is walking, and a
 -- wall you can walk into is present at capsule centre height. The fan is for
 -- the airborne re-probe, where the ray can end up over a lip or in a recess.
+-- Vertical extent of the capsule check, relative to the actor origin.
+-- Bottom just above step height, top at eye level. Half height can never
+-- drop below the radius (a capsule shorter than it is wide is a sphere).
+local function CapsuleCheckExtent()
+    local bottom = -capsuleHalfHeight + WallDetect.CAPSULE_FOOT_CLEARANCE
+    local top    =  capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
+    local centre = (bottom + top) * 0.5
+    local half   = math.max((top - bottom) * 0.5, capsuleRadius)
+    return centre, half
+end
+
+-- The capsule check itself. Sweeps the player-radius capsule forward by
+-- `maxGap` on the component's channel. Because the swept radius IS the
+-- player's radius, the sweep distance is the clearance from the player's
+-- surface -- gap = Distance with no correction. Returns the same shape
+-- TraceAlongDirection does so ClassifyWallHit needs no second path.
+local function CapsuleSweepAhead(pawn, direction, maxGap)
+    if not IsLive(KSL) then
+        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        if not IsLive(KSL) then return nil end
+    end
+    local origin = GetLoc(pawn)
+    if origin == nil then return nil end
+
+    local zc, half = CapsuleCheckExtent()
+    local from = { X = origin.X, Y = origin.Y, Z = origin.Z + zc }
+    local to   = { X = origin.X + direction.X * maxGap,
+                   Y = origin.Y + direction.Y * maxGap,
+                   Z = origin.Z + zc }
+
+    local hitResult, didHit = {}, nil
+    pcall(function()
+        didHit = KSL:CapsuleTraceSingle(pawn, from, to, capsuleRadius, half,
+            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, TRACE_DRAW_NONE,
+            hitResult, true,
+            { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 },
+            TRACE_DRAW_TIME)
+    end)
+    if not didHit then return nil end
+
+    local nx, ny, nz, dist
+    pcall(function() nx = hitResult.ImpactNormal.X end)
+    pcall(function() ny = hitResult.ImpactNormal.Y end)
+    pcall(function() nz = hitResult.ImpactNormal.Z end)
+    pcall(function() dist = hitResult.Distance end)
+    if type(nx) ~= "number" or type(ny) ~= "number"
+       or type(nz) ~= "number" or type(dist) ~= "number" then
+        return nil
+    end
+    return { normalX = nx, normalY = ny, normalZ = nz, gap = dist }
+end
+
+-- Whether the capsule check can be trusted on this build. Decided once, on
+-- the first grounded frame: a sweep straight down must find the floor and
+-- report a readable distance. A build whose CapsuleTraceSingle does not fill
+-- the hit struct would otherwise make every wall invisible, silently.
+local function SelfTestCapsuleTrace(pawn)
+    if Diag.capsuleTraceOk ~= nil then return end
+    if not IsLive(KSL) then
+        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        if not IsLive(KSL) then return end
+    end
+    local origin = GetLoc(pawn)
+    if origin == nil then return end
+
+    local from = { X = origin.X, Y = origin.Y, Z = origin.Z + 150 }
+    local to   = { X = origin.X, Y = origin.Y, Z = origin.Z - 150 }
+    local hitResult, didHit, dist = {}, nil, nil
+    pcall(function()
+        -- Visibility channel: the question is whether the struct fills, and
+        -- the floor blocks Visibility whatever it does with the climb channel.
+        didHit = KSL:CapsuleTraceSingle(pawn, from, to, capsuleRadius, capsuleHalfHeight,
+            0, false, {}, TRACE_DRAW_NONE, hitResult, true,
+            { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 }, 0.0)
+    end)
+    if not didHit then return end            -- nothing under us yet; try again next grounded frame
+    pcall(function() dist = hitResult.Distance end)
+
+    Diag.capsuleTraceOk = (type(dist) == "number")
+    if Diag.capsuleTraceOk then
+        ddbg("capsule trace self-test: OK (floor at %.1f) -- capsule check active", dist)
+    else
+        ddbg("capsule trace self-test: FAILED -- CapsuleTraceSingle does not fill "
+            .. "the hit struct on this build. Falling back to line probes.")
+    end
+end
+
+local function UsingCapsuleCheck()
+    return WallDetect.SHAPE == "capsule" and Diag.capsuleTraceOk ~= false
+end
+
 -- The two tests that separate a wall from something merely in the way. Both
 -- probe along the APPROACH direction, not the wall normal, so what they ask
 -- is "would the player, going this way, meet a face here" -- the question
@@ -972,7 +1082,17 @@ local function WallInMovementPath(pawn, cmc, maxGap, useFan)
     -- "the wall is close enough" are one statement instead of two knobs.
     local rayLength = capsuleRadius + maxGap
     local hit, wall
-    if useFan then
+    if UsingCapsuleCheck() then
+        hit = CapsuleSweepAhead(pawn, inputDirection, maxGap)
+        if hit == nil then return nil, "capsule found nothing" end
+        wall = ClassifyWallHit(hit, maxGap)
+        if wall == nil then
+            if hit.normalZ >= walkableFloorZ then
+                return nil, string.format("capsule hit walkable (normalZ %.2f)", hit.normalZ)
+            end
+            return nil, "capsule hit unclassifiable"
+        end
+    elseif useFan then
         wall = ProbeWallFan(pawn, inputDirection, rayLength, maxGap)
         if wall == nil then return nil, "fan found no climbable face" end
     else
@@ -1089,16 +1209,11 @@ local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- gate: commit
 local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- gate: grabbable
 local COLOR_PROBE   = { R = 1.0,  G = 0.0,  B = 0.0,  A = 1.0 }  -- every sweep, hit or miss
 local COLOR_HIT     = { R = 0.0,  G = 1.0,  B = 0.0,  A = 1.0 }  -- contact spheres, climb point
-local COLOR_RANGE   = { R = 0.35, G = 0.85, B = 1.0,  A = 0.8 }  -- detection-range ghost
+local COLOR_RANGE   = { R = 0.35, G = 0.85, B = 1.0,  A = 0.8 }  -- the capsule check
 
--- Radius the sweeps are DRAWN with. When detection runs on line traces
--- (PROBE_RADIUS = 0) this is purely cosmetic and the drawn sweep reaches
--- one radius short of where the line would; when PROBE_RADIUS is set the
--- drawing uses it and matches the detection exactly.
 local VIZ_MIN_PROBE_RADIUS = 18
 
 local vizCategory = nil
-
 local function VizCategory()
     if vizCategory == nil and Viz ~= nil then
         pcall(function() vizCategory = Viz.MakeCategory("PalFeel.Climb") end)
@@ -1116,11 +1231,8 @@ local function DrawGate(origin, dir, dist, color, cat)
     end)
 end
 
--- One swept probe drawn the way the reference climbing pattern draws it: a
--- red capsule-shaped swept volume whether or not it hit, and a green sphere
--- at the point of contact when it did. The library colours the whole volume
--- by outcome, so hit and miss colours are both set to red and the green is
--- added by hand. Returns the hit table (or nil).
+-- A swept sphere probe drawn the reference way: red volume either way, a
+-- green sphere at the contact. Returns the hit or nil.
 local function DrawSweep(from, to, radius, channel, cat)
     local hit = nil
     pcall(function()
@@ -1138,13 +1250,11 @@ local function DrawSweep(from, to, radius, channel, cat)
     return nil
 end
 
--- Draws every check this file makes, laid out like the reference: forward
--- sweeps stacked at low / waist / eye height, a sweep either side at waist
--- for width, and -- only when every check passes -- a large green ring at
--- the contact point, which is the reference's "this is climbable" marker.
---
--- All on the component's own channel. A sweep drawn on Visibility while the
--- real checks run on Const_RayChannel would show geometry nobody tests.
+-- Draws the checks that actually run. In capsule mode the capsule drawn is
+-- the capsule check -- same origin, extent, reach and channel as
+-- CapsuleSweepAhead -- so where it stops is where detection says the face
+-- is. The eye and width sweeps are the filters. The green ring appears only
+-- when all of it would be accepted as a wall.
 local function VisualiseClimbChecks(pawn, cmc)
     if not DEBUG_VOLUMES or Viz == nil then return end
 
@@ -1157,11 +1267,6 @@ local function VisualiseClimbChecks(pawn, cmc)
     local channel = ReadOpt(comp, "Const_RayChannel") or 0
     local radius  = math.max(WallDetect.PROBE_RADIUS, VIZ_MIN_PROBE_RADIUS)
     local reach   = capsuleRadius + InitClimb.GUARD_GAP
-    -- Every sweep is drawn to the same reach. Detection gives the eye and
-    -- width probes +WallDetect.SLACK on top of it, but that is a tolerance
-    -- for a rough face once the waist probe has ALREADY hit, not extra
-    -- range -- and drawn, it read as the probes reaching further than the
-    -- guard does. So the picture ends where the guard's reach ends.
 
     local function Sweep(h, lateral, len)
         local sx = origin.X - dir.Y * lateral
@@ -1172,39 +1277,39 @@ local function VisualiseClimbChecks(pawn, cmc)
             radius, channel, cat)
     end
 
+    local face = nil
+    if UsingCapsuleCheck() then
+        local zc, half = CapsuleCheckExtent()
+        pcall(function()
+            face = Viz.CapsuleTrace(
+                { X = origin.X, Y = origin.Y, Z = origin.Z + zc },
+                { X = origin.X + dir.X * InitClimb.GUARD_GAP,
+                  Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
+                  Z = origin.Z + zc },
+                capsuleRadius, half,
+                { Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+                  HitColor = COLOR_RANGE, MissColor = COLOR_RANGE,
+                  DrawImpactNormal = true, DrawSweptVolume = true })
+        end)
+        if face and not face.bBlockingHit then face = nil end
+    else
+        local waist = Sweep(0, 0, reach)
+        local low   = (probeFanOffset > 0) and Sweep(-probeFanOffset, 0, reach) or nil
+        face = waist or low
+    end
+
     local eyeZ  = capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
     local w     = WallDetect.WIDTH_HALF
-    local waist = Sweep(0, 0, reach)
-    local low   = (probeFanOffset > 0) and Sweep(-probeFanOffset, 0, reach) or nil
     local eye   = Sweep(eyeZ, 0, reach)
     local left  = Sweep(0,  w, reach)
     local right = Sweep(0, -w, reach)
 
-    -- The reference's big green marker: only when this would actually be
-    -- accepted as a wall, at the point the waist probe touched.
-    local face = waist or low
     if face and eye and left and right and face.ImpactPoint then
         pcall(function()
             Viz.DrawSphere(face.ImpactPoint, radius * 1.8, 24, COLOR_HIT,
                 3.0, DEBUG_VOLUME_TIME, cat)
         end)
     end
-
-    -- The detection range, as a capsule over the player: from the player's
-    -- centre forward to the edge of the guard's reach, at the player's own
-    -- height. Its front face is exactly where every sweep ends, so the
-    -- endpoint spheres sit on it, and "a wall touching this is at the limit
-    -- of what the guard can see" reads at a glance.
-    local half = reach * 0.5
-    pcall(function()
-        Viz.DrawCapsule(
-            { X = origin.X + dir.X * half,
-              Y = origin.Y + dir.Y * half,
-              Z = origin.Z },
-            capsuleHalfHeight, half,
-            { Pitch = 0, Yaw = 0, Roll = 0 },
-            16, COLOR_RANGE, 1.0, DEBUG_VOLUME_TIME, cat)
-    end)
 
     if DEBUG_VOLUME_GATES then
         DrawGate(origin, dir, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD,  cat)
@@ -2339,6 +2444,7 @@ function M.OnPlayerCached(pawn, cmc)
     orientOverridden         = false
     defaultOrientToMovement  = ReadOpt(cmc, "bOrientRotationToMovement")
     Diag.seqStarts, Diag.seqEnds = 0, 0
+    Diag.capsuleTraceOk = nil
     Diag.canStartFires, Diag.canStartVetoes, Diag.canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
@@ -2700,6 +2806,10 @@ end
 
 function M.OnTick(dt, pawn, cmc)
     SampleTickOrder()
+    if Diag.capsuleTraceOk == nil and WallDetect.SHAPE == "capsule"
+       and (cmc.MovementMode == 1 or cmc.MovementMode == 2) then
+        SelfTestCapsuleTrace(pawn)
+    end
     WatchForTeleport(pawn, cmc)
     VisualiseClimbChecks(pawn, cmc)
 

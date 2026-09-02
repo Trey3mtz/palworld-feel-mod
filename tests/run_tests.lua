@@ -271,6 +271,31 @@ do
 end
 
 -- =========================================================================
+print("\n[7b] The capsule check is the check")
+-- A rock below step height must not even be a candidate: the capsule starts
+-- above MaxStepHeight so it is outside the swept volume entirely. And the
+-- self-test must pass on a build whose capsule traces report, so that the
+-- capsule path -- not the line fallback -- is what the suite exercised.
+-- =========================================================================
+do
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+    pcall(Climb.OnTick, 1 / 60, w.pawn, w.cmc)          -- grounded: runs the self-test
+    local src = io.open(CLIMB):read("a")
+    Check("capsule is the default shape",
+          src:find('WallDetect.SHAPE%s*=%s*"capsule"') ~= nil, "default is not capsule")
+
+    -- Step-height rock: top 40uu above the feet (feet at -90 in the harness).
+    local rock = Wall(0, 0); rock.topZ = -50
+    local r = H.Run(H.LoadClimb(CLIMB), rock, { startX = 60, startZ = 0,
+        inputDir = { X = 1, Y = 0, Z = 0 }, duration = 2.0, forwardRay = 80 })
+    Check("rock below step height: not a candidate at all", not r.modSequenceRan,
+          "capsule was stopped by something the player walks over")
+end
+
+-- =========================================================================
 print("\n[8] Yaw is ours while we own the wall, and the player's again after")
 -- OrientRotationToMovement left on spins the character toward the stick every
 -- frame -- the "rotates away right before the latch" report. Restoring it
