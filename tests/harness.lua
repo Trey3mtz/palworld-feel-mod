@@ -174,6 +174,23 @@ local KSL = {
         return true
     end,
     CapsuleTraceSingle = function() return false, nil end,
+    -- A sphere sweep against a plane contacts one radius before the line
+    -- would, so Distance is the line distance minus the radius.
+    SphereTraceSingle = function(self, actor, startV, endV, radius, channel,
+                                 complex, ignore, drawType, hitResult)
+        local w = activeWorld
+        local d = Vec(endV.X - startV.X, endV.Y - startV.Y, endV.Z - startV.Z)
+        local len = math.sqrt(dot3(d, d))
+        if len < 1e-6 then return false end
+        local dir = { X = d.X / len, Y = d.Y / len, Z = d.Z / len }
+        local t = RayHit(w.wall, startV, dir, len + radius)
+        if t == nil or t - radius > len then return false end
+        hitResult.Distance = math.max(0, t - radius)
+        hitResult.ImpactNormal = Vec(w.wall.n.X, w.wall.n.Y, w.wall.n.Z)
+        hitResult.ImpactPoint = Vec(startV.X + dir.X * t, startV.Y + dir.Y * t,
+                                    startV.Z + dir.Z * t)
+        return true
+    end,
 }
 function StaticFindObject() return KSL end
 

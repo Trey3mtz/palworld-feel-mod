@@ -66,6 +66,9 @@ local DEBUG_VOLUMES = false
 -- How long each drawn frame persists. 0 = one frame (cleanest while moving);
 -- a small value leaves a short trail, which is easier to read in a screenshot.
 local DEBUG_VOLUME_TIME = 0.0
+-- Threshold bars along the approach line. Off by default so the picture
+-- matches the reference climbing visual: sweeps and hits only.
+local DEBUG_VOLUME_GATES = false
 
 -- ---- slide ----
 local VZ_TRIGGER  = -600
@@ -182,6 +185,12 @@ WallDetect.REQUIRE_WIDTH   = true
 -- rough face they land at slightly different depths, and a wall should not
 -- fail its width test because one flank is 10uu further back.
 WallDetect.SLACK           = 30
+-- 0 = line traces, the only shape proven to fill the hit struct on this
+-- UE4SS build. > 0 = sphere sweeps of that radius, which is what the
+-- reference climbing pattern uses and which forgive a rough face. Safe to
+-- try: if the sweep does not report, nothing arms and the game keeps the
+-- wall. Verify with DEBUG_VOLUMES before leaving it on.
+WallDetect.PROBE_RADIUS    = 0
 
 -- ---- init climb: launch ----
 InitClimb.LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
@@ -409,8 +418,17 @@ Diag.TELEPORT_JUMP_UU  = 1500
 Diag.teleportLastLoc   = nil
 Diag.teleportReports   = 0
 Diag.TELEPORT_LOG_MAX  = 6
+Diag.SEQ_LOG_MAX       = 16
+Diag.seqStarts, Diag.seqEnds = 0, 0
 
-local savedOrientToMovement = nil   -- bOrientRotationToMovement before we took yaw
+-- bOrientRotationToMovement as it was at spawn, and whether this file has
+-- overridden it. Captured at cache time rather than "on first take" because
+-- the first take can happen AFTER the game's own climb has already switched
+-- it off -- an organic grab makes isClimbing true, we take priority, and the
+-- value we would save is the component's false, not the player's true.
+-- Restoring that left the character unable to turn after every climb.
+local defaultOrientToMovement = nil
+local orientOverridden        = false
 
 Diag.grabWasClimbingPre  = false
 Diag.grabInsideTick      = 0
@@ -801,12 +819,20 @@ local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lat
     }
 
     local hitResult, didHit = {}, nil
+    local channel = ReadOpt(comp, "Const_RayChannel") or 0
+    local radius  = WallDetect.PROBE_RADIUS
     pcall(function()
-        didHit = KSL:LineTraceSingle(pawn, origin, finish,
-            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, TRACE_DRAW_NONE,
-            hitResult, true,
-            { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 },
-            TRACE_DRAW_TIME)
+        if radius > 0 then
+            didHit = KSL:SphereTraceSingle(pawn, origin, finish, radius,
+                channel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+                { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 },
+                TRACE_DRAW_TIME)
+        else
+            didHit = KSL:LineTraceSingle(pawn, origin, finish,
+                channel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+                { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 },
+                TRACE_DRAW_TIME)
+        end
     end)
     if not didHit then return nil end
 
@@ -826,7 +852,9 @@ local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lat
         normalX = normalX,
         normalY = normalY,
         normalZ = normalZ,
-        gap     = distanceFromCentre - capsuleRadius,
+        -- For a sweep, Distance is how far the sphere's CENTRE travelled; the
+        -- surface it touched is one radius further on.
+        gap     = distanceFromCentre + radius - capsuleRadius,
     }
 end
 
@@ -1052,11 +1080,17 @@ end
 -- gameplay down with it.
 -- =========================================================================
 
-local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- arm range
-local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- commit range
-local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- grabbable
-local COLOR_MISS    = { R = 0.45, G = 0.45, B = 0.50, A = 1.0 }  -- probe found nothing
-local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- width probes
+local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- gate: arm range
+local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- gate: commit range
+local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- gate: grabbable
+local COLOR_PROBE   = { R = 1.0,  G = 0.0,  B = 0.0,  A = 1.0 }  -- every sweep, hit or miss
+local COLOR_HIT     = { R = 0.0,  G = 1.0,  B = 0.0,  A = 1.0 }  -- contact spheres, climb point
+
+-- Radius the sweeps are DRAWN with. When detection runs on line traces
+-- (PROBE_RADIUS = 0) this is purely cosmetic and the drawn sweep reaches
+-- one radius short of where the line would; when PROBE_RADIUS is set the
+-- drawing uses it and matches the detection exactly.
+local VIZ_MIN_PROBE_RADIUS = 18
 
 local vizCategory = nil
 
@@ -1067,10 +1101,6 @@ local function VizCategory()
     return vizCategory
 end
 
--- A short vertical bar at `dist` along the approach, marking one of the
--- distances this file changes behaviour at. Bars rather than ground rings:
--- the comparison that matters is "is the face nearer or further than this",
--- which reads directly when the marker sits on the same line as the probes.
 local function DrawGate(origin, dir, dist, color, cat)
     local x, y = origin.X + dir.X * dist, origin.Y + dir.Y * dist
     pcall(function()
@@ -1081,91 +1111,81 @@ local function DrawGate(origin, dir, dist, color, cat)
     end)
 end
 
--- Draws every check this file makes, in world space.
+-- One swept probe drawn the way the reference climbing pattern draws it: a
+-- red capsule-shaped swept volume whether or not it hit, and a green sphere
+-- at the point of contact when it did. The library colours the whole volume
+-- by outcome, so hit and miss colours are both set to red and the green is
+-- added by hand. Returns the hit table (or nil).
+local function DrawSweep(from, to, radius, channel, cat)
+    local hit = nil
+    pcall(function()
+        hit = Viz.SphereTrace(from, to, radius, {
+            Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+            HitColor = COLOR_PROBE, MissColor = COLOR_PROBE,
+            DrawImpactNormal = false, DrawSweptVolume = true })
+    end)
+    if hit and hit.bBlockingHit and hit.Location then
+        pcall(function()
+            Viz.DrawSphere(hit.Location, radius, 12, COLOR_HIT, 1.5, DEBUG_VOLUME_TIME, cat)
+        end)
+        return hit
+    end
+    return nil
+end
+
+-- Draws every check this file makes, laid out like the reference: forward
+-- sweeps stacked at low / waist / eye height, a sweep either side at waist
+-- for width, and -- only when every check passes -- a large green ring at
+-- the contact point, which is the reference's "this is climbable" marker.
 --
--- Rays go through Viz.LineTrace rather than being drawn from cached results,
--- because the library also draws the impact point and the SURFACE NORMAL --
--- and the normal is what the walkable-slope rejection turns on. A face this
--- file refuses to climb because "surface walkable (normalZ >= WalkableFloorZ)"
--- is invisible in any drawing that shows only where the ray stopped.
---
--- The capsule sweep answers the other half. The rays show where the face IS;
--- the capsule shows how close the player can actually GET to it. A capsule
--- that halts outside the green commit gate means the commit distance is
--- unreachable on that geometry, and no probe tuning will fix it.
---
--- Debug-only cost: three extra line traces and one capsule sweep per frame.
+-- All on the component's own channel. A sweep drawn on Visibility while the
+-- real checks run on Const_RayChannel would show geometry nobody tests.
 local function VisualiseClimbChecks(pawn, cmc)
     if not DEBUG_VOLUMES or Viz == nil then return end
 
     local origin = GetLoc(pawn)
     if origin == nil then return end
-
     local dir = GetInputDirection(cmc) or WallFwd(pawn)
     if dir == nil then return end
 
     local cat     = VizCategory()
-    -- The component's own channel, not the library default. A ray drawn on
-    -- Visibility while the real checks run on Const_RayChannel would show a
-    -- confident picture of geometry nobody is testing against.
     local channel = ReadOpt(comp, "Const_RayChannel") or 0
+    local radius  = math.max(WallDetect.PROBE_RADIUS, VIZ_MIN_PROBE_RADIUS)
     local reach   = capsuleRadius + InitClimb.GUARD_GAP
+    local far     = reach + WallDetect.SLACK
 
-    local heights = { 0 }
-    if probeFanOffset > 0 then
-        heights[#heights + 1] =  probeFanOffset
-        heights[#heights + 1] = -probeFanOffset
+    local function Sweep(h, lateral, len)
+        local sx = origin.X - dir.Y * lateral
+        local sy = origin.Y + dir.X * lateral
+        return DrawSweep(
+            { X = sx, Y = sy, Z = origin.Z + h },
+            { X = sx + dir.X * len, Y = sy + dir.Y * len, Z = origin.Z + h },
+            radius, channel, cat)
     end
-    for _, h in ipairs(heights) do
+
+    local eyeZ  = capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
+    local w     = WallDetect.WIDTH_HALF
+    local waist = Sweep(0, 0, reach)
+    local low   = (probeFanOffset > 0) and Sweep(-probeFanOffset, 0, reach) or nil
+    local eye   = Sweep(eyeZ, 0, far)
+    local left  = Sweep(0,  w, far)
+    local right = Sweep(0, -w, far)
+
+    -- The reference's big green marker: only when this would actually be
+    -- accepted as a wall, at the point the waist probe touched.
+    local face = waist or low
+    if face and eye and left and right and face.ImpactPoint then
         pcall(function()
-            Viz.LineTrace(
-                { X = origin.X, Y = origin.Y, Z = origin.Z + h },
-                { X = origin.X + dir.X * reach,
-                  Y = origin.Y + dir.Y * reach,
-                  Z = origin.Z + h },
-                { Channel  = channel,
-                  Duration = DEBUG_VOLUME_TIME,
-                  Category = cat,
-                  HitColor = COLOR_ATTACH,
-                  MissColor = COLOR_MISS,
-                  DrawImpactNormal = true })
+            Viz.DrawSphere(face.ImpactPoint, radius * 1.8, 24, COLOR_HIT,
+                3.0, DEBUG_VOLUME_TIME, cat)
         end)
     end
 
-    -- Thresholds, measured from the capsule surface exactly as the checks
-    -- measure them, so what is drawn is what is compared.
-    DrawGate(origin, dir, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD,  cat)
-    DrawGate(origin, dir, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT, cat)
-    DrawGate(origin, dir, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT, cat)
-    DrawGate(origin, dir, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH, cat)
-
-    -- The shape checks, drawn the way the standard Unreal pattern draws them:
-    -- eye-level probe above the waist probes, width probes either side. When
-    -- the waist ray lands but the eye ray does not, that is a step, not a
-    -- wall, and the picture says so directly. (A capsule sweep used to be
-    -- drawn here; it was removed because a horizontal sweep has no step-up
-    -- and halts on ground the real player walks over, which answered a
-    -- question nobody was asking.)
-    local probeReach = reach + WallDetect.SLACK
-    local eyeZ = origin.Z + capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
-    pcall(function()
-        Viz.LineTrace(
-            { X = origin.X, Y = origin.Y, Z = eyeZ },
-            { X = origin.X + dir.X * probeReach, Y = origin.Y + dir.Y * probeReach, Z = eyeZ },
-            { Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
-              HitColor = COLOR_COMMIT, MissColor = COLOR_MISS, DrawImpactNormal = true })
-    end)
-    for _, side in ipairs({ 1, -1 }) do
-        local w  = WallDetect.WIDTH_HALF * side
-        local sx = origin.X - dir.Y * w
-        local sy = origin.Y + dir.X * w
-        pcall(function()
-            Viz.LineTrace(
-                { X = sx, Y = sy, Z = origin.Z },
-                { X = sx + dir.X * probeReach, Y = sy + dir.Y * probeReach, Z = origin.Z },
-                { Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
-                  HitColor = COLOR_CAPSULE, MissColor = COLOR_MISS })
-        end)
+    if DEBUG_VOLUME_GATES then
+        DrawGate(origin, dir, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD,  cat)
+        DrawGate(origin, dir, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT, cat)
+        DrawGate(origin, dir, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT, cat)
+        DrawGate(origin, dir, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH, cat)
     end
 end
 
@@ -1187,10 +1207,19 @@ end
 
 local function EndInitClimb(pawn, cmc, reason)
     if not M.InInitClimbState then return end
+    local kind = initClimbState and initClimbState.type or "?"
+    local air  = initClimbState and initClimbState.airTime or 0
     initClimbState     = nil
     M.InInitClimbState = false
     EnableForInitClimb(pawn, cmc)
     dbg("init climb end: %s", reason or "?")
+
+    Diag.seqEnds = Diag.seqEnds + 1
+    if Diag.seqEnds <= Diag.SEQ_LOG_MAX then
+        ddbg("SEQUENCE #%d end: %s (%s entry, %.2fs aloft)%s",
+            Diag.seqEnds, reason or "?", kind, air,
+            (reason == "latched") and "" or "   <-- a jump spent without a latch")
+    end
 end
 
 -- Force the mode, then read it back: ForceClimbAttach reports whether its
@@ -1234,6 +1263,15 @@ local function BeginInitClimb(pawn, cmc, wall, entryType)
 
     M.InInitClimbState = true
     DisableForInitClimb(pawn, cmc)
+
+    -- Every sequence takes the player's movement over for up to ~0.85s. One
+    -- that does not end in a latch has spent a jump for nothing, and from the
+    -- inside that is "jumps feel heavier". Counted so a session log can say
+    -- how often it happens instead of leaving it to feel.
+    Diag.seqStarts = Diag.seqStarts + 1
+    if Diag.seqStarts <= Diag.SEQ_LOG_MAX then
+        ddbg("SEQUENCE #%d start: %s entry, gap=%.1f", Diag.seqStarts, entryType, wall.gap)
+    end
 end
 
 -- Square up to the wall and hand off to the game's own jump, so the launch
@@ -1988,23 +2026,19 @@ local function UpdateClimbPriority(pawn, cmc, isClimbing)
         -- every frame -- exactly the "rotates away right before the latch"
         -- report. The prior value is kept, not assumed, so a game that has
         -- its own reason to run with it off does not get it forced back on.
-        -- Saved on the FIRST take only. GroundCheck, EndClimbJumpState and
-        -- BeginHopAway all clear ClimbHasPriority directly, so a re-take can
-        -- happen while our own `false` is still in place -- saving it again
-        -- there would record our write as the original and restore that.
-        pcall(function()
-            if savedOrientToMovement == nil then
-                savedOrientToMovement = cmc.bOrientRotationToMovement
-            end
-            cmc.bOrientRotationToMovement = false
-        end)
+        pcall(function() cmc.bOrientRotationToMovement = false end)
+        orientOverridden = true
         CommonState.ClimbHasPriority = true
     elseif not shouldTakePriority then
         pcall(function() cmc.bUseControllerDesiredRotation = true end)
-        if savedOrientToMovement ~= nil then
-            local restore = savedOrientToMovement
-            savedOrientToMovement = nil
-            pcall(function() cmc.bOrientRotationToMovement = restore end)
+        -- Back to what the player spawned with, never to a value read at
+        -- take time: see defaultOrientToMovement.
+        if orientOverridden then
+            orientOverridden = false
+            if defaultOrientToMovement ~= nil then
+                local restore = defaultOrientToMovement
+                pcall(function() cmc.bOrientRotationToMovement = restore end)
+            end
         end
         CommonState.ClimbHasPriority = false
     end
@@ -2277,7 +2311,9 @@ function M.OnPlayerCached(pawn, cmc)
     Diag.grabInsideTick      = 0
     Diag.teleportLastLoc     = nil
     Diag.teleportReports     = 0
-    savedOrientToMovement = nil
+    orientOverridden         = false
+    defaultOrientToMovement  = ReadOpt(cmc, "bOrientRotationToMovement")
+    Diag.seqStarts, Diag.seqEnds = 0, 0
     Diag.canStartFires, Diag.canStartVetoes, Diag.canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 

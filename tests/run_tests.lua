@@ -265,9 +265,10 @@ do
 end
 
 -- =========================================================================
-print("\n[8] Yaw is ours while we own the wall")
+print("\n[8] Yaw is ours while we own the wall, and the player's again after")
 -- OrientRotationToMovement left on spins the character toward the stick every
--- frame -- the "rotates away right before the latch" report.
+-- frame -- the "rotates away right before the latch" report. Restoring it
+-- wrongly is the "no longer rotates after climbing" report.
 -- =========================================================================
 do
     local Climb = H.LoadClimb(CLIMB)
@@ -290,16 +291,68 @@ do
           sawSequence and offDuringSequence,
           sawSequence and "still true mid-sequence" or "sequence never ran")
 
-    -- Leave the wall. Acceleration is zeroed directly as well as the input:
-    -- Step() applies input AFTER the tick, so a stale toward-the-wall
-    -- acceleration on this frame would read as a fresh walk-in and simply
-    -- start the next sequence.
     w.cmc.MovementMode, w.cmc.CustomMovementMode = 1, 0
     w.cmc.Acceleration.X, w.cmc.Acceleration.Y = 0, 0
     for _ = 1, 5 do pcall(Climb.OnTick, dt, w.pawn, w.cmc); H.Step(w, dt, { X = 0, Y = 0, Z = 0 }) end
-    Check("orient-to-movement restored after release",
+    Check("orient-to-movement restored after our own sequence",
           w.cmc.bOrientRotationToMovement == true,
           "left at " .. tostring(w.cmc.bOrientRotationToMovement))
+end
+
+-- The reported bug. The game grabs the wall itself and switches
+-- OrientRotationToMovement off for its climb BEFORE we ever take priority.
+-- Saving "the current value" at that moment saves the game's false and
+-- restores false. Spawn is the only moment the original is certain.
+do
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 160, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    w.cmc.bOrientRotationToMovement = true
+    Climb.OnPlayerCached(w.pawn, w.cmc)                 -- spawn: true
+
+    local dt = 1 / 60
+    -- The game latches organically and, as its climb starts, turns it off.
+    w.cmc.MovementMode, w.cmc.CustomMovementMode = 6, 5
+    w.cmc.bOrientRotationToMovement = false
+    w.cmc.Acceleration.X, w.cmc.Acceleration.Y = 0, 0
+    for _ = 1, 10 do pcall(Climb.OnTick, dt, w.pawn, w.cmc) end   -- we take priority here
+
+    -- The game ends its climb.
+    w.cmc.MovementMode, w.cmc.CustomMovementMode = 1, 0
+    for _ = 1, 5 do pcall(Climb.OnTick, dt, w.pawn, w.cmc); H.Step(w, dt, { X = 0, Y = 0, Z = 0 }) end
+    Check("organic climb: orient-to-movement restored to the SPAWN value",
+          w.cmc.bOrientRotationToMovement == true,
+          "left at " .. tostring(w.cmc.bOrientRotationToMovement)
+          .. " -- restored the game's false as if it were the original")
+end
+
+-- =========================================================================
+print("\n[9] Sphere-sweep detection is a drop-in for line traces")
+-- The reference pattern sweeps spheres. Kept opt-in until verified in-game,
+-- but the gap arithmetic must already be right or turning it on would shift
+-- every threshold by one radius.
+-- =========================================================================
+do
+    local Climb = H.LoadClimb(CLIMB)
+    -- Reach into the module's tuning through the same path a user would.
+    local src = io.open(CLIMB):read("a")
+    Check("PROBE_RADIUS defaults to line traces",
+          src:find("WallDetect.PROBE_RADIUS%s*=%s*0") ~= nil, "default is not 0")
+
+    -- Run the full suite of one scenario with spheres on, by patching the
+    -- loaded module's table via a sentinel file.
+    local tmp = "./tests/_climb_sphere.lua"
+    local f = io.open(tmp, "w")
+    f:write((src:gsub("WallDetect.PROBE_RADIUS%s*=%s*0", "WallDetect.PROBE_RADIUS = 15", 1)))
+    f:close()
+    local ClimbS = H.LoadClimb(tmp)
+    os.remove(tmp)
+    local r = H.Run(ClimbS, Wall(0, 0), { startX = 60, startZ = 0,
+        inputDir = { X = 1, Y = 0, Z = 0 }, duration = 3.0, forwardRay = 80,
+        organicGrab = true, approachSpeed = 550 })
+    Check("radius 15: still detects and latches",
+          r.outcome == "latched" and r.modSequenceRan,
+          string.format("outcome=%s ran=%s", tostring(r.outcome), tostring(r.modSequenceRan)))
 end
 
 -- =========================================================================
