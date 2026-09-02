@@ -230,5 +230,78 @@ do
 end
 
 -- =========================================================================
+print("\n[7] Something in the way is not a wall")
+-- The visualiser showed the approach reading a rock as a face. A wall has to
+-- be there at eye level AND wide enough; a step or a post is neither.
+-- Vanilla grab is off so the only way to end up climbing is our sequence,
+-- which makes "did we run" the whole question.
+-- =========================================================================
+do
+    -- Control: a real wall is still detected.
+    local r = Run({ entry = "ground", duration = 2.0 })
+    Check("control: full wall is detected", r.modSequenceRan, "sequence never ran")
+
+    -- Low obstacle: present at waist, absent at eye level.
+    -- Harness capsule half height is 90, eye probe sits at 0.70 * 90 = 63.
+    local low = Wall(0, 0); low.topZ = 40
+    r = H.Run(H.LoadClimb(CLIMB), low, { startX = 60, startZ = 0,
+        inputDir = { X = 1, Y = 0, Z = 0 }, duration = 2.0, forwardRay = 80 })
+    Check("low obstacle: NOT treated as a wall", not r.modSequenceRan,
+          "committed to climbing a step")
+
+    -- Narrow post: present dead ahead, absent 40uu to either side.
+    local post = Wall(0, 0); post.halfWidth = 20
+    r = H.Run(H.LoadClimb(CLIMB), post, { startX = 60, startZ = 0,
+        inputDir = { X = 1, Y = 0, Z = 0 }, duration = 2.0, forwardRay = 80 })
+    Check("narrow post: NOT treated as a wall", not r.modSequenceRan,
+          "committed to climbing a post")
+
+    -- Wide enough: a face just wider than the width probes still counts.
+    local wide = Wall(0, 0); wide.halfWidth = 60
+    r = H.Run(H.LoadClimb(CLIMB), wide, { startX = 60, startZ = 0,
+        inputDir = { X = 1, Y = 0, Z = 0 }, duration = 2.0, forwardRay = 80 })
+    Check("face wider than the probes: detected", r.modSequenceRan,
+          "rejected a wall that is wide enough")
+end
+
+-- =========================================================================
+print("\n[8] Yaw is ours while we own the wall")
+-- OrientRotationToMovement left on spins the character toward the stick every
+-- frame -- the "rotates away right before the latch" report.
+-- =========================================================================
+do
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    w.cmc.bOrientRotationToMovement = true
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local dt, dir = 1 / 60, { X = 1, Y = 0, Z = 0 }
+    local offDuringSequence, sawSequence = false, false
+    for _ = 1, 120 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        if Climb.InInitClimbState then
+            sawSequence = true
+            if w.cmc.bOrientRotationToMovement == false then offDuringSequence = true end
+        end
+        H.Step(w, dt, dir)
+    end
+    Check("orient-to-movement is off during the sequence",
+          sawSequence and offDuringSequence,
+          sawSequence and "still true mid-sequence" or "sequence never ran")
+
+    -- Leave the wall. Acceleration is zeroed directly as well as the input:
+    -- Step() applies input AFTER the tick, so a stale toward-the-wall
+    -- acceleration on this frame would read as a fresh walk-in and simply
+    -- start the next sequence.
+    w.cmc.MovementMode, w.cmc.CustomMovementMode = 1, 0
+    w.cmc.Acceleration.X, w.cmc.Acceleration.Y = 0, 0
+    for _ = 1, 5 do pcall(Climb.OnTick, dt, w.pawn, w.cmc); H.Step(w, dt, { X = 0, Y = 0, Z = 0 }) end
+    Check("orient-to-movement restored after release",
+          w.cmc.bOrientRotationToMovement == true,
+          "left at " .. tostring(w.cmc.bOrientRotationToMovement))
+end
+
+-- =========================================================================
 print(string.format("\n%d/%d checks passed", checks - failures, checks))
 os.exit(failures == 0 and 0 or 1)

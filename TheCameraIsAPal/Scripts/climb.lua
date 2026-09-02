@@ -162,6 +162,27 @@ local PROBE_PENETRATION_SLOP = 6   -- uu of negative gap treated as "touching"
 local PROBE_FAN_HEIGHT_FRAC = 0.45
 local PROBE_FAN_HEIGHT_PAD  = 4    -- uu kept clear of the capsule's end caps
 
+-- ---- wall shape checks ----
+-- A hit at waist height is not a wall. A rock, a plinth, a rise in the ground
+-- all hit at waist height, and a horizontal probe cannot tell them from a
+-- cliff face -- the visualiser showed the capsule sweep stopping on exactly
+-- such a rock while the real player would have stepped over it. So a face
+-- has to pass two more tests before it counts, the same two the standard
+-- Unreal climbing pattern uses:
+--   eye level : a probe at eye height must ALSO find it. A hit at waist that
+--               misses at eye is a step, not a wall.
+--   width     : probes offset left and right must both find it. A post or an
+--               edge you would slip off is not a wall either.
+local WallDetect = {}
+WallDetect.EYE_OFFSET_FRAC = 0.70   -- of capsule half height, above centre
+WallDetect.WIDTH_HALF      = 40     -- uu each side of the approach line
+WallDetect.REQUIRE_EYE     = true
+WallDetect.REQUIRE_WIDTH   = true
+-- The side and eye probes reach a little further than the waist probe: on a
+-- rough face they land at slightly different depths, and a wall should not
+-- fail its width test because one flank is 10uu further back.
+WallDetect.SLACK           = 30
+
 -- ---- init climb: launch ----
 InitClimb.LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
 -- Overwrites whatever the game's jump produced so the arc is identical every
@@ -354,6 +375,11 @@ local KSL = nil             -- KismetSystemLibrary default object, lazy
 local hooksRegistered = false
 local lastGroundCheck = nil
 
+-- All discovery / watchdog state lives in one table. Eighteen separate
+-- locals for it pushed the file past Lua's 200-local ceiling for a main
+-- chunk, and they are one thing anyway: read-only instrumentation.
+local Diag = {}
+
 -- ---- tick-order diagnostic (read-only) ----
 -- Everything currently runs off BP_PalPlayerController_C:ReceiveTick. The
 -- controller and the climbing component both tick in TG_PrePhysics, and
@@ -366,12 +392,12 @@ local lastGroundCheck = nil
 -- These sample whether the component's tick is even hookable, and if so
 -- whether it lands before or after our controller tick. Answering that is
 -- the prerequisite for moving the grab decision onto the component's tick.
-local compTickHookAlive   = false
-local compTickedBeforeUs  = false
-local tickOrderBefore     = 0
-local tickOrderAfter      = 0
-local tickOrderSamples    = 0
-local compTicks           = 0   -- engine ticks a component once per frame
+Diag.compTickHookAlive   = false
+Diag.compTickedBeforeUs  = false
+Diag.tickOrderBefore     = 0
+Diag.tickOrderAfter      = 0
+Diag.tickOrderSamples    = 0
+Diag.compTicks           = 0   -- engine ticks a component once per frame
 -- ---- teleport watchdog ----
 -- This file writes movement modes, velocities and component flags, and any of
 -- those can hand the pawn to game code that relocates it. A displacement this
@@ -379,13 +405,15 @@ local compTicks           = 0   -- engine ticks a component once per frame
 -- attributable to a frame and a state rather than to noticing you are in the
 -- sea. Sprinting is ~10uu/frame and terminal velocity ~50uu/frame, so this
 -- sits far above anything legitimate.
-local TELEPORT_JUMP_UU  = 1500
-local teleportLastLoc   = nil
-local teleportReports   = 0
-local TELEPORT_LOG_MAX  = 6
+Diag.TELEPORT_JUMP_UU  = 1500
+Diag.teleportLastLoc   = nil
+Diag.teleportReports   = 0
+Diag.TELEPORT_LOG_MAX  = 6
 
-local grabWasClimbingPre  = false
-local grabInsideTick      = 0
+local savedOrientToMovement = nil   -- bOrientRotationToMovement before we took yaw
+
+Diag.grabWasClimbingPre  = false
+Diag.grabInsideTick      = 0
 
 -- ---- CanClimbingStart gate ----
 -- The component's own predicate for "may a climb begin". Holding CanClimbing
@@ -397,12 +425,12 @@ local grabInsideTick      = 0
 -- Off until a session proves the hook fires and the return slot is what this
 -- assumes -- the last vararg, same shape GroundCheck already relies on.
 -- Enabling it before that is how the last two regressions happened.
-local CANSTART_VETO_ENABLED = false
-local canStartFires     = 0
-local canStartVetoes    = 0
-local canStartLogged    = 0
-local CANSTART_LOG_MAX  = 8
-local TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
+Diag.CANSTART_VETO_ENABLED = false
+Diag.canStartFires     = 0
+Diag.canStartVetoes    = 0
+Diag.canStartLogged    = 0
+Diag.CANSTART_LOG_MAX  = 8
+Diag.TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
 
 
 
@@ -747,7 +775,9 @@ end
 -- capsule), on the climbing component's own trace channel. Returns
 -- { normalX, normalY, normalZ, gap } or nil, where gap is measured from the
 -- capsule SURFACE rather than its centre.
-local function TraceAlongDirection(pawn, direction, rayLength, heightOffset)
+-- `lateral` shifts the origin sideways, perpendicular to `direction` in the
+-- horizontal plane; positive is to the left of travel.
+local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lateral)
     if not IsLive(KSL) then
         KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
         if not IsLive(KSL) then
@@ -759,6 +789,10 @@ local function TraceAlongDirection(pawn, direction, rayLength, heightOffset)
     local origin = GetLoc(pawn)
     if origin == nil then return nil end
     origin.Z = origin.Z + (heightOffset or 0)
+    if lateral and lateral ~= 0 then
+        origin.X = origin.X - direction.Y * lateral
+        origin.Y = origin.Y + direction.X * lateral
+    end
 
     local finish = {
         X = origin.X + direction.X * rayLength,
@@ -861,6 +895,39 @@ end
 -- Single ray by design: this runs every frame the player is walking, and a
 -- wall you can walk into is present at capsule centre height. The fan is for
 -- the airborne re-probe, where the ray can end up over a lip or in a recess.
+-- The two tests that separate a wall from something merely in the way. Both
+-- probe along the APPROACH direction, not the wall normal, so what they ask
+-- is "would the player, going this way, meet a face here" -- the question
+-- the rest of the sequence is built on.
+local function PassesWallShapeChecks(pawn, direction, wall, reach)
+    local probeReach = reach + WallDetect.SLACK
+
+    if WallDetect.REQUIRE_EYE then
+        local eyeZ = capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
+        local eye  = TraceAlongDirection(pawn, direction, probeReach, eyeZ, 0)
+        if eye == nil then
+            return false, "not at eye level (low obstacle)"
+        end
+        -- Something IS there at eye height but it is walkable: the top of a
+        -- boulder, a slope rolling over. Still not a face.
+        if eye.normalZ >= walkableFloorZ then
+            return false, string.format("walkable at eye level (normalZ %.2f)", eye.normalZ)
+        end
+    end
+
+    if WallDetect.REQUIRE_WIDTH then
+        local w = WallDetect.WIDTH_HALF
+        local left  = TraceAlongDirection(pawn, direction, probeReach, 0,  w)
+        local right = TraceAlongDirection(pawn, direction, probeReach, 0, -w)
+        if left == nil or right == nil then
+            return false, string.format("too narrow (left %s, right %s)",
+                left and "hit" or "miss", right and "hit" or "miss")
+        end
+    end
+
+    return true
+end
+
 -- Returns the wall, or nil plus a short reason. The reason exists because a
 -- session reported twelve consecutive "probe lost the face" give-ups and
 -- nothing distinguished "no input held" from "ray missed" from "surface is
@@ -902,6 +969,9 @@ local function WallInMovementPath(pawn, cmc, maxGap, useFan)
         return nil, string.format("outside cone (%.0f deg)",
             math.deg(math.acos(Clamp(approachAlignment, -1, 1))))
     end
+
+    local shapeOk, shapeWhy = PassesWallShapeChecks(pawn, inputDirection, wall, rayLength)
+    if not shapeOk then return nil, shapeWhy end
 
     fdbg("[climb] Walking into wall!")
     return wall
@@ -986,7 +1056,7 @@ local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- arm range
 local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- commit range
 local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- grabbable
 local COLOR_MISS    = { R = 0.45, G = 0.45, B = 0.50, A = 1.0 }  -- probe found nothing
-local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- where the body fits
+local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- width probes
 
 local vizCategory = nil
 
@@ -1069,18 +1139,34 @@ local function VisualiseClimbChecks(pawn, cmc)
     DrawGate(origin, dir, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT, cat)
     DrawGate(origin, dir, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH, cat)
 
+    -- The shape checks, drawn the way the standard Unreal pattern draws them:
+    -- eye-level probe above the waist probes, width probes either side. When
+    -- the waist ray lands but the eye ray does not, that is a step, not a
+    -- wall, and the picture says so directly. (A capsule sweep used to be
+    -- drawn here; it was removed because a horizontal sweep has no step-up
+    -- and halts on ground the real player walks over, which answered a
+    -- question nobody was asking.)
+    local probeReach = reach + WallDetect.SLACK
+    local eyeZ = origin.Z + capsuleHalfHeight * WallDetect.EYE_OFFSET_FRAC
     pcall(function()
-        Viz.CapsuleTrace(origin,
-            { X = origin.X + dir.X * InitClimb.GUARD_GAP,
-              Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
-              Z = origin.Z },
-            capsuleRadius, capsuleHalfHeight,
-            { Channel  = channel,
-              Duration = DEBUG_VOLUME_TIME,
-              Category = cat,
-              HitColor = COLOR_CAPSULE,
-              MissColor = COLOR_MISS })
+        Viz.LineTrace(
+            { X = origin.X, Y = origin.Y, Z = eyeZ },
+            { X = origin.X + dir.X * probeReach, Y = origin.Y + dir.Y * probeReach, Z = eyeZ },
+            { Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+              HitColor = COLOR_COMMIT, MissColor = COLOR_MISS, DrawImpactNormal = true })
     end)
+    for _, side in ipairs({ 1, -1 }) do
+        local w  = WallDetect.WIDTH_HALF * side
+        local sx = origin.X - dir.Y * w
+        local sy = origin.Y + dir.X * w
+        pcall(function()
+            Viz.LineTrace(
+                { X = sx, Y = sy, Z = origin.Z },
+                { X = sx + dir.X * probeReach, Y = sy + dir.Y * probeReach, Z = origin.Z },
+                { Channel = channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+                  HitColor = COLOR_CAPSULE, MissColor = COLOR_MISS })
+        end)
+    end
 end
 
 -- =========================================================================
@@ -1897,9 +1983,29 @@ local function UpdateClimbPriority(pawn, cmc, isClimbing)
 
     if shouldTakePriority and not CommonState.ClimbHasPriority then
         pcall(function() cmc.bUseControllerDesiredRotation = false end)
+        -- While on or at a wall this file (or the component) owns yaw. Left
+        -- on, OrientRotationToMovement spins the character toward the stick
+        -- every frame -- exactly the "rotates away right before the latch"
+        -- report. The prior value is kept, not assumed, so a game that has
+        -- its own reason to run with it off does not get it forced back on.
+        -- Saved on the FIRST take only. GroundCheck, EndClimbJumpState and
+        -- BeginHopAway all clear ClimbHasPriority directly, so a re-take can
+        -- happen while our own `false` is still in place -- saving it again
+        -- there would record our write as the original and restore that.
+        pcall(function()
+            if savedOrientToMovement == nil then
+                savedOrientToMovement = cmc.bOrientRotationToMovement
+            end
+            cmc.bOrientRotationToMovement = false
+        end)
         CommonState.ClimbHasPriority = true
     elseif not shouldTakePriority then
         pcall(function() cmc.bUseControllerDesiredRotation = true end)
+        if savedOrientToMovement ~= nil then
+            local restore = savedOrientToMovement
+            savedOrientToMovement = nil
+            pcall(function() cmc.bOrientRotationToMovement = restore end)
+        end
         CommonState.ClimbHasPriority = false
     end
 end
@@ -1988,10 +2094,10 @@ local function RegisterComponentHooks()
             -- suppression has to be written to matter this frame.
             function(Context)
                 if not IsOurComponent(Context) then return end
-                compTickHookAlive  = true
-                compTickedBeforeUs = true
-                compTicks          = compTicks + 1
-                grabWasClimbingPre = ReadOpt(comp, "IsClimbing") == true
+                Diag.compTickHookAlive  = true
+                Diag.compTickedBeforeUs = true
+                Diag.compTicks          = Diag.compTicks + 1
+                Diag.grabWasClimbingPre = ReadOpt(comp, "IsClimbing") == true
                 ApplyClimbSuppression()
             end,
             -- POST: did the component decide to grab inside this call? A
@@ -2003,13 +2109,13 @@ local function RegisterComponentHooks()
             function(Context)
                 if not IsOurComponent(Context) then return end
                 local nowClimbing = ReadOpt(comp, "IsClimbing") == true
-                if nowClimbing and not grabWasClimbingPre then
-                    grabInsideTick = grabInsideTick + 1
-                    if grabInsideTick <= 3 then
+                if nowClimbing and not Diag.grabWasClimbingPre then
+                    Diag.grabInsideTick = Diag.grabInsideTick + 1
+                    if Diag.grabInsideTick <= 3 then
                         ddbg("GRAB WINDOW: component went IsClimbing "
                             .. "false->true INSIDE its own BP tick (#%d) -- "
                             .. "a pre-hook suppression lands before it",
-                            grabInsideTick)
+                            Diag.grabInsideTick)
                     end
                 end
             end)
@@ -2023,14 +2129,14 @@ local function RegisterComponentHooks()
     -- entire approach. Post-hook because a return value only exists after
     -- execution -- NoOp pre-slot, same shape GroundCheck uses.
     --
-    -- This pass LOGS the call shape and only vetoes when CANSTART_VETO_ENABLED
+    -- This pass LOGS the call shape and only vetoes when Diag.CANSTART_VETO_ENABLED
     -- is set, because "the last vararg is the return value" is an assumption
     -- about this function's signature, not a fact. argc is logged so the shape
     -- can be read off a session before anything relies on it.
     local okStart, errStart = pcall(function()
         RegisterHook(clsPath .. ":CanClimbingStart", NoOp, function(Context, ...)
             if not IsOurComponent(Context) then return end
-            canStartFires = canStartFires + 1
+            Diag.canStartFires = Diag.canStartFires + 1
 
             local args = { ... }
             local argc = #args
@@ -2042,23 +2148,23 @@ local function RegisterComponentHooks()
             -- Veto only while the guard actually wants this wall. Outside
             -- that, the component's own answer stands untouched.
             local vetoed = false
-            if CANSTART_VETO_ENABLED and wantClimbSuppressed and argc > 0 then
+            if Diag.CANSTART_VETO_ENABLED and wantClimbSuppressed and argc > 0 then
                 vetoed = pcall(function() args[argc]:set(false) end)
-                if vetoed then canStartVetoes = canStartVetoes + 1 end
+                if vetoed then Diag.canStartVetoes = Diag.canStartVetoes + 1 end
             end
 
-            if canStartLogged < CANSTART_LOG_MAX then
-                canStartLogged = canStartLogged + 1
+            if Diag.canStartLogged < Diag.CANSTART_LOG_MAX then
+                Diag.canStartLogged = Diag.canStartLogged + 1
                 ddbg("CanClimbingStart #%d: argc=%d ret=%s (%s) "
                     .. "wantSuppressed=%s vetoed=%s",
-                    canStartFires, argc, tostring(ret), type(ret),
+                    Diag.canStartFires, argc, tostring(ret), type(ret),
                     tostring(wantClimbSuppressed), tostring(vetoed))
             end
         end)
     end)
     ddbg("hook CanClimbingStart: %s  (veto %s)",
         okStart and "registered" or ("FAILED: " .. tostring(errStart)),
-        CANSTART_VETO_ENABLED and "ARMED" or "observing only")
+        Diag.CANSTART_VETO_ENABLED and "ARMED" or "observing only")
 
     -- One-shot dump of the component's own BP functions. GroundCheck and
     -- ClimbUpAtTopEvent were found by hand; if one of the others IS the grab
@@ -2164,14 +2270,15 @@ function M.OnPlayerCached(pawn, cmc)
     guardArmedTime      = 0
     guardCooldown       = 0
     guardGiveUps        = 0
-    compTickedBeforeUs  = false
-    tickOrderBefore, tickOrderAfter, tickOrderSamples = 0, 0, 0
-    compTicks           = 0
-    grabWasClimbingPre  = false
-    grabInsideTick      = 0
-    teleportLastLoc     = nil
-    teleportReports     = 0
-    canStartFires, canStartVetoes, canStartLogged = 0, 0, 0
+    Diag.compTickedBeforeUs  = false
+    Diag.tickOrderBefore, Diag.tickOrderAfter, Diag.tickOrderSamples = 0, 0, 0
+    Diag.compTicks           = 0
+    Diag.grabWasClimbingPre  = false
+    Diag.grabInsideTick      = 0
+    Diag.teleportLastLoc     = nil
+    Diag.teleportReports     = 0
+    savedOrientToMovement = nil
+    Diag.canStartFires, Diag.canStartVetoes, Diag.canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
@@ -2463,23 +2570,23 @@ end
 -- order is not stable, and no probe range tuned from this file can fix that.
 local function SampleTickOrder()
     if not DEBUG_DISCOVERY then return end
-    if not compTickHookAlive then return end
-    if tickOrderSamples >= TICK_ORDER_SAMPLE_MAX then return end
+    if not Diag.compTickHookAlive then return end
+    if Diag.tickOrderSamples >= Diag.TICK_ORDER_SAMPLE_MAX then return end
 
-    tickOrderSamples = tickOrderSamples + 1
-    if compTickedBeforeUs then
-        tickOrderBefore = tickOrderBefore + 1
+    Diag.tickOrderSamples = Diag.tickOrderSamples + 1
+    if Diag.compTickedBeforeUs then
+        Diag.tickOrderBefore = Diag.tickOrderBefore + 1
     else
-        tickOrderAfter = tickOrderAfter + 1
+        Diag.tickOrderAfter = Diag.tickOrderAfter + 1
     end
-    compTickedBeforeUs = false
+    Diag.compTickedBeforeUs = false
 
-    if tickOrderSamples == TICK_ORDER_SAMPLE_MAX then
+    if Diag.tickOrderSamples == Diag.TICK_ORDER_SAMPLE_MAX then
         ddbg("TICK ORDER over %d of our ticks: component ran BEFORE us %d, "
             .. "AFTER (or not at all) %d. A split means the order is not "
             .. "stable, which on its own is enough to make the same wall "
             .. "behave differently between runs.",
-            tickOrderSamples, tickOrderBefore, tickOrderAfter)
+            Diag.tickOrderSamples, Diag.tickOrderBefore, Diag.tickOrderAfter)
 
         -- The engine ticks a component exactly once per frame, so the
         -- component's count is a reference clock for real frames. Our tick
@@ -2489,17 +2596,17 @@ local function SampleTickOrder()
         -- and every duration in this file (airTime, LOCK_TIME, retry
         -- intervals) then advances at double real time, which no amount of
         -- tuning would explain away.
-        local ratio = compTicks > 0 and (tickOrderSamples / compTicks) or 0
+        local ratio = Diag.compTicks > 0 and (Diag.tickOrderSamples / Diag.compTicks) or 0
         ddbg("TICK RATIO: our ticks %d vs component ticks %d = %.2fx. "
             .. "~1.0 is healthy; ~2.0 means the controller tick hook is "
             .. "double-registered and every duration here runs at 2x.",
-            tickOrderSamples, compTicks, ratio)
+            Diag.tickOrderSamples, Diag.compTicks, ratio)
 
         ddbg("CanClimbingStart: %d calls in that window, %d vetoed. "
             .. "0 calls means the organic grab does not route through it "
             .. "and the veto cannot work; calls only while approaching a "
             .. "face means it is the right lever.",
-            canStartFires, canStartVetoes)
+            Diag.canStartFires, Diag.canStartVetoes)
     end
 end
 
@@ -2507,17 +2614,17 @@ end
 -- naming the state this file was in when it happened.
 local function WatchForTeleport(pawn, cmc)
     local here = GetLoc(pawn)
-    if here == nil then teleportLastLoc = nil return end
+    if here == nil then Diag.teleportLastLoc = nil return end
 
-    local last = teleportLastLoc
-    teleportLastLoc = here
+    local last = Diag.teleportLastLoc
+    Diag.teleportLastLoc = here
     if last == nil then return end
 
     local dx, dy, dz = here.X - last.X, here.Y - last.Y, here.Z - last.Z
     local moved = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if moved < TELEPORT_JUMP_UU then return end
-    if teleportReports >= TELEPORT_LOG_MAX then return end
-    teleportReports = teleportReports + 1
+    if moved < Diag.TELEPORT_JUMP_UU then return end
+    if Diag.teleportReports >= Diag.TELEPORT_LOG_MAX then return end
+    Diag.teleportReports = Diag.teleportReports + 1
 
     ddbg("TELEPORT: moved %.0fuu in one frame (%.0f,%.0f,%.0f) -> "
         .. "(%.0f,%.0f,%.0f) | initClimb=%s phase=%s climbJump=%s "

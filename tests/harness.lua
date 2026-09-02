@@ -51,6 +51,13 @@ local function RayHit(wall, origin, dir, rayLen)
     if nd >= -1e-6 then return nil end                 -- parallel / backface
     local t = (WallOffsetAt(wall, origin.Z) - dot3(wall.n, origin)) / nd
     if t < 0 or t > rayLen then return nil end
+    -- `halfWidth` bounds the face sideways, so a post or a thin edge can be
+    -- modelled: a hit outside it lands on nothing.
+    if wall.halfWidth ~= nil then
+        local hx, hy = origin.X + dir.X * t, origin.Y + dir.Y * t
+        local lateral = -wall.n.Y * hx + wall.n.X * hy
+        if math.abs(lateral) > wall.halfWidth then return nil end
+    end
     return t
 end
 
