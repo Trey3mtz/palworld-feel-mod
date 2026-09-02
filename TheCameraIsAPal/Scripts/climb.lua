@@ -6,7 +6,12 @@
 local CommonState = require("commonstate")
 local Easing = require("easingfunctions")
 local Input       = require("input")
-local TraceVis    = require("TraceVisualizer")
+
+-- TraceViz lives in UE4SS's shared/ folder and may simply not be installed.
+-- A hard require would take the whole climbing subsystem down with it, so a
+-- missing visualiser degrades to no visualisation and nothing else.
+local okViz, Viz = pcall(require, "TraceViz")
+if not okViz then Viz = nil end
 
 -- =========================================================================
 -- 1. TUNING
@@ -45,25 +50,18 @@ local DEBUG_DUMP_FUNCTIONS = false
 -- up to 66ms of extra latency detecting a wall you have pressed into.
 local PROBE_FRAME_INTERVAL = 1
 
--- Draws every probe in world space so the rays can be checked against what
--- this file believes it is casting -- length, origin height, fan spread, and
--- whether a given face is being seen at all. EDrawDebugTrace: 0 None,
--- 1 ForOneFrame, 2 ForDuration, 3 Persistent. Red = the traced segment,
--- green = the hit. Leave at 0 for play; 1 is the one to turn on.
+-- Unreal compiles debug drawing out of shipping builds (ENABLE_DRAW_DEBUG is
+-- 0), and that includes the DrawDebugType visualisation built into every
+-- UKismetSystemLibrary trace: the trace runs, the drawing does not. So the
+-- EDrawDebugTrace argument below is pinned to None, and everything visual
+-- goes through TraceViz, which draws on the HUD canvas instead -- gameplay
+-- code that survives shipping.
 --
--- Nothing in this file's geometry should be taken on faith until this has
--- been run once: the reach figures here are assumptions about the pawn and
--- the component, not measurements.
-local DEBUG_DRAW      = 0
-local DEBUG_DRAW_TIME = 0.0   -- seconds; only meaningful for mode 2
+-- This was not a hypothesis that could be tested from here: passing a debug
+-- draw mode looks correct, compiles, runs, and silently draws nothing.
+local TRACE_DRAW_NONE = 0
+local TRACE_DRAW_TIME = 0.0
 
--- Draws the climbing checks as world-space geometry every frame: the probe
--- rays at each fan height, and rings at each distance threshold the feature
--- switches behaviour on. The thresholds are the whole temperament of this
--- system -- when the guard arms, when it commits, how far a grab reaches --
--- and they have been tuned so far by inference from give-up logs rather than
--- by looking at them. Set to true, walk at a face, and the numbers become a
--- picture.
 local DEBUG_VOLUMES = false
 -- How long each drawn frame persists. 0 = one frame (cleanest while moving);
 -- a small value leaves a short trail, which is easier to read in a screenshot.
@@ -286,7 +284,7 @@ local LEAD_RAY_BONUS = 8    -- uu of score preference for the ray angled
 -- units and origin nobody here has confirmed, and if it is surface-relative
 -- (or a socket offset, or anything else) the derivation silently computes a
 -- TIGHTER budget than this and the latch gets harder, not easier.
--- DEBUG_DRAW exists to settle that question from in-game before any figure
+-- DEBUG_VOLUMES exists to settle that question from in-game before any figure
 -- here is tied to it again.
 local ATTACH_MAX_GAP = 55
 
@@ -771,10 +769,10 @@ local function TraceAlongDirection(pawn, direction, rayLength, heightOffset)
     local hitResult, didHit = {}, nil
     pcall(function()
         didHit = KSL:LineTraceSingle(pawn, origin, finish,
-            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, DEBUG_DRAW,
+            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, TRACE_DRAW_NONE,
             hitResult, true,
             { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 },
-            DEBUG_DRAW_TIME)
+            TRACE_DRAW_TIME)
     end)
     if not didHit then return nil end
 
@@ -987,35 +985,48 @@ end
 local COLOR_GUARD   = { R = 1.0, G = 0.25, B = 0.10, A = 1.0 }  -- arm range
 local COLOR_COMMIT  = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }  -- commit range
 local COLOR_ATTACH  = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }  -- grabbable
-local COLOR_HIT     = { R = 1.0,  G = 1.0,  B = 0.10, A = 1.0 }  -- impact points
-local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- capsule sweep
+local COLOR_MISS    = { R = 0.45, G = 0.45, B = 0.50, A = 1.0 }  -- probe found nothing
+local COLOR_CAPSULE = { R = 0.85, G = 0.30, B = 1.0,  A = 1.0 }  -- where the body fits
 
--- Ground rings marking each distance the feature changes behaviour at. Not a
--- trace, so it goes straight to KismetSystemLibrary rather than through the
--- visualizer.
-local function DrawRing(pawn, centre, radius, color)
+local vizCategory = nil
+
+local function VizCategory()
+    if vizCategory == nil and Viz ~= nil then
+        pcall(function() vizCategory = Viz.MakeCategory("PalFeel.Climb") end)
+    end
+    return vizCategory
+end
+
+-- A short vertical bar at `dist` along the approach, marking one of the
+-- distances this file changes behaviour at. Bars rather than ground rings:
+-- the comparison that matters is "is the face nearer or further than this",
+-- which reads directly when the marker sits on the same line as the probes.
+local function DrawGate(origin, dir, dist, color, cat)
+    local x, y = origin.X + dir.X * dist, origin.Y + dir.Y * dist
     pcall(function()
-        KSL:DrawDebugCircle(pawn, centre, radius, 24, color,
-            DEBUG_VOLUME_TIME, 1.5,
-            { X = 1, Y = 0, Z = 0 }, { X = 0, Y = 1, Z = 0 }, false)
+        Viz.DrawLine(
+            { X = x, Y = y, Z = origin.Z - capsuleHalfHeight * 0.5 },
+            { X = x, Y = y, Z = origin.Z + capsuleHalfHeight * 0.5 },
+            color, 2.0, DEBUG_VOLUME_TIME, cat)
     end)
 end
 
 -- Draws every check this file makes, in world space.
 --
--- The probe rays go through TraceVisualizer on the COMPONENT'S OWN CHANNEL,
--- not the library default. A ray drawn on channel 0 while the real checks run
--- on Const_RayChannel would hit different geometry -- a confident picture of
--- something nobody is testing, which is worse than no picture.
+-- Rays go through Viz.LineTrace rather than being drawn from cached results,
+-- because the library also draws the impact point and the SURFACE NORMAL --
+-- and the normal is what the walkable-slope rejection turns on. A face this
+-- file refuses to climb because "surface walkable (normalZ >= WalkableFloorZ)"
+-- is invisible in any drawing that shows only where the ray stopped.
 --
--- The capsule sweep is the one that answers the finicky-wall question
--- directly: the line rays show where the FACE is, the capsule shows how close
--- the player can actually GET to it. When the capsule stops outside the green
--- commit ring, the commit distance is simply unreachable on that geometry, and
--- no amount of probe tuning will fix it.
+-- The capsule sweep answers the other half. The rays show where the face IS;
+-- the capsule shows how close the player can actually GET to it. A capsule
+-- that halts outside the green commit gate means the commit distance is
+-- unreachable on that geometry, and no probe tuning will fix it.
+--
+-- Debug-only cost: three extra line traces and one capsule sweep per frame.
 local function VisualiseClimbChecks(pawn, cmc)
-    if not DEBUG_VOLUMES then return end
-    if not IsLive(KSL) then return end
+    if not DEBUG_VOLUMES or Viz == nil then return end
 
     local origin = GetLoc(pawn)
     if origin == nil then return end
@@ -1023,43 +1034,52 @@ local function VisualiseClimbChecks(pawn, cmc)
     local dir = GetInputDirection(cmc) or WallFwd(pawn)
     if dir == nil then return end
 
+    local cat     = VizCategory()
+    -- The component's own channel, not the library default. A ray drawn on
+    -- Visibility while the real checks run on Const_RayChannel would show a
+    -- confident picture of geometry nobody is testing against.
     local channel = ReadOpt(comp, "Const_RayChannel") or 0
+    local reach   = capsuleRadius + InitClimb.GUARD_GAP
 
-    -- Thresholds, measured from the capsule surface exactly as the checks
-    -- measure them, so what is drawn is what is compared.
-    local foot = { X = origin.X, Y = origin.Y,
-                   Z = origin.Z - capsuleHalfHeight + 2 }
-    DrawRing(pawn, foot, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD)
-    DrawRing(pawn, foot, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT)
-    DrawRing(pawn, foot, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT)
-    DrawRing(pawn, foot, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH)
-
-    -- Probe rays at the heights the fan actually uses.
-    local reach = capsuleRadius + InitClimb.GUARD_GAP
     local heights = { 0 }
     if probeFanOffset > 0 then
         heights[#heights + 1] =  probeFanOffset
         heights[#heights + 1] = -probeFanOffset
     end
     for _, h in ipairs(heights) do
-        local from = { X = origin.X, Y = origin.Y, Z = origin.Z + h }
-        local to   = { X = origin.X + dir.X * reach,
-                       Y = origin.Y + dir.Y * reach,
-                       Z = origin.Z + h }
         pcall(function()
-            TraceVis:DrawLineTrace(pawn, from, to, DEBUG_VOLUME_TIME,
-                channel, COLOR_GUARD, COLOR_HIT)
+            Viz.LineTrace(
+                { X = origin.X, Y = origin.Y, Z = origin.Z + h },
+                { X = origin.X + dir.X * reach,
+                  Y = origin.Y + dir.Y * reach,
+                  Z = origin.Z + h },
+                { Channel  = channel,
+                  Duration = DEBUG_VOLUME_TIME,
+                  Category = cat,
+                  HitColor = COLOR_ATTACH,
+                  MissColor = COLOR_MISS,
+                  DrawImpactNormal = true })
         end)
     end
 
-    -- Where the capsule can actually reach.
-    local sweepTo = { X = origin.X + dir.X * InitClimb.GUARD_GAP,
-                      Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
-                      Z = origin.Z }
+    -- Thresholds, measured from the capsule surface exactly as the checks
+    -- measure them, so what is drawn is what is compared.
+    DrawGate(origin, dir, capsuleRadius + InitClimb.GUARD_GAP, COLOR_GUARD,  cat)
+    DrawGate(origin, dir, capsuleRadius + InitClimb.HOP_GAP,   COLOR_COMMIT, cat)
+    DrawGate(origin, dir, capsuleRadius + InitClimb.MAX_GAP,   COLOR_COMMIT, cat)
+    DrawGate(origin, dir, capsuleRadius + ATTACH_MAX_GAP,      COLOR_ATTACH, cat)
+
     pcall(function()
-        TraceVis:DrawCapsuleTrace(pawn, origin, sweepTo,
-            capsuleRadius, capsuleHalfHeight, DEBUG_VOLUME_TIME,
-            channel, COLOR_CAPSULE, COLOR_HIT)
+        Viz.CapsuleTrace(origin,
+            { X = origin.X + dir.X * InitClimb.GUARD_GAP,
+              Y = origin.Y + dir.Y * InitClimb.GUARD_GAP,
+              Z = origin.Z },
+            capsuleRadius, capsuleHalfHeight,
+            { Channel  = channel,
+              Duration = DEBUG_VOLUME_TIME,
+              Category = cat,
+              HitColor = COLOR_CAPSULE,
+              MissColor = COLOR_MISS })
     end)
 end
 
@@ -1443,8 +1463,8 @@ local function SenseWall(pawn, wallFacing, leapSideSign)
                 { X = origin.X + directionX * HUG_RAY_LEN,
                   Y = origin.Y + directionY * HUG_RAY_LEN,
                   Z = origin.Z },
-                traceChannel, false, {}, DEBUG_DRAW, hitResult, true,
-                {R=1,G=0,B=0,A=1}, {R=0,G=1,B=0,A=1}, DEBUG_DRAW_TIME)
+                traceChannel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+                {R=1,G=0,B=0,A=1}, {R=0,G=1,B=0,A=1}, TRACE_DRAW_TIME)
         end)
         if not didHit then return end
 
