@@ -285,7 +285,7 @@ do
     pcall(Climb.OnTick, 1 / 60, w.pawn, w.cmc)          -- grounded: runs the self-test
     local src = io.open(CLIMB):read("a")
     Check("capsule is the default shape",
-          src:find('WallDetect.SHAPE%s*=%s*"capsule"') ~= nil, "default is not capsule")
+          src:find('SHAPE%s*=%s*"capsule"') ~= nil, "default is not capsule")
 
     -- Step-height rock: top 40uu above the feet (feet at -90 in the harness).
     local rock = Wall(0, 0); rock.topZ = -50
@@ -409,13 +409,13 @@ do
     -- Reach into the module's tuning through the same path a user would.
     local src = io.open(CLIMB):read("a")
     Check("PROBE_RADIUS defaults to line traces",
-          src:find("WallDetect.PROBE_RADIUS%s*=%s*0") ~= nil, "default is not 0")
+          src:find("PROBE_RADIUS%s*=%s*0,") ~= nil, "default is not 0")
 
     -- Run the full suite of one scenario with spheres on, by patching the
     -- loaded module's table via a sentinel file.
     local tmp = "./tests/_climb_sphere.lua"
     local f = io.open(tmp, "w")
-    f:write((src:gsub("WallDetect.PROBE_RADIUS%s*=%s*0", "WallDetect.PROBE_RADIUS = 15", 1)))
+    f:write((src:gsub("PROBE_RADIUS%s*=%s*0,", "PROBE_RADIUS = 15,", 1)))
     f:close()
     local ClimbS = H.LoadClimb(tmp)
     os.remove(tmp)

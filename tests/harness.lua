@@ -277,6 +277,9 @@ function M.Step(w, dt, inputDir)
     end
 
     if cmc.MovementMode == 6 and cmc.CustomMovementMode == 5 then
+        -- The climb solver owns velocity: whatever the pawn arrived with is
+        -- gone, so a drop back to falling starts from rest.
+        cmc.Velocity.X, cmc.Velocity.Y, cmc.Velocity.Z = 0, 0, 0
         -- The component drops the climb when its own forward ray misses.
         local o = pawn:K2_GetActorLocation()
         local r = math.rad(pawn.yaw)
