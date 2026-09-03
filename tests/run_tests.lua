@@ -545,5 +545,77 @@ do
 end
 
 -- =========================================================================
+print("\n[12] The latch watch answers a drop the way the component makes it")
+-- From a session log: the component ends the climb it did not set up by
+-- pushing the pawn ~30uu off the face and leaving it drifting away, and at
+-- least once it left into a WALKING mode from 150uu up. A watch that read
+-- that as a landing handed the wall back; one that re-forced without
+-- driving back in was refused six times from a worse position each time.
+-- =========================================================================
+do
+    -- (a) An exit into walking mode from height, pushed off the face: a
+    -- drop. The re-force squares up and drives the pawn back in.
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local dt, dir = 1 / 60, { X = 1, Y = 0, Z = 0 }
+    local dropped, reforced, inwardOnReforce = false, false, false
+    for _ = 1, 240 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        local climbing = (w.cmc.MovementMode == 6 and w.cmc.CustomMovementMode == 5)
+        if climbing and dropped then
+            reforced = true
+            inwardOnReforce = w.cmc.Velocity.X > 0
+            break
+        end
+        if climbing then
+            dropped = true
+            w.cmc.MovementMode, w.cmc.CustomMovementMode = 1, 0    -- walking, 150uu up
+            w.climbComp.IsClimbing = false
+            w.pawn.pos.X = w.pawn.pos.X - 30                       -- pushed off the face
+            w.cmc.Velocity.X = -150                                -- and drifting away
+        end
+        H.Step(w, dt, dir)
+    end
+    Check("exit into walking mode from height: treated as a drop and re-forced",
+          dropped and reforced, dropped and "handed the wall back as a landing" or "never latched")
+    Check("re-force drives the pawn back toward the face", inwardOnReforce,
+          "velocity still pointed away from the wall on the re-force frame")
+
+    -- (b) A component that drops every attach. Once the re-force budget is
+    -- spent the wall goes to vanilla for the standard cooldown rather than
+    -- straight into another hop.
+    Climb = H.LoadClimb(CLIMB)
+    w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local wasLatched, gaveUpAt, nextAscentAt, wasAscent = false, nil, nil, false
+    for _ = 1, 400 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        if w.cmc.MovementMode == 6 and w.cmc.CustomMovementMode == 5 then
+            wasLatched = true
+            w.cmc.MovementMode, w.cmc.CustomMovementMode = 3, 0
+            w.climbComp.IsClimbing = false
+            w.cmc.Velocity.Z = 0
+        end
+        if wasLatched and gaveUpAt == nil and Climb.Mode == "IDLE" then gaveUpAt = w.t end
+        local inAscent = Climb.Mode == "ASCENT"
+        if inAscent and not wasAscent and gaveUpAt ~= nil and nextAscentAt == nil then
+            nextAscentAt = w.t
+        end
+        wasAscent = inAscent
+        H.Step(w, dt, dir)
+    end
+    Check("spent re-force budget: the wall goes to vanilla before the next hop",
+          gaveUpAt ~= nil and (nextAscentAt == nil or nextAscentAt - gaveUpAt >= 0.7),
+          string.format("gave up at %s, next hop %s later",
+              gaveUpAt and string.format("%.2fs", gaveUpAt) or "never",
+              (gaveUpAt and nextAscentAt) and string.format("%.2fs", nextAscentAt - gaveUpAt) or "never"))
+end
+
+-- =========================================================================
 print(string.format("\n%d/%d checks passed", checks - failures, checks))
 os.exit(failures == 0 and 0 or 1)

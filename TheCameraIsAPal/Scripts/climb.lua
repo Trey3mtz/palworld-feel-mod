@@ -221,7 +221,7 @@ T.TopOut = {
 -- ---- log budgets (lines per session) ----
 T.Log = {
     TRANSITIONS = 120,
-    LATCH       = 16,
+    LATCH       = 64,
     GIVEUPS     = 12,
     TELEPORTS   = 6,
     TELEPORT_JUMP_UU = 1500,   -- a single-frame displacement above this is a teleport, not movement
@@ -1261,7 +1261,13 @@ local function LatchWatchTick(F)
         return false
     end
     if F.isClimbing then return false end
-    if not F.isFalling then S.watch = nil return false end    -- landed or another mode: theirs
+
+    -- The component ends its climb into a walking mode from well above the
+    -- ground. A non-falling exit is only a landing if the pawn is back near
+    -- the launch height; otherwise it is a drop like any other.
+    local rise = GetZ(F) - w.launchZ
+    local landed = not F.isFalling and rise < T.Ascent.MIN_RISE * 0.5
+    if landed then S.watch = nil return false end
 
     local face
     if UsingCapsuleCheck() then
@@ -1272,7 +1278,12 @@ local function LatchWatchTick(F)
     if face == nil or face.gap > T.Detect.ATTACH_GAP then S.watch = nil return false end
 
     w.drops = w.drops + 1
-    local rise = GetZ(F) - w.launchZ
+    -- The component's own flags at the moment of the drop, before anything
+    -- here rewrites them: a CanClimbing of false says it refused on purpose.
+    local how = string.format("rise=%.0f gap=%.1f movement=%d/%d canClimb=%s ending=%s groundCheck=%s",
+        rise, face.gap, F.mode, F.custom, tostring(ReadOpt(S.comp, "CanClimbing")),
+        tostring(ReadOpt(S.comp, "IsEnding")), tostring(S.lastGroundCheck))
+
     -- The component's own entry first, once. If it takes, its state is set
     -- up the way its update expects and the drops should stop.
     if not w.rescued then
@@ -1280,25 +1291,36 @@ local function LatchWatchTick(F)
         if TryComponentClimbEntry() then
             ReadModes(F)
             if Budget("latch", T.Log.LATCH) then
-                ddbg("latch DROPPED (#%d, rise=%.0f gap=%.1f groundCheck=%s): component entry -> %s",
-                    w.drops, rise, face.gap, tostring(S.lastGroundCheck),
+                ddbg("latch DROPPED (#%d, %s): component entry -> %s", w.drops, how,
                     F.isClimbing and "CLIMBING" or "no effect")
             end
             if F.isClimbing then return true end
         end
     end
     if w.reforces >= T.Latch.MAX_REFORCE then
+        -- Not straight back to another hop: the wall goes to vanilla for a
+        -- moment, the same as a guard give-up.
+        S.guard.cooldown = T.Guard.COOLDOWN
         if Budget("latch", T.Log.LATCH) then
-            ddbg("latch DROPPED #%d: re-force budget spent, letting it go", w.drops)
+            ddbg("latch DROPPED #%d: re-force budget spent -- wall handed to vanilla for %.2fs",
+                w.drops, T.Guard.COOLDOWN)
         end
         S.watch = nil
         return false
     end
     w.reforces = w.reforces + 1
+
+    -- The component pushes the pawn off the face on the way out and leaves
+    -- it drifting away. Square up and drive back in with the ascent's own
+    -- hold loop before forcing the mode, or each re-force is made from a
+    -- worse position than the last.
+    FaceYaw(F.pawn, w.faceDir)
+    local inVel = Clamp((face.gap - T.Ascent.HOLD_GAP) * T.Ascent.IN_GAIN, 0, T.Ascent.IN_MAX)
+    SetHorizVel(F.cmc, w.faceDir.X * inVel, w.faceDir.Y * inVel)
+
     local held = ForceAttach(F)
     if Budget("latch", T.Log.LATCH) then
-        ddbg("latch DROPPED (#%d, rise=%.0f gap=%.1f groundCheck=%s): re-forced #%d",
-            w.drops, rise, face.gap, tostring(S.lastGroundCheck), w.reforces)
+        ddbg("latch DROPPED (#%d, %s): re-forced #%d (in %.0f uu/s)", w.drops, how, w.reforces, inVel)
     end
     return held
 end
@@ -1323,9 +1345,11 @@ States[Mode.LATCHED] = {
 
         -- The watch runs every frame so it expires while the latch holds;
         -- a drop it answers leaves the pawn climbing again.
+        local w = S.watch
         local answered = LatchWatchTick(F)
         if not F.isClimbing and not answered then
-            return Mode.IDLE, "left climb mode"
+            return Mode.IDLE, string.format("left climb mode (movement %d/%d%s)", F.mode, F.custom,
+                w and string.format(", rise %.0f", GetZ(F) - w.launchZ) or "")
         end
         if F.atTop then return Mode.VAULT, "component vault" end
 
