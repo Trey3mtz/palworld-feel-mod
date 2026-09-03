@@ -220,7 +220,7 @@ T.TopOut = {
 
 -- ---- log budgets (lines per session) ----
 T.Log = {
-    TRANSITIONS = 48,
+    TRANSITIONS = 120,
     LATCH       = 16,
     GIVEUPS     = 12,
     TELEPORTS   = 6,
@@ -624,19 +624,21 @@ local function Trace(pawn, from, to, channel, radius, halfH)
 end
 
 -- A level probe from the capsule centre (offset up/down by heightOffset and
--- sideways by lateral; positive lateral is to the left of travel).
-local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lateral)
-    local origin = GetLoc(pawn)
-    if origin == nil then return nil end
-    origin.Z = origin.Z + (heightOffset or 0)
+-- sideways by lateral; positive lateral is to the left of travel). `origin`
+-- is the frame's location when the caller has it; nothing moves the pawn
+-- before sensing within a tick.
+local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lateral, origin)
+    local base = origin or GetLoc(pawn)
+    if base == nil then return nil end
+    local start = { X = base.X, Y = base.Y, Z = base.Z + (heightOffset or 0) }
     if lateral and lateral ~= 0 then
-        origin.X = origin.X - direction.Y * lateral
-        origin.Y = origin.Y + direction.X * lateral
+        start.X = start.X - direction.Y * lateral
+        start.Y = start.Y + direction.X * lateral
     end
-    local finish = { X = origin.X + direction.X * rayLength,
-                     Y = origin.Y + direction.Y * rayLength, Z = origin.Z }
+    local finish = { X = start.X + direction.X * rayLength,
+                     Y = start.Y + direction.Y * rayLength, Z = start.Z }
     local radius = T.Detect.PROBE_RADIUS
-    local nx, ny, nz, dist = Trace(pawn, origin, finish, S.channel, radius, nil)
+    local nx, ny, nz, dist = Trace(pawn, start, finish, S.channel, radius, nil)
     if nx == nil then return nil end
     -- A sweep's Distance is how far the sphere's CENTRE travelled; the
     -- surface it touched is one radius further on.
@@ -656,8 +658,8 @@ end
 
 -- The capsule check. Because the swept radius IS the player's radius, the
 -- sweep distance is the clearance from the player's surface: gap = Distance.
-local function CapsuleSweepAhead(pawn, direction, maxGap)
-    local origin = GetLoc(pawn)
+local function CapsuleSweepAhead(pawn, direction, maxGap, origin)
+    origin = origin or GetLoc(pawn)
     if origin == nil then return nil end
     local zc, half = CapsuleCheckExtent()
     local from = { X = origin.X, Y = origin.Y, Z = origin.Z + zc }
@@ -715,11 +717,11 @@ end
 -- the nearest reading (what a hold loop should chase); `centreGap` is the
 -- centre ray alone, the ray the component itself casts, and the one an
 -- attach is judged on.
-local function ProbeWallFan(pawn, direction, rayLength, maxGap)
+local function ProbeWallFan(pawn, direction, rayLength, maxGap, origin)
     local bestWall, centreGap = nil, nil
     local function ProbeAt(heightOffset)
         local wall = ClassifyWallHit(
-            TraceAlongDirection(pawn, direction, rayLength, heightOffset), maxGap)
+            TraceAlongDirection(pawn, direction, rayLength, heightOffset, 0, origin), maxGap)
         if wall == nil then return nil end
         if bestWall == nil or wall.gap < bestWall.gap then bestWall = wall end
         return wall
@@ -737,11 +739,11 @@ end
 -- The two tests that separate a wall from something merely in the way.
 -- Both probe along the APPROACH direction: "would the player, going this
 -- way, meet a face here".
-local function PassesWallShapeChecks(pawn, direction, reach)
+local function PassesWallShapeChecks(pawn, direction, reach, origin)
     local probeReach = reach + T.Detect.SLACK
     if T.Detect.REQUIRE_EYE then
         local eye = TraceAlongDirection(pawn, direction, probeReach,
-            S.halfH * T.Detect.EYE_OFFSET_FRAC, 0)
+            S.halfH * T.Detect.EYE_OFFSET_FRAC, 0, origin)
         if eye == nil then return false, "not at eye level (low obstacle)" end
         if eye.normalZ >= S.walkableZ then
             return false, string.format("walkable at eye level (normalZ %.2f)", eye.normalZ)
@@ -749,8 +751,8 @@ local function PassesWallShapeChecks(pawn, direction, reach)
     end
     if T.Detect.REQUIRE_WIDTH then
         local w = T.Detect.WIDTH_HALF
-        local left  = TraceAlongDirection(pawn, direction, probeReach, 0,  w)
-        local right = TraceAlongDirection(pawn, direction, probeReach, 0, -w)
+        local left  = TraceAlongDirection(pawn, direction, probeReach, 0,  w, origin)
+        local right = TraceAlongDirection(pawn, direction, probeReach, 0, -w, origin)
         if left == nil or right == nil then
             return false, string.format("too narrow (left %s, right %s)",
                 left and "hit" or "miss", right and "hit" or "miss")
@@ -768,7 +770,7 @@ local function WallInMovementPath(F, maxGap, useFan)
     local rayLength = S.radius + maxGap
     local hit, wall
     if UsingCapsuleCheck() then
-        hit = CapsuleSweepAhead(F.pawn, inputDirection, maxGap)
+        hit = CapsuleSweepAhead(F.pawn, inputDirection, maxGap, F.loc)
         if hit == nil then return nil, "capsule found nothing" end
         wall = ClassifyWallHit(hit, maxGap)
         if wall == nil then
@@ -778,10 +780,10 @@ local function WallInMovementPath(F, maxGap, useFan)
             return nil, "capsule hit unclassifiable"
         end
     elseif useFan then
-        wall = ProbeWallFan(F.pawn, inputDirection, rayLength, maxGap)
+        wall = ProbeWallFan(F.pawn, inputDirection, rayLength, maxGap, F.loc)
         if wall == nil then return nil, "fan found no climbable face" end
     else
-        hit = TraceAlongDirection(F.pawn, inputDirection, rayLength, 0)
+        hit = TraceAlongDirection(F.pawn, inputDirection, rayLength, 0, 0, F.loc)
         if hit == nil then return nil, "ray missed" end
         wall = ClassifyWallHit(hit, maxGap)
         if wall == nil then
@@ -802,7 +804,7 @@ local function WallInMovementPath(F, maxGap, useFan)
             math.deg(math.acos(Clamp(alignment, -1, 1))))
     end
 
-    local shapeOk, shapeWhy = PassesWallShapeChecks(F.pawn, inputDirection, rayLength)
+    local shapeOk, shapeWhy = PassesWallShapeChecks(F.pawn, inputDirection, rayLength, F.loc)
     if not shapeOk then return nil, shapeWhy end
     return wall
 end
@@ -810,13 +812,13 @@ end
 -- Three rays in a fan around the leap's facing; the best hit or nil.
 -- Returns { normalX, normalY, gap, rayAngle }: a non-zero rayAngle means the
 -- face is off to that side, which is what identifies a corner.
-local function SenseWall(pawn, wallFacing, leapSideSign)
+local function SenseWall(pawn, wallFacing, leapSideSign, origin)
     local bestHit, bestScore = nil, math.huge
     local function CastRay(angleDeg)
         local a = math.rad(angleDeg)
         local dir = { X = wallFacing.X * math.cos(a) - wallFacing.Y * math.sin(a),
                       Y = wallFacing.X * math.sin(a) + wallFacing.Y * math.cos(a) }
-        local hit = TraceAlongDirection(pawn, dir, T.Leap.RAY_LEN, 0)
+        local hit = TraceAlongDirection(pawn, dir, T.Leap.RAY_LEN, 0, 0, origin)
         if hit == nil then return end
         -- The ray angled toward the leap's travel side sees corners first,
         -- so it wins near-ties.
@@ -837,12 +839,12 @@ end
 
 -- Is the face about to end just above us? Low ray still finds it, high ray
 -- finds nothing: that difference is the lip.
-local function SenseTopEdge(pawn, faceDir)
+local function SenseTopEdge(pawn, faceDir, origin)
     local reach = S.radius + T.TopOut.MAX_GAP
-    local low = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.LOW_OFFSET)
+    local low = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.LOW_OFFSET, 0, origin)
     if low == nil or low.gap > T.TopOut.MAX_GAP then return false end
     if low.normalZ >= S.walkableZ then return false end   -- a slope rolling over, not a lip
-    local high = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.HIGH_OFFSET)
+    local high = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.HIGH_OFFSET, 0, origin)
     return high == nil
 end
 
@@ -850,8 +852,8 @@ end
 -- 7. STATES
 -- Each mode is { enter(F, from, payload), tick(F) -> next, why, payload | nil,
 -- exit(F, to, why) }. Ticks read the Frame and never re-read the game for
--- what the Frame already holds. RefreshModes re-reads the movement mode
--- after this file's own writes, the only reads that can change mid-tick.
+-- what the Frame already holds. ReadModes re-reads the movement mode after
+-- this file's own writes, the only reads that can change mid-tick.
 -- =========================================================================
 
 local function ReadModes(F)
@@ -862,20 +864,27 @@ local function ReadModes(F)
     F.isFalling  = (F.mode == 3)
 end
 
+local function rawVz(c) return c.Velocity.Z end
 local function ReadFrame(pawn, cmc, dt)
     local F = { pawn = pawn, cmc = cmc, dt = dt }
     ReadModes(F)
-    local vel = ReadOpt(cmc, "Velocity")
-    F.vz    = ReadOpt(vel, "Z") or 0
+    local okVz, vz = pcall(rawVz, cmc)
+    F.vz    = (okVz and type(vz) == "number") and vz or 0
     F.loc   = GetLoc(pawn)
     F.input = GetInputDirection(cmc)
     F.atTop = IsLive(S.comp) and ReadOpt(S.comp, "UpAtTopMode") == true
     return F
 end
 
+-- This frame's height, from the Frame. Only the slide moves the pawn
+-- mid-tick, and it re-reads for itself.
 local function GetZ(F)
-    local loc = GetLoc(F.pawn)
-    return loc and loc.Z or (F.loc and F.loc.Z) or 0
+    return F.loc and F.loc.Z or 0
+end
+
+local function GetLocZ(pawn)
+    local loc = GetLoc(pawn)
+    return loc and loc.Z or nil
 end
 
 -- Writes the component into its organic post-attach signature and forces
@@ -943,6 +952,9 @@ States[Mode.IDLE] = {
         end
         local rising = F.isFalling and F.vz >= T.Guard.RISE_VZ_MIN
         if not (F.isWalking or rising) then return nil end
+        -- Without a component to hand the wall to, a hop would spend the
+        -- player's jump for nothing.
+        if not IsLive(S.comp) then return nil end
 
         local wall = WallInMovementPath(F, T.Guard.REACH, false)
         if wall == nil then return nil end
@@ -1125,7 +1137,7 @@ States[Mode.ASCENT] = {
 
         -- Tracks well past grab range so the hold loop can pull a drifting
         -- ascent back in instead of losing the face.
-        local wall = ProbeWallFan(F.pawn, a.faceDir, S.radius + T.Guard.REACH, T.Guard.REACH)
+        local wall = ProbeWallFan(F.pawn, a.faceDir, S.radius + T.Guard.REACH, T.Guard.REACH, F.loc)
         if wall == nil then
             a.framesWithoutWall = a.framesWithoutWall + 1
             a.inVel = 0
@@ -1209,11 +1221,12 @@ end
 local function SlideTick(F)
     local s = S.slide
     local deltaZ = s.v * F.dt
-    local z0 = GetZ(F)
+    local z0 = GetLocZ(F.pawn)
     local ok = CallOpt(F.pawn, "K2_AddActorWorldOffset", { X = 0, Y = 0, Z = -deltaZ }, true, {}, false)
     if not ok then SlideEnd(F, "K2_AddActorWorldOffset call failed") return end
-    if deltaZ > 0.5 then
-        local moved = z0 - GetZ(F)
+    local z1 = GetLocZ(F.pawn)
+    if deltaZ > 0.5 and z0 ~= nil and z1 ~= nil then
+        local moved = z0 - z1
         if moved < deltaZ * T.Slide.BLOCK_RATIO then
             SlideEnd(F, string.format("blocked (commanded %.1f, moved %.1f)", deltaZ, moved))
             return
@@ -1252,9 +1265,9 @@ local function LatchWatchTick(F)
 
     local face
     if UsingCapsuleCheck() then
-        face = CapsuleSweepAhead(F.pawn, w.faceDir, T.Detect.ATTACH_GAP)
+        face = CapsuleSweepAhead(F.pawn, w.faceDir, T.Detect.ATTACH_GAP, F.loc)
     else
-        face = TraceAlongDirection(F.pawn, w.faceDir, S.radius + T.Detect.ATTACH_GAP, 0)
+        face = TraceAlongDirection(F.pawn, w.faceDir, S.radius + T.Detect.ATTACH_GAP, 0, 0, F.loc)
     end
     if face == nil or face.gap > T.Detect.ATTACH_GAP then S.watch = nil return false end
 
@@ -1308,17 +1321,22 @@ States[Mode.LATCHED] = {
             return Mode.LEAP, "jump: " .. bucket, { bucket = bucket, sign = sign }
         end
 
-        if not F.isClimbing and not LatchWatchTick(F) then
+        -- The watch runs every frame so it expires while the latch holds;
+        -- a drop it answers leaves the pawn climbing again.
+        local answered = LatchWatchTick(F)
+        if not F.isClimbing and not answered then
             return Mode.IDLE, "left climb mode"
         end
         if F.atTop then return Mode.VAULT, "component vault" end
 
+        -- This frame's facing first: the stick is decomposed against it, and
+        -- the jump classifier and the leap's initial facing read it later.
+        local fwd = WallFwd(F.pawn)
+        if fwd ~= nil then S.prev.wallFwd = fwd end
+
         ApplyRawClimbInput(F)
         if S.slide ~= nil then SlideTick(F) end
 
-        -- Cached for the jump classifier and the leap's initial facing.
-        local fwd = WallFwd(F.pawn)
-        if fwd ~= nil then S.prev.wallFwd = fwd end
         local along, up = Input.GetStick()
         S.prev.alongWall, S.prev.upward = along, up
         if along > 0 then S.prev.sideSign = 1 elseif along < 0 then S.prev.sideSign = -1 end
@@ -1408,7 +1426,7 @@ States[Mode.LEAP] = {
         if not F.isFalling then return Mode.IDLE, "leap ended: not falling" end
 
         -- Catch the top-out before anything else, while rising only.
-        if T.TopOut.ENABLED and l.dirUp > 0 and SenseTopEdge(F.pawn, l.faceDir) then
+        if T.TopOut.ENABLED and l.dirUp > 0 and SenseTopEdge(F.pawn, l.faceDir, F.loc) then
             if ForceAttach(F) then
                 dbg("top-out caught mid-leap")
                 return Mode.LATCHED, "top-out"
@@ -1417,7 +1435,7 @@ States[Mode.LEAP] = {
 
         local inWindow  = l.deltaTime < l.driveTime + T.Leap.ATTACH_WINDOW
         local atAttach  = l.deltaTime >= l.driveTime
-        local hit = SenseWall(F.pawn, l.faceDir, l.dirSide)
+        local hit = SenseWall(F.pawn, l.faceDir, l.dirSide, F.loc)
 
         if inWindow then
             WriteOpt(F.cmc, "GravityScale", 0.0)

@@ -509,5 +509,41 @@ do
 end
 
 -- =========================================================================
+print("\n[11] The latch watch expires while the latch holds")
+-- The watch guards a FORCED latch for a short window. It has to count that
+-- window down while the pawn is climbing, or a legitimate exit any time
+-- later -- the component ending the climb with the face still in reach --
+-- would be read as a drop and forced back onto the wall.
+-- =========================================================================
+do
+    local Climb = H.LoadClimb(CLIMB)
+    local w = H.MakeWorld(Wall(0, 0), { startX = 60, startZ = 0, forwardRay = 80 })
+    H.setWorld(w)
+    Climb.OnPlayerCached(w.pawn, w.cmc)
+
+    local dt, dir = 1 / 60, { X = 1, Y = 0, Z = 0 }
+    local latched = false
+    for _ = 1, 240 do
+        pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+        if w.cmc.MovementMode == 6 and w.cmc.CustomMovementMode == 5 then latched = true break end
+        H.Step(w, dt, dir)
+    end
+    -- Hold well past the watch window.
+    for _ = 1, 45 do pcall(Climb.OnTick, dt, w.pawn, w.cmc); H.Step(w, dt, dir) end
+
+    -- The game ends the climb: falling from rest, face still in reach.
+    w.cmc.MovementMode, w.cmc.CustomMovementMode = 3, 0
+    w.cmc.Velocity.Z = 0
+    w.climbComp.IsClimbing = false
+    pcall(Climb.OnTick, dt, w.pawn, w.cmc)
+
+    Check("latched through our sequence first", latched, "never latched")
+    Check("an exit after the watch window is respected",
+          w.cmc.MovementMode == 3 and Climb.Mode == "IDLE",
+          string.format("mode=%d/%d state=%s -- the expired watch re-forced the latch",
+              w.cmc.MovementMode, w.cmc.CustomMovementMode, tostring(Climb.Mode)))
+end
+
+-- =========================================================================
 print(string.format("\n%d/%d checks passed", checks - failures, checks))
 os.exit(failures == 0 and 0 or 1)
