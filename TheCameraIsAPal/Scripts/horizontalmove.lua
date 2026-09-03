@@ -111,8 +111,8 @@ local LAUNCH_FRAC_WALK = 0.51   -- 51% of the sprint launch
 -- Both target DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
 -- come from the montage assets themselves.
 local SKID_MONTAGES = {
-    sprint = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_FlipBwd.AM_Player_Female_FlipBwd",
-    walk   = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_RollFwd.AM_Player_Female_RollFwd",
+    sprint = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AS_Player_Female_QuickTurn.AS_Player_Female_QuickTurn",
+    walk   = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AS_Player_Female_QuickTurn.AS_Player_Female_QuickTurn",
 }
 
 -- ---- debug ----
@@ -842,6 +842,20 @@ end)
 -- 12. LIFECYCLE
 -- =========================================================================
 
+-- Load Assets
+local function GetSkidAsset(class)
+    local asset = skidAssetCache[class]
+    if asset and asset:IsValid() then return asset end
+    asset = StaticFindObject(SKID_MONTAGES[class])
+    if not (asset and asset:IsValid()) then
+        asset = nil
+        pcall(function() asset = LoadAsset(SKID_MONTAGES[class]) end)
+        if asset and not asset:IsValid() then asset = nil end
+    end
+    skidAssetCache[class] = asset
+    return asset
+end
+
 function M.OnPlayerCached(pawn, cmc)
     moveInputLocked = false
     
@@ -945,6 +959,15 @@ function M.OnPlayerCached(pawn, cmc)
         tostring(ReadOpt(cmc, "AirControlBoostMultiplier")),
         tostring(ReadOpt(cmc, "AirControlBoostVelocityThreshold")),
         tostring(ReadOpt(cmc, "FallingLateralFriction")))
+
+    -- Preload skid clips (game thread here; sync load hitch happens
+    -- at spawn instead of mid-skid)
+    for class in pairs(SKID_MONTAGES) do
+        GetSkidAsset(class)
+        if skidAssetCache[class] == nil then
+            dbg("skid asset failed to load: %s", SKID_MONTAGES[class])
+        end
+    end
 end
 
 -- A deceleration no braking path can produce while input is held means the
