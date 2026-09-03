@@ -33,13 +33,16 @@ local DEBUG_FRAME = false
 -- produced none of them.
 local DEBUG_DISCOVERY = true
 
--- The function dump is a one-time question that has been answered (the class
--- exposes CanClimbingStart, StartClimbing, ClimbingMainUpdate, CheckClimbingMode,
--- DelayCanClimbing, ForceCancelClimb, GroundCheck, and the CenterRayCast /
--- UpRayCast / SideRayCast / DiagonalRayCast family). Off by default: it costs
--- a startup hitch and walks object graph edges that must each be IsValid()
--- checked, which is where a crash-on-load came from once already.
-local DEBUG_DUMP_FUNCTIONS = false
+-- Deeper one-shot investigations (class function dump, tick-order sampling,
+-- CanClimbingStart observation, trace-struct check) live in
+-- climb_discover.lua. Off by default: their questions are answered, and the
+-- function dump costs a startup hitch.
+local DEBUG_DISCOVERY_DEEP = false
+local Discover = nil
+if DEBUG_DISCOVERY_DEEP then
+    local okD, mod = pcall(require, "climb_discover")
+    if okD then Discover = mod end
+end
 
 -- Frames between init-climb wall probes. 1 = every frame (original
 -- behaviour). Each LineTraceSingle costs three UE4SS
@@ -309,8 +312,6 @@ local HOP_VZ    = 620
 local HOP_OUT   = 300
 local HOP_LOCK  = 0.20
 
-local LOCK_ROTATION = true
-
 
 -- ---- hug closed-loop (facing + distance hold) ----
 local HUG_TARGET     = 5      -- uu gap to hold (matches observed ~55 rest)
@@ -366,7 +367,6 @@ local prevWallFwd    = { X = 1, Y = 0 }
 local prevClimbInputAlongWall = 0
 local prevClimbInputUpward = 0
 local prevAtTopAnimPlaying = false
-local prevClimbZ     = nil
 
 -- ---- slide state ----
 local slidingDownWall        = false
@@ -411,24 +411,6 @@ local lastGroundCheck = nil
 -- chunk, and they are one thing anyway: read-only instrumentation.
 local Diag = {}
 
--- ---- tick-order diagnostic (read-only) ----
--- Everything currently runs off BP_PalPlayerController_C:ReceiveTick. The
--- controller and the climbing component both tick in TG_PrePhysics, and
--- within a tick group UE orders nothing unless a prerequisite says so -- so
--- which runs first is decided by registration order and can differ between
--- sessions, respawns, or streaming states. That is enough on its own to make
--- the same wall behave differently on different runs, and no tuning value
--- here can fix it.
---
--- These sample whether the component's tick is even hookable, and if so
--- whether it lands before or after our controller tick. Answering that is
--- the prerequisite for moving the grab decision onto the component's tick.
-Diag.compTickHookAlive   = false
-Diag.compTickedBeforeUs  = false
-Diag.tickOrderBefore     = 0
-Diag.tickOrderAfter      = 0
-Diag.tickOrderSamples    = 0
-Diag.compTicks           = 0   -- engine ticks a component once per frame
 -- ---- teleport watchdog ----
 -- This file writes movement modes, velocities and component flags, and any of
 -- those can hand the pawn to game code that relocates it. A displacement this
@@ -468,27 +450,6 @@ Diag.seqStarts, Diag.seqEnds = 0, 0
 -- Restoring that left the character unable to turn after every climb.
 local defaultOrientToMovement = nil
 local orientOverridden        = false
-
-Diag.grabWasClimbingPre  = false
-Diag.grabInsideTick      = 0
-
--- ---- CanClimbingStart gate ----
--- The component's own predicate for "may a climb begin". Holding CanClimbing
--- off across a whole 130uu approach is a blunt instrument: it suppresses
--- legitimate climbing over a wide area and needs the guard-arming state
--- machine to decide when to stop. Vetoing this one call instead is
--- per-decision and needs no area at all.
---
--- Off until a session proves the hook fires and the return slot is what this
--- assumes -- the last vararg, same shape GroundCheck already relies on.
--- Enabling it before that is how the last two regressions happened.
-Diag.CANSTART_VETO_ENABLED = false
-Diag.canStartFires     = 0
-Diag.canStartVetoes    = 0
-Diag.canStartLogged    = 0
-Diag.CANSTART_LOG_MAX  = 8
-Diag.TICK_ORDER_SAMPLE_MAX = 240   -- ~4s at 60fps, then it goes quiet
-
 
 
 -- =========================================================================
@@ -1217,7 +1178,7 @@ local function SetHorizVel(cmc, x, y)
 end
 
 local function FaceYaw(pawn, faceDir)
-    if not LOCK_ROTATION or faceDir == nil then return end
+    if faceDir == nil then return end
     local yaw = math.deg(math.atan(faceDir.Y, faceDir.X))
     pcall(function()
         pawn:K2_SetActorRotation({ Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
@@ -2043,33 +2004,6 @@ local function TrackWallSurface(dt, pawn, cmc, wallHit)
     return true
 end
 
--- One-shot out-struct characterization: a floor's normal is +1.00 by
--- definition, distinguishing a populated normal from a zero-init struct
--- (vertical walls cannot). Runs once per pawn.
-local function CharacterizeTraceStruct(pawn)
-    if not IsLive(KSL) then
-        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
-        if not IsLive(KSL) then return end
-    end
-    local l = GetLoc(pawn)
-    if l == nil then return end
-    local out, hit = {}, nil
-    local ok = pcall(function()
-        hit = KSL:LineTraceSingle(pawn, l,
-            { X = l.X, Y = l.Y, Z = l.Z - 200 },
-            ReadOpt(comp, "Const_RayChannel") or 0, false, {},
-            0, out, true,
-            { R = 1.0, G = 0.0, B = 0.0, A = 1.0 },
-            { R = 0.0, G = 1.0, B = 0.0, A = 1.0 }, 0.0)
-    end)
-    if not ok then dbg("floor trace: call failed") return end
-    local nz, dist = "?", "?"
-    pcall(function() nz   = string.format("%+.2f", out.ImpactNormal.Z) end)
-    pcall(function() dist = string.format("%.1f", out.Distance) end)
-    dbg("floor trace: hit=%s dist=%s normalZ=%s  (+1.00 = normals live, "
-        .. "+0.00 = struct dead)", tostring(hit), dist, nz)
-end
-
 local function BeginWallHugLeap(pawn, cmc, bucket, sideSign)
     local ang  = math.rad(LEAP_ANGLES[bucket])
     local mean = LEAP_SPEED_START / 6 + 5 * LEAP_SPEED_END / 6
@@ -2362,166 +2296,18 @@ local function RegisterComponentHooks()
     ddbg("hook GroundCheck: %s",
         okGnd and "registered" or ("FAILED: " .. tostring(errGnd)))
 
-    -- DIAGNOSTIC ONLY -- changes no behaviour.
-    --
-    -- ReceiveTick is UActorComponent's BlueprintImplementableEvent "Tick".
-    -- It is only a hookable UFunction-with-script if this Blueprint actually
-    -- implements an Event Tick node; if the climb logic lives in native
-    -- UPalClimbingComponent::TickComponent then there is nothing here to
-    -- hook at all, because a C++ virtual never crosses ProcessEvent.
-    -- Registering against the BP class path (never the /Script/Engine base,
-    -- which would fire for every component in the world) answers that.
+    -- ReceiveTick pre-hook: the only point in the frame provably ahead of the
+    -- component's own logic (measured: component tick before our controller
+    -- tick on 240/240 frames). A suppression written here lands THIS frame.
     local okTick, errTick = pcall(function()
-        RegisterHook(clsPath .. ":ReceiveTick",
-            -- PRE: the only point in the frame that is provably ahead of the
-            -- component's own logic. Measured: component tick before our
-            -- controller tick on 240/240 frames, so this is where a
-            -- suppression has to be written to matter this frame.
-            function(Context)
-                if not IsOurComponent(Context) then return end
-                Diag.compTickHookAlive  = true
-                Diag.compTickedBeforeUs = true
-                Diag.compTicks          = Diag.compTicks + 1
-                Diag.grabWasClimbingPre = ReadOpt(comp, "IsClimbing") == true
-                ApplyClimbSuppression()
-            end,
-            -- POST: did the component decide to grab inside this call? A
-            -- false->true flip across the pre/post boundary proves the grab
-            -- happens AFTER the BP tick and can therefore be pre-empted from
-            -- the pre-hook. Zero flips would mean the decision lives in
-            -- native TickComponent ahead of ReceiveTick, and suppressing from
-            -- here is still a frame late.
-            function(Context)
-                if not IsOurComponent(Context) then return end
-                local nowClimbing = ReadOpt(comp, "IsClimbing") == true
-                if nowClimbing and not Diag.grabWasClimbingPre then
-                    Diag.grabInsideTick = Diag.grabInsideTick + 1
-                    if Diag.grabInsideTick <= 3 then
-                        ddbg("GRAB WINDOW: component went IsClimbing "
-                            .. "false->true INSIDE its own BP tick (#%d) -- "
-                            .. "a pre-hook suppression lands before it",
-                            Diag.grabInsideTick)
-                    end
-                end
-            end)
+        RegisterHook(clsPath .. ":ReceiveTick", function(Context)
+            if not IsOurComponent(Context) then return end
+            ApplyClimbSuppression()
+        end)
     end)
     ddbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native "
         .. "and the grab decision cannot be pre-empted this way",
         okTick and "registered" or ("FAILED: " .. tostring(errTick)))
-
-    -- CanClimbingStart: the component's own "may a climb begin" predicate,
-    -- and the surgical alternative to holding CanClimbing off across an
-    -- entire approach. Post-hook because a return value only exists after
-    -- execution -- NoOp pre-slot, same shape GroundCheck uses.
-    --
-    -- This pass LOGS the call shape and only vetoes when Diag.CANSTART_VETO_ENABLED
-    -- is set, because "the last vararg is the return value" is an assumption
-    -- about this function's signature, not a fact. argc is logged so the shape
-    -- can be read off a session before anything relies on it.
-    local okStart, errStart = pcall(function()
-        RegisterHook(clsPath .. ":CanClimbingStart", NoOp, function(Context, ...)
-            if not IsOurComponent(Context) then return end
-            Diag.canStartFires = Diag.canStartFires + 1
-
-            local args = { ... }
-            local argc = #args
-            local ret  = nil
-            if argc > 0 then
-                pcall(function() ret = args[argc]:get() end)
-            end
-
-            -- Veto only while the guard actually wants this wall. Outside
-            -- that, the component's own answer stands untouched.
-            local vetoed = false
-            if Diag.CANSTART_VETO_ENABLED and wantClimbSuppressed and argc > 0 then
-                vetoed = pcall(function() args[argc]:set(false) end)
-                if vetoed then Diag.canStartVetoes = Diag.canStartVetoes + 1 end
-            end
-
-            if Diag.canStartLogged < Diag.CANSTART_LOG_MAX then
-                Diag.canStartLogged = Diag.canStartLogged + 1
-                ddbg("CanClimbingStart #%d: argc=%d ret=%s (%s) "
-                    .. "wantSuppressed=%s vetoed=%s",
-                    Diag.canStartFires, argc, tostring(ret), type(ret),
-                    tostring(wantClimbSuppressed), tostring(vetoed))
-            end
-        end)
-    end)
-    ddbg("hook CanClimbingStart: %s  (veto %s)",
-        okStart and "registered" or ("FAILED: " .. tostring(errStart)),
-        Diag.CANSTART_VETO_ENABLED and "ARMED" or "observing only")
-
-    -- One-shot dump of the component's own BP functions. GroundCheck and
-    -- ClimbUpAtTopEvent were found by hand; if one of the others IS the grab
-    -- decision, pre-hooking that is far more surgical than a tick hook and
-    -- would let the suppression be conditional instead of held across a
-    -- whole approach.
-    -- Dumping the class's functions answered what the component exposes, so
-    -- this is OFF by default now: the answer is recorded in the notes above
-    -- and re-running it costs a startup hitch for nothing.
-    --
-    -- It is also where a crash-on-load came from. The first version walked
-    -- the SuperStruct chain with only a `parent ~= nil` guard. Past
-    -- /Script/CoreUObject.Object, GetSuperStruct returns a NON-NIL but
-    -- INVALID wrapper (it printed as "nil" because GetFullName gave nothing),
-    -- and dereferencing that took a native access violation. pcall does not
-    -- protect against those -- FindClimbingComponent says exactly this a few
-    -- hundred lines up, and every dereference has to be IsValid()-checked
-    -- individually. So: IsLive() before every single dereference, and the
-    -- walk stops the moment a link fails to validate.
-    if DEBUG_DUMP_FUNCTIONS then
-        local function DumpFunctions(cls, label)
-            if not IsLive(cls) then
-                ddbg("  [%s] not a live object -- skipped", label)
-                return false
-            end
-            local seen, named = 0, 0
-            local okEach = pcall(function()
-                cls:ForEachFunction(function(fn)
-                    seen = seen + 1
-                    local n = nil
-                    pcall(function() n = fn:GetFullName() end)
-                    if n == nil then pcall(function() n = fn:GetName() end) end
-                    if n ~= nil then
-                        named = named + 1
-                        ddbg("  [%s] fn: %s", label, tostring(n))
-                    end
-                end)
-            end)
-            ddbg("  [%s] ForEachFunction: callable=%s visited=%d named=%d",
-                label, tostring(okEach), seen, named)
-            return okEach
-        end
-
-        pcall(function()
-            ddbg("---- functions on %s ----", clsPath)
-            local cls = comp:GetClass()
-            if not IsLive(cls) then return end
-            DumpFunctions(cls, "class")
-
-            local parent, depth = nil, 0
-            pcall(function() parent = cls:GetSuperStruct() end)
-            while IsLive(parent) and depth < 4 do
-                local pname = nil
-                pcall(function() pname = parent:GetFullName() end)
-                -- An unreadable name means the wrapper is not a real live
-                -- UStruct: stop rather than touch it again.
-                if type(pname) ~= "string" then
-                    ddbg("  -- super[%d]: unreadable, stopping walk", depth)
-                    break
-                end
-                ddbg("  -- super[%d]: %s", depth, pname)
-                DumpFunctions(parent, "super" .. depth)
-
-                local nxt = nil
-                pcall(function() nxt = parent:GetSuperStruct() end)
-                if not IsLive(nxt) then break end
-                parent = nxt
-                depth = depth + 1
-            end
-            ddbg("---- end functions ----")
-        end)
-    end
 
     -- Signatures of the component's own entry/exit functions, read from the
     -- UFunction objects without calling anything. Decides whether
@@ -2586,7 +2372,6 @@ function M.OnPlayerCached(pawn, cmc)
     walkableFloorZ = ReadOpt(cmc, "WalkableFloorZ") or WALKABLE_FLOOR_Z_FALLBACK
     initClimbState     = nil
     M.InInitClimbState = false
-    prevClimbZ     = nil
     wantClimbSuppressed = false   -- fresh component, fresh flags
     climbSuppressionHeld = false
     approachGuardArmed  = false
@@ -2594,11 +2379,6 @@ function M.OnPlayerCached(pawn, cmc)
     guardArmedTime      = 0
     guardCooldown       = 0
     guardGiveUps        = 0
-    Diag.compTickedBeforeUs  = false
-    Diag.tickOrderBefore, Diag.tickOrderAfter, Diag.tickOrderSamples = 0, 0, 0
-    Diag.compTicks           = 0
-    Diag.grabWasClimbingPre  = false
-    Diag.grabInsideTick      = 0
     Diag.teleportLastLoc     = nil
     Diag.teleportReports     = 0
     orientOverridden         = false
@@ -2607,7 +2387,6 @@ function M.OnPlayerCached(pawn, cmc)
     Diag.capsuleTraceOk = nil
     Diag.latchLogged    = 0
     Latch.watch         = nil
-    Diag.canStartFires, Diag.canStartVetoes, Diag.canStartLogged = 0, 0, 0
     ReleaseAllMoveInput(pawn)
 
     pcall(function()
@@ -2640,8 +2419,13 @@ function M.OnPlayerCached(pawn, cmc)
         ddbg("component props: fwdRay=%s rayChannel=%s (UNVERIFIED units/origin)",
             tostring(ReadOpt(comp, "Const_ForwardRayLength")),
             tostring(ReadOpt(comp, "Const_RayChannel")))
-        CharacterizeTraceStruct(pawn)
         RegisterComponentHooks()
+        if Discover ~= nil then
+            local clsPath = nil
+            pcall(function() clsPath = comp:GetClass():GetFullName():match("(%S+)$") end)
+            Discover.OnPlayerCached({ pawn = pawn, cmc = cmc, comp = comp,
+                compName = compName, clsPath = clsPath, log = ddbg })
+        end
     end
 end
 
@@ -2682,7 +2466,6 @@ local function CacheClimbFrame(pawn, cmc, inClimb, isClimbingAtTop)
         local stickAlongWall, stickUpward = Input.GetStick()
         prevClimbInputAlongWall = stickAlongWall
         prevClimbInputUpward    = stickUpward
-        prevClimbZ = GetZ(pawn)
     end
     prevModeWasClimb = inClimb
     prevAtTopAnimPlaying = isClimbingAtTop
@@ -2786,7 +2569,10 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
     -- the face. That ray is blind to anything recessed at capsule-centre
     -- height, and the fan was only ever reached AFTER it found something --
     -- so a lost face never got the second look that would have recovered it.
-    if wall == nil and approachGuardArmed and why ~= "no input held" then
+    -- The fan only exists on the line-probe path; in capsule mode the sweep
+    -- already spans the capsule's height and a second call repeats it.
+    if wall == nil and approachGuardArmed and why ~= "no input held"
+       and not UsingCapsuleCheck() then
         wall = WallInMovementPath(pawn, cmc, InitClimb.GUARD_GAP, true)
         if wall ~= nil then why = nil end
     end
@@ -2828,7 +2614,7 @@ local function TickApproachGuard(dt, pawn, cmc, isWalking)
     -- centre ray is blind to a face recessed at waist height but present at
     -- chest or shin height, and committing on that reading is the difference
     -- between latching and walking into the wall doing nothing.
-    if wall.gap <= commitGap * InitClimb.FAN_NEAR_MULT then
+    if wall.gap <= commitGap * InitClimb.FAN_NEAR_MULT and not UsingCapsuleCheck() then
         local fanned = WallInMovementPath(pawn, cmc, InitClimb.GUARD_GAP, true)
         if fanned ~= nil and fanned.gap < wall.gap then wall = fanned end
     end
@@ -2909,52 +2695,6 @@ local function TickInitClimbStart(dt, pawn, cmc, isWalking, isClimbing, isAtTop)
 end
 
 
--- Reads the flag the component's tick hook sets, then clears it, so each
--- controller tick learns whether the component ran ahead of it. Sampled for
--- a few seconds and then silent. A split result is the finding: it means the
--- order is not stable, and no probe range tuned from this file can fix that.
-local function SampleTickOrder()
-    if not DEBUG_DISCOVERY then return end
-    if not Diag.compTickHookAlive then return end
-    if Diag.tickOrderSamples >= Diag.TICK_ORDER_SAMPLE_MAX then return end
-
-    Diag.tickOrderSamples = Diag.tickOrderSamples + 1
-    if Diag.compTickedBeforeUs then
-        Diag.tickOrderBefore = Diag.tickOrderBefore + 1
-    else
-        Diag.tickOrderAfter = Diag.tickOrderAfter + 1
-    end
-    Diag.compTickedBeforeUs = false
-
-    if Diag.tickOrderSamples == Diag.TICK_ORDER_SAMPLE_MAX then
-        ddbg("TICK ORDER over %d of our ticks: component ran BEFORE us %d, "
-            .. "AFTER (or not at all) %d. A split means the order is not "
-            .. "stable, which on its own is enough to make the same wall "
-            .. "behave differently between runs.",
-            Diag.tickOrderSamples, Diag.tickOrderBefore, Diag.tickOrderAfter)
-
-        -- The engine ticks a component exactly once per frame, so the
-        -- component's count is a reference clock for real frames. Our tick
-        -- comes from a hook on the controller's ReceiveTick, and a session
-        -- log showed that function registered TWICE. If both registrations
-        -- are live, every subsystem runs twice per frame on the same dt --
-        -- and every duration in this file (airTime, LOCK_TIME, retry
-        -- intervals) then advances at double real time, which no amount of
-        -- tuning would explain away.
-        local ratio = Diag.compTicks > 0 and (Diag.tickOrderSamples / Diag.compTicks) or 0
-        ddbg("TICK RATIO: our ticks %d vs component ticks %d = %.2fx. "
-            .. "~1.0 is healthy; ~2.0 means the controller tick hook is "
-            .. "double-registered and every duration here runs at 2x.",
-            Diag.tickOrderSamples, Diag.compTicks, ratio)
-
-        ddbg("CanClimbingStart: %d calls in that window, %d vetoed. "
-            .. "0 calls means the organic grab does not route through it "
-            .. "and the veto cannot work; calls only while approaching a "
-            .. "face means it is the right lever.",
-            Diag.canStartFires, Diag.canStartVetoes)
-    end
-end
-
 -- Reports any single-frame displacement large enough to be a teleport,
 -- naming the state this file was in when it happened.
 local function WatchForTeleport(pawn, cmc)
@@ -2983,7 +2723,7 @@ local function WatchForTeleport(pawn, cmc)
 end
 
 function M.OnTick(dt, pawn, cmc)
-    SampleTickOrder()
+    if Discover ~= nil then Discover.OnTick() end
     if Diag.capsuleTraceOk == nil and WallDetect.SHAPE == "capsule"
        and (cmc.MovementMode == 1 or cmc.MovementMode == 2) then
         SelfTestCapsuleTrace(pawn)
