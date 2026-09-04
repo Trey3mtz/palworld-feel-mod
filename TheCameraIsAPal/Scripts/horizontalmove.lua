@@ -175,6 +175,14 @@ local function dbg(fmt, ...)
     if DEBUG then print(string.format("[PalFeel:hmove] " .. fmt .. "\n", ...)) end
 end
 
+-- Safe full-name read for diagnostics; unresolved pointers must print as a
+-- distinct token rather than erroring out of the surrounding log line.
+local function FullNameOf(obj)
+    if not (obj and obj:IsValid()) then return "<nil>" end
+    local ok, name = pcall(function() return obj:GetFullName() end)
+    return ok and name or "<unreadable>"
+end
+
 -- Read a property that may not exist under this exact name.
 -- NOTE: must not collapse a legitimate `false` to nil, or boolean-false
 -- states become indistinguishable from unreadable fields.
@@ -464,13 +472,56 @@ local function IsAnySkidPlaying(anim)
     return false
 end
 
+-- One-shot skeleton comparison. A montage whose Skeleton differs from the
+-- mesh's live skeleton is rejected by Montage_Play with no engine warning,
+-- so the two full names are printed side by side to make it visible.
+local function LogSkidSkeletons()
+    local mesh = cachedPawn and cachedPawn:IsValid() and cachedPawn.Mesh or nil
+    local meshSkeleton = nil
+    if mesh and mesh:IsValid() then
+        local skeletalMesh = ReadOpt(mesh, "SkeletalMesh")
+                          or ReadOpt(mesh, "SkinnedAsset")
+        if skeletalMesh and skeletalMesh:IsValid() then
+            meshSkeleton = ReadOpt(skeletalMesh, "Skeleton")
+        end
+    end
+    dbg("mesh skeleton: %s", FullNameOf(meshSkeleton))
+
+    for class in pairs(SKID_MONTAGES) do
+        local montage = GetSkidMontage(class)
+        dbg("montage %s: obj=%s skeleton=%s", class,
+            FullNameOf(montage),
+            FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
+    end
+end
+
 local function PlaySkidAnimation(class)
     local montage = GetSkidMontage(class)
-    if montage == nil then return end
+    if montage == nil then
+        dbg("skid play %s: montage not resolved (%s)", class, SKID_MONTAGES[class])
+        return
+    end
     local anim = ResolveAnimInstance()
-    if anim == nil then return end
+    if anim == nil then
+        dbg("skid play %s: no anim instance", class)
+        return
+    end
     if IsAnySkidPlaying(anim) then return end
-    pcall(function() anim:Montage_Play(montage, 1.0, 0, 0.0, true) end)
+    -- Montage_Play returns the montage length, or 0.0 when the montage is
+    -- rejected (incompatible skeleton, missing slot). Both are silent, so
+    -- the return value is the only signal separating them from a good play.
+    local played = 0.0
+    local ok = pcall(function()
+        played = anim:Montage_Play(montage, 1.0, 0, 0.0, true) or 0.0
+    end)
+    if not ok then
+        dbg("skid play %s: Montage_Play threw", class)
+    elseif played <= 0.0 then
+        dbg("skid play %s: Montage_Play REJECTED (returned 0) -- "
+            .. "skeleton mismatch or missing slot", class)
+    else
+        dbg("skid play %s: playing, length=%.3f", class, played)
+    end
 end
 
 -- =========================================================================
@@ -968,6 +1019,8 @@ function M.OnPlayerCached(pawn, cmc)
             dbg("skid asset failed to load: %s", SKID_MONTAGES[class])
         end
     end
+
+    LogSkidSkeletons()
 end
 
 -- A deceleration no braking path can produce while input is held means the
