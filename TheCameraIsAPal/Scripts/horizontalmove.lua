@@ -167,7 +167,7 @@ local prevSpd = nil
 local wallT   = 0
 
 -- ---- skid animation state ----
-local skidMontageCache = {}    -- class -> montage handle
+local skidMontageCache = {}    -- asset path -> montage handle
 
 -- =========================================================================
 -- 3. UTILITIES
@@ -316,20 +316,29 @@ end
 -- use so the graph reads the value the same frame it is set.
 -- =========================================================================
 
--- Sole loader for the skid clips. StaticFindObject only sees an object that
--- is already resident, so the LoadAsset fallback is what makes a play work
--- when the preload has not run (or ran before the pak mounted).
-local function GetSkidMontage(class)
-    local montage = skidMontageCache[class]
+-- Sole loader for the skid clips, keyed by asset path so classes sharing
+-- a clip share one lookup. A Lua handle is not a GC root, so a world
+-- reload can drop the montage between spawns: StaticFindObject re-finds it
+-- when resident, and LoadAsset is the fallback for when it is not.
+local function LoadSkidMontage(path)
+    local montage = skidMontageCache[path]
     if montage and montage:IsValid() then return montage end
-    montage = StaticFindObject(SKID_MONTAGES[class])
+    montage = StaticFindObject(path)
     if not (montage and montage:IsValid()) then
         montage = nil
-        pcall(function() montage = LoadAsset(SKID_MONTAGES[class]) end)
-        if montage and not montage:IsValid() then montage = nil end
+        local ok, err = pcall(function() montage = LoadAsset(path) end)
+        if not ok then
+            dbg("LoadAsset threw for %s: %s", path, tostring(err))
+        elseif montage and not montage:IsValid() then
+            montage = nil
+        end
     end
-    skidMontageCache[class] = montage
+    skidMontageCache[path] = montage
     return montage
+end
+
+local function GetSkidMontage(class)
+    return LoadSkidMontage(SKID_MONTAGES[class])
 end
 
 local function ResolveAnimInstance()
@@ -470,8 +479,7 @@ end
 -- Either variant still playing suppresses a new play: both live in
 -- DefaultGroup, so Montage_Play would cut the other mid-skid otherwise.
 local function IsAnySkidPlaying(anim)
-    for class in pairs(SKID_MONTAGES) do
-        local montage = skidMontageCache[class]
+    for _, montage in pairs(skidMontageCache) do
         if montage and montage:IsValid() then
             local playing = false
             pcall(function() playing = anim:Montage_IsPlaying(montage) end)
@@ -1006,11 +1014,17 @@ function M.OnPlayerCached(pawn, cmc)
         tostring(ReadOpt(cmc, "AirControlBoostVelocityThreshold")),
         tostring(ReadOpt(cmc, "FallingLateralFriction")))
 
-    -- Preload skid clips (game thread here; sync load hitch happens
-    -- at spawn instead of mid-skid)
-    for class in pairs(SKID_MONTAGES) do
-        if GetSkidMontage(class) == nil then
-            dbg("skid montage failed to load: %s", SKID_MONTAGES[class])
+    -- Preload skid clips, once per distinct asset. This runs on every
+    -- spawn and world reload by design: a reload GCs the montage, and this
+    -- is the first game-thread point where a sync load is acceptable. When
+    -- the clip is still resident it costs one StaticFindObject per path.
+    local seen = {}
+    for _, path in pairs(SKID_MONTAGES) do
+        if not seen[path] then
+            seen[path] = true
+            if LoadSkidMontage(path) == nil then
+                dbg("skid montage failed to load: %s", path)
+            end
         end
     end
 
