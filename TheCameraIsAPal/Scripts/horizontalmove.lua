@@ -107,12 +107,14 @@ local LAUNCH_FRAC      = 0.85   -- sprint-class
 local LAUNCH_FRAC_WALK = 0.51   -- 51% of the sprint launch
 
 -- ---- skid animation ----
--- PLACEHOLDER clips (resident dodge montages) until authored skids exist.
--- Both target DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
--- come from the montage assets themselves.
+-- Authored clip, shipped in TheJumpIsAPal_P.pak. Must be the AM_ montage,
+-- never the AS_ sequence it wraps: Montage_Play only accepts a UAnimMontage
+-- and silently no-ops on a sequence.
+-- Targets DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
+-- come from the montage asset itself.
 local SKID_MONTAGES = {
-    sprint = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AS_Player_Female_QuickTurn.AS_Player_Female_QuickTurn",
-    walk   = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AS_Player_Female_QuickTurn.AS_Player_Female_QuickTurn",
+    sprint = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
+    walk   = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
 }
 
 -- ---- debug ----
