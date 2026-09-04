@@ -317,9 +317,15 @@ end
 -- =========================================================================
 
 -- Sole loader for the skid clips, keyed by asset path so classes sharing
--- a clip share one lookup. A Lua handle is not a GC root, so a world
--- reload can drop the montage between spawns: StaticFindObject re-finds it
--- when resident, and LoadAsset is the fallback for when it is not.
+-- a clip share one lookup.
+--
+-- The clip is made resident by the BPModLoader ModActor, which holds a hard
+-- reference to it; BPModLoader spawns that actor on every map load, so the
+-- package is loaded and rooted for the life of the world and
+-- StaticFindObject hits. UE4SS LoadAsset is NOT a substitute: it resolves
+-- through the Asset Registry, which only knows the base game's
+-- AssetRegistry.bin, so for a mod pak asset it returns nil without loading.
+-- It stays as a fallback for assets that are in the registry.
 local function LoadSkidMontage(path)
     local montage = skidMontageCache[path]
     if montage and montage:IsValid() then return montage end
