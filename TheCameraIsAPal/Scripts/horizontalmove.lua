@@ -112,6 +112,8 @@ local LAUNCH_FRAC_WALK = 0.51   -- 51% of the sprint launch
 -- and silently no-ops on a sequence.
 -- Targets DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
 -- come from the montage asset itself.
+local SKID_ANIM_ENABLED = true   -- false: sliding turn runs, no montage plays
+
 local SKID_MONTAGES = {
     sprint = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
     walk   = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
@@ -519,6 +521,7 @@ local function LogSkidSkeletons(pawn)
 end
 
 local function PlaySkidAnimation(class)
+    if not SKID_ANIM_ENABLED then return end
     local montage = GetSkidMontage(class)
     if montage == nil then
         dbg("skid play %s: montage not resolved (%s)", class, SKID_MONTAGES[class])
@@ -1026,6 +1029,7 @@ function M.OnPlayerCached(pawn, cmc)
     -- the clip is still resident it costs one StaticFindObject per path.
     local seen = {}
     for _, path in pairs(SKID_MONTAGES) do
+        if not SKID_ANIM_ENABLED then break end
         if not seen[path] then
             seen[path] = true
             if LoadSkidMontage(path) == nil then
