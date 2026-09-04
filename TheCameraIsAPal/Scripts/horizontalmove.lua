@@ -316,11 +316,18 @@ end
 -- use so the graph reads the value the same frame it is set.
 -- =========================================================================
 
+-- Sole loader for the skid clips. StaticFindObject only sees an object that
+-- is already resident, so the LoadAsset fallback is what makes a play work
+-- when the preload has not run (or ran before the pak mounted).
 local function GetSkidMontage(class)
     local montage = skidMontageCache[class]
     if montage and montage:IsValid() then return montage end
     montage = StaticFindObject(SKID_MONTAGES[class])
-    if montage and not montage:IsValid() then montage = nil end
+    if not (montage and montage:IsValid()) then
+        montage = nil
+        pcall(function() montage = LoadAsset(SKID_MONTAGES[class]) end)
+        if montage and not montage:IsValid() then montage = nil end
+    end
     skidMontageCache[class] = montage
     return montage
 end
@@ -477,8 +484,8 @@ end
 -- One-shot skeleton comparison. A montage whose Skeleton differs from the
 -- mesh's live skeleton is rejected by Montage_Play with no engine warning,
 -- so the two full names are printed side by side to make it visible.
-local function LogSkidSkeletons()
-    local mesh = cachedPawn and cachedPawn:IsValid() and cachedPawn.Mesh or nil
+local function LogSkidSkeletons(pawn)
+    local mesh = pawn and pawn:IsValid() and pawn.Mesh or nil
     local meshSkeleton = nil
     if mesh and mesh:IsValid() then
         local skeletalMesh = ReadOpt(mesh, "SkeletalMesh")
@@ -895,20 +902,6 @@ end)
 -- 12. LIFECYCLE
 -- =========================================================================
 
--- Load Assets
-local function GetSkidAsset(class)
-    local asset = skidAssetCache[class]
-    if asset and asset:IsValid() then return asset end
-    asset = StaticFindObject(SKID_MONTAGES[class])
-    if not (asset and asset:IsValid()) then
-        asset = nil
-        pcall(function() asset = LoadAsset(SKID_MONTAGES[class]) end)
-        if asset and not asset:IsValid() then asset = nil end
-    end
-    skidAssetCache[class] = asset
-    return asset
-end
-
 function M.OnPlayerCached(pawn, cmc)
     moveInputLocked = false
     
@@ -1016,13 +1009,12 @@ function M.OnPlayerCached(pawn, cmc)
     -- Preload skid clips (game thread here; sync load hitch happens
     -- at spawn instead of mid-skid)
     for class in pairs(SKID_MONTAGES) do
-        GetSkidAsset(class)
-        if skidAssetCache[class] == nil then
-            dbg("skid asset failed to load: %s", SKID_MONTAGES[class])
+        if GetSkidMontage(class) == nil then
+            dbg("skid montage failed to load: %s", SKID_MONTAGES[class])
         end
     end
 
-    LogSkidSkeletons()
+    LogSkidSkeletons(pawn)
 end
 
 -- A deceleration no braking path can produce while input is held means the
