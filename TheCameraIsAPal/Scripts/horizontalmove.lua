@@ -115,8 +115,8 @@ local LAUNCH_FRAC_WALK = 0.51   -- 51% of the sprint launch
 local SKID_ANIM_ENABLED = true   -- false: sliding turn runs, no montage plays
 
 local SKID_MONTAGES = {
-    sprint = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
-    walk   = "/Game/Pal/Animation/Character/Player/Female/MoveMod/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
+    sprint = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
+    walk   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
 }
 
 -- ---- debug ----
@@ -125,6 +125,7 @@ local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
 local DEBUG_ANIM = true    -- IsWalking/IsSprint flips
 local DEBUG_CHANNELS = true -- lean-channel resting values, via the ABP hook
+local DEBUG_LEAN = false    -- per-tick lean flag dump (two lines every frame)
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -1103,10 +1104,11 @@ function M.OnTick(dt, pawn, cmc)
 
     CaptureGameWalkCap(cmc)
     AdvanceBuildupEase(dt, cmc)
-    local debugEnableLeaning  = ReadOpt(animInstance, "DebugEnableLeaning")
-    local forceDisableLeaning = ReadOpt(animInstance, "AnimNotifyForceDisableLeaning")
-    dbg("debugEnableLeaning: %s", debugEnableLeaning)
-    dbg("forceDisableLeaning: %s",forceDisableLeaning)
+    if DEBUG_LEAN then
+        dbg("debugEnableLeaning: %s  forceDisableLeaning: %s",
+            tostring(ReadOpt(animInstance, "DebugEnableLeaning")),
+            tostring(ReadOpt(animInstance, "AnimNotifyForceDisableLeaning")))
+    end
 end
 
 return M
