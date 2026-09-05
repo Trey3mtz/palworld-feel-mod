@@ -94,12 +94,27 @@ local TURN_COOLDOWN   = 0.35    -- s before another turn may trigger
 local PEAK_DECAY      = 300     -- uu/s^2 the tracked peak bleeds off
 local SKID_FN         = Easing.EaseOutQuad
 
-local SKID_TIME          = 0.25
+local SKID_TIME          = 0.32   -- s; the clip is half-turned at 0.32
 local SKID_END_PEAK_FRAC = 0.45   -- end speed as a fraction of tracked PEAK
 local SKID_END_FLOOR     = 150    -- uu/s absolute floor
 local LAUNCH_HOLD        = 0.20   -- s reasserting launch, so the write takes
 
-local PIVOT_TIME = 0.24                 -- s
+-- Facing during the turn. Two modes, chosen per turn by whether the skid
+-- montage actually started:
+--   montage playing : the clip turns the body 180 deg inside its own bones,
+--                     so the capsule must NOT rotate underneath it or the
+--                     two stack to 360. Instead the capsule yaw is snapped
+--                     to the launch heading in one frame at PIVOT_SNAP_TIME,
+--                     the moment the clip is fully round. The animated pose
+--                     then faces exactly where the new capsule forward
+--                     points, so the snap is invisible, and the montage
+--                     blend-out hands off to locomotion facing the same way.
+--                     The montage's blend-out must start at the same time:
+--                     BlendOut = length - PIVOT_SNAP_TIME (0.633 - 0.55 =
+--                     ~0.08 s) with Blend Out Trigger Time -1.
+--   no montage      : the capsule is eased over PIVOT_TIME as before.
+local PIVOT_SNAP_TIME = 0.55            -- s from trigger; clip fully turned
+local PIVOT_TIME = 0.24                 -- s, ease fallback (no montage)
 local PIVOT_FN   = Easing.EaseOutCirc   -- (from, to, alpha), like SKID_FN
 
 local SPRINT_PEAK      = 450    -- peak above this = sprint-class turn
@@ -164,6 +179,7 @@ local peakSpeed, turnCool = 0, 0
 local skidX, skidY, skidSpeed, skidEndSpeed = 0, 0, 0, 0
 local launchX, launchY, launchSpeed = 0, 0, 0
 local pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
+local pivotSnap, pivotDone = false, false   -- snap mode this turn; yaw applied
 
 -- ---- wall contact state ----
 local prevSpd = nil
@@ -521,19 +537,21 @@ local function LogSkidSkeletons(pawn)
     end
 end
 
+-- Returns true when the montage actually started, so the turn can choose
+-- its facing mode: snap when the clip carries the rotation, ease otherwise.
 local function PlaySkidAnimation(class)
-    if not SKID_ANIM_ENABLED then return end
+    if not SKID_ANIM_ENABLED then return false end
     local montage = GetSkidMontage(class)
     if montage == nil then
         dbg("skid play %s: montage not resolved (%s)", class, SKID_MONTAGES[class])
-        return
+        return false
     end
     local anim = ResolveAnimInstance()
     if anim == nil then
         dbg("skid play %s: no anim instance", class)
-        return
+        return false
     end
-    if IsAnySkidPlaying(anim) then return end
+    if IsAnySkidPlaying(anim) then return false end
     -- Montage_Play returns the montage length, or 0.0 when the montage is
     -- rejected (incompatible skeleton, missing slot). Both are silent, so
     -- the return value is the only signal separating them from a good play.
@@ -543,12 +561,14 @@ local function PlaySkidAnimation(class)
     end)
     if not ok then
         dbg("skid play %s: Montage_Play threw", class)
+        return false
     elseif played <= 0.0 then
         dbg("skid play %s: Montage_Play REJECTED (returned 0) -- "
             .. "skeleton mismatch or missing slot", class)
-    else
-        dbg("skid play %s: playing, length=%.3f", class, played)
+        return false
     end
+    dbg("skid play %s: playing, length=%.3f", class, played)
+    return true
 end
 
 -- =========================================================================
@@ -564,11 +584,21 @@ end
 -- keeps running instead of fighting this write.
 local function TickPivot(pawn)
     if not moveInputLocked then return end
+    if pivotDone then return end
     if not (pawn and pawn:IsValid()) then return end
 
-    local pivotAlpha = math.min(pivotT / PIVOT_TIME, 1.0)
-    local rotation   = pawn:K2_GetActorRotation()
-    rotation.Yaw     = PIVOT_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+    local rotation = pawn:K2_GetActorRotation()
+    if pivotSnap then
+        -- The clip is turning the body; leave the capsule alone until the
+        -- clip is fully round, then set the yaw in one frame.
+        if pivotT < PIVOT_SNAP_TIME then return end
+        rotation.Yaw = pivotTargetYaw
+        pivotDone    = true
+    else
+        local pivotAlpha = math.min(pivotT / PIVOT_TIME, 1.0)
+        rotation.Yaw = PIVOT_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+        pivotDone    = pivotAlpha >= 1.0
+    end
     pawn:K2_SetActorRotation(rotation, false)
 end
 
@@ -593,7 +623,8 @@ local function BeginTurn(f, dot, pawn)
         (sprintClass and LAUNCH_FRAC or LAUNCH_FRAC_WALK)
 
     LockMoveInput(pawn)
-    PlaySkidAnimation(sprintClass and "sprint" or "walk")
+    pivotSnap = PlaySkidAnimation(sprintClass and "sprint" or "walk")
+    pivotDone = false
 
     local currentRotation = pawn:K2_GetActorRotation()
     pivotT                = 0
@@ -624,10 +655,13 @@ end
 
 -- Reassert for a few frames so PhysCustom's per-frame decay cannot bleed
 -- the exit speed.
+-- Input stays locked until the facing is final as well: unlocking while
+-- the capsule still faces the old heading would let orient-to-movement
+-- start its own rotation and fight the snap.
 local function TickLaunchPhase(cmc, pawn)
     cmc.Velocity.X = launchX * launchSpeed
     cmc.Velocity.Y = launchY * launchSpeed
-    if turnT >= LAUNCH_HOLD then
+    if turnT >= LAUNCH_HOLD and pivotDone then
         phase, turnCool = PHASE_NONE, TURN_COOLDOWN
         UnlockMoveInput(pawn)
     end
@@ -639,6 +673,7 @@ local function RunCommittedTurn(dt, cmc, f, pawn)
     if not IsTurnCapableMode(f.mode, f.custom) then
         dbg("turn aborted: mode=%d/%d", f.mode, f.custom)
         phase, turnCool = PHASE_NONE, TURN_COOLDOWN
+        pivotDone = true
         UnlockMoveInput(pawn)
         return false
     end
@@ -944,6 +979,7 @@ function M.OnPlayerCached(pawn, cmc)
     -- shoves the new pawn along the dead pawn's stored direction.
     phase, turnT, turnCool, peakSpeed = PHASE_NONE, 0, 0, 0
     pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
+    pivotSnap, pivotDone = false, false
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
 
