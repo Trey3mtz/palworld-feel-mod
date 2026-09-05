@@ -113,8 +113,12 @@ local LAUNCH_HOLD        = 0.20   -- s reasserting launch, so the write takes
 --                     BlendOut = length - PIVOT_SNAP_TIME (0.633 - 0.55 =
 --                     ~0.08 s) with Blend Out Trigger Time -1.
 --   no montage      : the capsule is eased over PIVOT_TIME as before.
-local PIVOT_SNAP_TIME = 0.55            -- s from trigger; fallback if the
-                                        -- montage never reports blend-out
+local PIVOT_SNAP_POS  = 0.51            -- montage position (s) to snap at.
+                                        -- Must sit one frame BEFORE blend-out
+                                        -- starts (length - BlendOut), so the
+                                        -- capsule is already round when the
+                                        -- first blended frame renders.
+local PIVOT_SNAP_TIME = 0.60            -- s from trigger; fallback only
 local PIVOT_TIME = 0.24                 -- s, ease fallback (no montage)
 local PIVOT_FN   = Easing.EaseOutCirc   -- (from, to, alpha), like SKID_FN
 
@@ -515,21 +519,27 @@ local function TickPivot(pawn)
     local rotation = pawn:K2_GetActorRotation()
     if pivotSnap then
         -- The clip is turning the body; leave the capsule alone until the
-        -- clip is fully round, then set the yaw in one frame. "Fully round"
-        -- is read from the montage itself: Montage_IsPlaying drops to false
-        -- the frame blend-out begins, so the snap lands exactly where the
-        -- clip hands off, whatever BlendOut the cooked asset carries.
-        -- PIVOT_SNAP_TIME only guards against a montage that never reports.
-        local blendingOut = false
+        -- clip is nearly round, then set the yaw in one frame. Lua ticks
+        -- after this frame's animation was evaluated, so the snap must land
+        -- BEFORE blend-out begins: once the montage reports stopped the
+        -- first hand-off frame has already rendered against the old yaw
+        -- (one frame facing the wrong way). Read the clip position and
+        -- snap at PIVOT_SNAP_POS; the stopped flag and PIVOT_SNAP_TIME are
+        -- fallbacks only.
+        local why = nil
         local anim = ResolveAnimInstance()
         if anim and activeSkidMontage and activeSkidMontage:IsValid() then
             pcall(function()
-                blendingOut = not anim:Montage_IsPlaying(activeSkidMontage)
+                if not anim:Montage_IsPlaying(activeSkidMontage) then
+                    why = "montage stopped"
+                elseif anim:Montage_GetPosition(activeSkidMontage) >= PIVOT_SNAP_POS then
+                    why = "PIVOT_SNAP_POS"
+                end
             end)
         end
-        if not blendingOut and pivotT < PIVOT_SNAP_TIME then return end
-        dbg("pivot snap at t=%.3f (%s)", pivotT,
-            blendingOut and "montage blend-out" or "PIVOT_SNAP_TIME")
+        if why == nil and pivotT >= PIVOT_SNAP_TIME then why = "PIVOT_SNAP_TIME" end
+        if why == nil then return end
+        dbg("pivot snap at t=%.3f (%s)", pivotT, why)
         rotation.Yaw = pivotTargetYaw
         pivotDone    = true
     else
