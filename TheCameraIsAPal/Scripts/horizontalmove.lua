@@ -113,6 +113,16 @@ local LAUNCH_HOLD        = 0.20   -- s reasserting launch, so the write takes
 --                     BlendOut = length - PIVOT_SNAP_TIME (0.633 - 0.55 =
 --                     ~0.08 s) with Blend Out Trigger Time -1.
 --   no montage      : the capsule is eased over PIVOT_TIME as before.
+-- SKID_CLIP_ROOT_MOTION: the clip's heading lives on its root bone and the
+-- sequence has Enable Root Motion on, so the engine strips the turn from the
+-- rendered pose. The capsule then carries the whole turn, eased over
+-- PIVOT_CLIP_TIME (clip length minus blend-out) with PIVOT_CLIP_FN. This is
+-- the only stack-free arrangement: rotation in one place.
+-- false: legacy clip with the turn baked into pelvis; the capsule snaps at
+-- PIVOT_SNAP_POS (always shows a flip during blend-out).
+local SKID_CLIP_ROOT_MOTION = false
+local PIVOT_CLIP_TIME = 0.55
+local PIVOT_CLIP_FN   = Easing.EaseInOutSine
 local PIVOT_SNAP_POS  = 0.51            -- montage position (s) to snap at.
                                         -- Must sit one frame BEFORE blend-out
                                         -- starts (length - BlendOut), so the
@@ -517,7 +527,11 @@ local function TickPivot(pawn)
     if not (pawn and pawn:IsValid()) then return end
 
     local rotation = pawn:K2_GetActorRotation()
-    if pivotSnap then
+    if pivotSnap and SKID_CLIP_ROOT_MOTION then
+        local pivotAlpha = math.min(pivotT / PIVOT_CLIP_TIME, 1.0)
+        rotation.Yaw = PIVOT_CLIP_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+        pivotDone    = pivotAlpha >= 1.0
+    elseif pivotSnap then
         -- The clip is turning the body; leave the capsule alone until the
         -- clip is nearly round, then set the yaw in one frame. Lua ticks
         -- after this frame's animation was evaluated, so the snap must land
