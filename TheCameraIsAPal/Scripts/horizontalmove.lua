@@ -113,7 +113,8 @@ local LAUNCH_HOLD        = 0.20   -- s reasserting launch, so the write takes
 --                     BlendOut = length - PIVOT_SNAP_TIME (0.633 - 0.55 =
 --                     ~0.08 s) with Blend Out Trigger Time -1.
 --   no montage      : the capsule is eased over PIVOT_TIME as before.
-local PIVOT_SNAP_TIME = 0.55            -- s from trigger; clip fully turned
+local PIVOT_SNAP_TIME = 0.55            -- s from trigger; fallback if the
+                                        -- montage never reports blend-out
 local PIVOT_TIME = 0.24                 -- s, ease fallback (no montage)
 local PIVOT_FN   = Easing.EaseOutCirc   -- (from, to, alpha), like SKID_FN
 
@@ -178,6 +179,7 @@ local skidX, skidY, skidSpeed, skidEndSpeed = 0, 0, 0, 0
 local launchX, launchY, launchSpeed = 0, 0, 0
 local pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
 local pivotSnap, pivotDone = false, false   -- snap mode this turn; yaw applied
+local activeSkidMontage = nil               -- montage started for this turn
 
 -- ---- wall contact state ----
 local prevSpd = nil
@@ -490,6 +492,7 @@ local function PlaySkidAnimation(class)
         return false
     end
     dbg("skid play %s: playing, length=%.3f", class, played)
+    activeSkidMontage = montage
     return true
 end
 
@@ -512,8 +515,21 @@ local function TickPivot(pawn)
     local rotation = pawn:K2_GetActorRotation()
     if pivotSnap then
         -- The clip is turning the body; leave the capsule alone until the
-        -- clip is fully round, then set the yaw in one frame.
-        if pivotT < PIVOT_SNAP_TIME then return end
+        -- clip is fully round, then set the yaw in one frame. "Fully round"
+        -- is read from the montage itself: Montage_IsPlaying drops to false
+        -- the frame blend-out begins, so the snap lands exactly where the
+        -- clip hands off, whatever BlendOut the cooked asset carries.
+        -- PIVOT_SNAP_TIME only guards against a montage that never reports.
+        local blendingOut = false
+        local anim = ResolveAnimInstance()
+        if anim and activeSkidMontage and activeSkidMontage:IsValid() then
+            pcall(function()
+                blendingOut = not anim:Montage_IsPlaying(activeSkidMontage)
+            end)
+        end
+        if not blendingOut and pivotT < PIVOT_SNAP_TIME then return end
+        dbg("pivot snap at t=%.3f (%s)", pivotT,
+            blendingOut and "montage blend-out" or "PIVOT_SNAP_TIME")
         rotation.Yaw = pivotTargetYaw
         pivotDone    = true
     else
@@ -933,6 +949,7 @@ function M.OnPlayerCached(pawn, cmc)
     phase, turnT, turnCool, peakSpeed = PHASE_NONE, 0, 0, 0
     pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
     pivotSnap, pivotDone = false, false
+    activeSkidMontage    = nil
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
 
