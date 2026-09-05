@@ -138,9 +138,7 @@ local SKID_MONTAGES = {
 local DEBUG      = true
 local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
-local DEBUG_ANIM = true    -- IsWalking/IsSprint flips
-local DEBUG_CHANNELS = true -- lean-channel resting values, via the ABP hook
-local DEBUG_LEAN = false    -- per-tick lean flag dump (two lines every frame)
+local DEBUG_CHANNELS = false -- one-shot lean-channel resting values at spawn
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -154,7 +152,6 @@ local originalRotationRateYaw = nil
 -- ---- animation state ----
 local animInstance = nil
 local animInstanceAddress = nil
-local prevAnimIsWalking, prevAnimIsSprint = nil, nil
 
 -- ---- walk-cap state ----
 local desired   = nil     -- game's intended walk top speed (captured)
@@ -395,57 +392,6 @@ local function CacheAnimInstance()
     return true
 end
 
--- Read-only. Catches the speed at which the ABP flips IsWalking / IsSprint.
-local function LogAnimState(frame)
-    if not DEBUG_ANIM then return end
-    if animInstance == nil or not animInstance:IsValid() then
-        if not CacheAnimInstance() then return end
-    end
-
-    local animIsWalking = ReadOpt(animInstance, "IsWalking")
-    local animIsSprint  = ReadOpt(animInstance, "IsSprint")
-    local stateFlipped  = (animIsWalking ~= prevAnimIsWalking)
-                       or (animIsSprint  ~= prevAnimIsSprint)
-
-    if stateFlipped then
-        dbg("anim flip: IsWalking=%s IsSprint=%s  ourSpd=%.0f abpSpeed=%s",
-            tostring(animIsWalking), tostring(animIsSprint), frame.spd,
-            tostring(ReadOpt(animInstance, "Speed")))
-    end
-
-    prevAnimIsWalking, prevAnimIsSprint = animIsWalking, animIsSprint
-end
-
--- BoneListOnlySpines / BoneListFullBody are TMap<FName, UPalBoneInfo*>.
--- They are UE4SS TMap userdata, not Lua tables, so pairs() fails on them.
--- FName:get() also yields an FName OBJECT, not a string -- tostring() on
--- that prints the userdata pointer, which is why the first pass logged
--- addresses instead of bone names.
-local function LogBoneList(targetAnimInstance, listPropertyName)
-    local boneList = ReadOpt(targetAnimInstance, listPropertyName)
-    if boneList == nil then
-        dbg("%s unreachable", listPropertyName)
-        return
-    end
-
-    local boneNames = {}
-    local iterated = pcall(function()
-        boneList:ForEach(function(boneNameKey, _boneInfo)
-            local boneName = boneNameKey:get()
-            local converted, boneNameString = pcall(function()
-                return boneName:ToString()
-            end)
-            boneNames[#boneNames + 1] = converted and boneNameString or "<unreadable>"
-        end)
-    end)
-
-    if not iterated then
-        dbg("%s ForEach failed", listPropertyName)
-        return
-    end
-    dbg("%s (%d): %s", listPropertyName, #boneNames, table.concat(boneNames, ", "))
-end
-
 local function FormatRotator(rotator)
     if rotator == nil then return "nil" end
     return string.format("[P %.2f Y %.2f R %.2f]",
@@ -465,17 +411,6 @@ local function LogAnimChannels(targetAnimInstance)
     local aimRotatorForSpine = ReadOpt(targetAnimInstance, "AimRotatorForSpine")
     local overrideTransform  = ReadOpt(targetAnimInstance, "BP_OverrideTransform")
 
-    local overrideTranslation = "nil"
-    if overrideTransform ~= nil then
-        local gotTranslation, translation =
-            pcall(function() return overrideTransform.Translation end)
-        if gotTranslation and translation ~= nil then
-            overrideTranslation = string.format("(%.1f,%.1f,%.1f)",
-                translation.X or 0.0, translation.Y or 0.0, translation.Z or 0.0)
-        end
-        
-    end
-
     dbg("channels: bOverride=%s alpha=%.2f rideWeight=%.2f rideRot=%s aimSpine=%s xformT=%s",
         tostring(overrideEnabled),
         overrideAlpha or 0.0,
@@ -486,20 +421,6 @@ local function LogAnimChannels(targetAnimInstance)
 end
 
 
--- /Game/ path: RefreshBlueprintHooks rebinds this on every pawn
--- construction. Registered as a POST hook; main.lua's Register() fills the
--- pre slot with NoOp, which UE4SS requires even for post-only hooks.
-local ANIM_CHANNEL_LOG_INTERVAL = 0.5
-local animChannelLogTimer = 0
-
-local function TickAnimChannelLog(deltaTime)
-    if not DEBUG_CHANNELS then return end
-    if animInstance == nil or not animInstance:IsValid() then return end
-    animChannelLogTimer = animChannelLogTimer + deltaTime
-    if animChannelLogTimer < ANIM_CHANNEL_LOG_INTERVAL then return end
-    animChannelLogTimer = 0
-    LogAnimChannels(animInstance)
-end
 
 -- Either variant still playing suppresses a new play: both live in
 -- DefaultGroup, so Montage_Play would cut the other mid-skid otherwise.
@@ -984,13 +905,9 @@ function M.OnPlayerCached(pawn, cmc)
     keepSpeed, keepActive = 0, false
 
     -- The old pawn's anim instance may still report valid, in which case
-    -- LogAnimState would never re-resolve and animInstanceAddress would stay
-    -- nil -- silently disarming the ABP hook for the rest of the session.
-    
+    -- the lazy re-cache on the next tick would never fire and
+    -- animInstanceAddress would stay stale for the rest of the session.
     animInstance, animInstanceAddress = nil, nil
-    prevAnimIsWalking, prevAnimIsSprint = nil, nil
-    animChannelLogTimer = 0
-    
 
     if not pawn or not pawn:IsValid() then return end
 
@@ -1008,17 +925,9 @@ function M.OnPlayerCached(pawn, cmc)
     -- fact that the module cache is populated lazily on the first tick.
     local resolvedAnimInstance = ResolveAnimInstance()
     if resolvedAnimInstance and resolvedAnimInstance:IsValid() then
-        local animClass = nil
-        pcall(function() animClass = resolvedAnimInstance:GetClass() end)
-        if animClass and animClass:IsValid() then
-            local named, className = pcall(function() return animClass:GetFullName() end)
-            dbg("anim class: %s", named and className or "class name read failed")
-        end
-        LogBoneList(resolvedAnimInstance, "BoneListOnlySpines")
-        LogBoneList(resolvedAnimInstance, "BoneListFullBody")
-        LogAnimChannels(resolvedAnimInstance)   -- one baseline read at spawn
-            resolvedAnimInstance.DebugEnableLeaning            = true
-            resolvedAnimInstance.AnimNotifyForceDisableLeaning = false
+        if DEBUG_CHANNELS then LogAnimChannels(resolvedAnimInstance) end
+        resolvedAnimInstance.DebugEnableLeaning            = true
+        resolvedAnimInstance.AnimNotifyForceDisableLeaning = false
     end
 
     -- Report the sprint fields before touching anything (fills the baseline).
@@ -1109,8 +1018,11 @@ end
 
 function M.OnTick(dt, pawn, cmc)
     local frame = ReadFrame(cmc)
-    LogAnimState(frame)
-    TickAnimChannelLog(dt)
+    -- Lazy: the pawn's components are not initialised at construction, so
+    -- the instance is resolved on the first tick that can see it.
+    if animInstance == nil or not animInstance:IsValid() then
+        CacheAnimInstance()
+    end
     TickLeanProbe()
 
     -- Above every early return: an abort while airborne would otherwise
@@ -1140,11 +1052,6 @@ function M.OnTick(dt, pawn, cmc)
 
     CaptureGameWalkCap(cmc)
     AdvanceBuildupEase(dt, cmc)
-    if DEBUG_LEAN then
-        dbg("debugEnableLeaning: %s  forceDisableLeaning: %s",
-            tostring(ReadOpt(animInstance, "DebugEnableLeaning")),
-            tostring(ReadOpt(animInstance, "AnimNotifyForceDisableLeaning")))
-    end
 end
 
 return M
