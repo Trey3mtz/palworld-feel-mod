@@ -139,6 +139,7 @@ local DEBUG      = true
 local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
 local DEBUG_CHANNELS = false -- one-shot lean-channel resting values at spawn
+local DEBUG_TURN_TRACE = true -- per-tick trace while a turn owns velocity
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -588,6 +589,36 @@ local function TickLaunchPhase(cmc, pawn)
     end
 end
 
+-- Per-tick trace while a turn is active: capsule yaw against velocity
+-- heading, montage state, and the ABP's locomotion flags. Exists to catch
+-- the game rotating the capsule or dropping the montage on its own.
+local function TraceTurn(f, pawn)
+    if not DEBUG_TURN_TRACE then return end
+    local yaw = -1
+    if pawn and pawn:IsValid() then
+        local ok, rot = pcall(function() return pawn:K2_GetActorRotation() end)
+        if ok and rot then yaw = rot.Yaw end
+    end
+    local velYaw = (f.spd > 1e-3) and math.deg(math.atan(f.vy, f.vx)) or 0
+    local playing, pos = "?", -1
+    local anim = ResolveAnimInstance()
+    if anim then
+        for _, montage in pairs(skidMontageCache) do
+            if montage and montage:IsValid() then
+                pcall(function()
+                    playing = tostring(anim:Montage_IsPlaying(montage))
+                    pos     = anim:Montage_GetPosition(montage)
+                end)
+            end
+        end
+    end
+    dbg("trace t=%.3f ph=%d yaw=%.0f vel=%.0f spd=%.0f montage=%s@%.2f walk=%s sprint=%s lock=%s",
+        pivotT, phase, yaw, velYaw, f.spd, playing, pos,
+        tostring(anim and ReadOpt(anim, "IsWalking")),
+        tostring(anim and ReadOpt(anim, "IsSprint")),
+        tostring(moveInputLocked))
+end
+
 -- Once started, only physical invalidation stops it. Input release and
 -- sprint-flag loss are NOT aborts.
 local function RunCommittedTurn(dt, cmc, f, pawn)
@@ -604,6 +635,7 @@ local function RunCommittedTurn(dt, cmc, f, pawn)
     -- which would restart the pivot mid-way through it.
     pivotT = pivotT + dt
     TickPivot(pawn)
+    TraceTurn(f, pawn)
 
     -- Launch direction is captured at the trigger and deliberately NOT
     -- re-steered: letting live input rewrite it allowed the player to cancel
