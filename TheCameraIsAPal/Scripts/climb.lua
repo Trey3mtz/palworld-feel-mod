@@ -1,129 +1,256 @@
 -- =========================================================================
+-- climb.lua -- PalFeel climbing: a state machine layered over Palworld's
+-- BP_PalClimbingComponent.
+--
 -- Author: TheTr3y
--- Date: 2026-07-25
+--
+-- The component owns the climb itself. This file owns everything around it:
+-- deciding when a climb should begin (and winning that decision from the
+-- component's own grab), the hop that precedes a latch, the jump off a wall
+-- and the leap along it, the slide that catches a fast fall, and the
+-- hand-off to the component's vault at the top.
+--
+-- One mode at a time. Every frame reads the game once into a Frame, the
+-- current mode's tick runs against that Frame and returns the next mode or
+-- nothing, and SetMode is the only place a transition happens. Everything
+-- taken from the game (input holds, the glider, the climb suppression, the
+-- rotation flags, ...) is taken through the ledger in section 5 and given
+-- back when the owning mode exits, so an exit cannot forget.
+--
+--   IDLE      nothing owned; watching for an approach, a grab, a vault
+--   APPROACH  a face is in reach and the component is held off while we close
+--   ASCENT    the hop: launch, hold the face, attach when viable
+--   LATCHED   climbing; the latch watch, the wall slide, raw stick input
+--   LEAP      the wall-plane jump: drive, track the face, re-attach
+--   DISMOUNT  the hop away from the wall
+--   VAULT     the component's own top-out; we only hold input off
+-- =========================================================================
+
+-- =========================================================================
+-- 1. REQUIRES + DEBUG FLAGS
 -- =========================================================================
 
 local CommonState = require("commonstate")
-local Easing = require("easingfunctions")
+local Easing      = require("easingfunctions")
 local Input       = require("input")
 
--- =========================================================================
--- 1. TUNING
--- =========================================================================
+-- TraceViz lives in UE4SS's shared/ folder and may not be installed. A hard
+-- require would take the whole subsystem down with it.
+local okViz, Viz = pcall(require, "TraceViz")
+if not okViz then Viz = nil end
 
-local DEBUG   = false
+local DEBUG       = false   -- state-change lines
+local DEBUG_FRAME = false   -- per-frame lines; never leave on, the log is untrimmed
 
--- Per-frame logging, separated from DEBUG so it cannot be left on. print()
--- feeds UE4SS's console buffer and log file, neither of which is trimmed.
-local DEBUG_FRAME = false
+-- Bounded discovery output: each line prints a fixed number of times per
+-- session and then goes quiet. Defaulted ON because it answers questions
+-- this file cannot answer by reasoning (what the component exposes, whether
+-- a forced latch held, which reason ended a sequence).
+local DEBUG_DISCOVERY = true
 
--- Frames between init-climb wall probes. 1 = every frame (original
--- behaviour). Each LineTraceSingle costs three UE4SS
--- "[push_weakobjectproperty] Operation::Set is not supported" lines, because
--- UE4SS builds the FHitResult out-param by Set-ing every property of the
--- STRUCT (not the table) and three of them are TWeakObjectPtr. At 60fps that
--- is ~180 lines/sec. Set this to 4 to cut it by three quarters; the cost is
--- up to 66ms of extra latency detecting a wall you have pressed into.
-local PROBE_FRAME_INTERVAL = 1
+-- Deeper one-shot investigations (class function dump, tick-order sampling,
+-- CanClimbingStart observation, trace-struct check) live in
+-- climb_discover.lua. Off by default: their questions are answered, and
+-- the function dump costs a startup hitch.
+local DEBUG_DISCOVERY_DEEP = false
+local Discover = nil
+if DEBUG_DISCOVERY_DEEP then
+    local okD, mod = pcall(require, "climb_discover")
+    if okD then Discover = mod end
+end
 
--- ---- slide ----
-local VZ_TRIGGER  = -600
-local VZ_CAP      = 1600
-local TRANSFER    = 0.45
-local DECEL       = 1400
-local MIN_SLIDE_V = 60
-local BLOCK_RATIO = 0.4
-
-
--- Speed profile along the leap direction: EaseOutQuint from START to
--- END. Drive time is derived from the curve's time-average speed
--- (START/6 + 5*END/6 for out-quint) so travel is exactly LEAP_DIST
--- regardless of tuning. Keep (driveTime + ATTACH_WINDOW) under ~0.50s or
--- the component's cooldown expires mid-leap and organic re-grabs
--- return. Current average = 900 -> driveTime = 0.278s, same as the
--- constant-speed build.
-local LEAP_SPEED_START = 2200
-local LEAP_SPEED_END   = 162
-local LEAP_EASE        = Easing.EaseOutCirc
-local LEAP_DIST     = 175    -- uu of travel before the attach check
-local LEAP_ANGLES   = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 }
-local ATTACH_WINDOW = 0.10   -- s at leap end to confirm a wall
-
--- ---- init climb: wall detection ----
-local INIT_CLIMB_CONE_DEG    = 40    -- max angle between input and into-wall
-local INIT_CLIMB_MAX_GAP     = 21    -- uu from capsule SURFACE that counts as reachable
-local INIT_CLIMB_INPUT_FLOOR = 0.6   -- min |Acceleration.XY| that counts as input
-local INIT_CLIMB_CONE_COS    = math.cos(math.rad(INIT_CLIMB_CONE_DEG))
-local WALKABLE_FLOOR_Z_FALLBACK = 0.6428   -- cos(50 deg); BP_PlayerBase default
-
--- ---- init climb: launch schedule ----
-local INIT_CLIMB_LAUNCH_GRACE = 0.12   -- s to leave the ground before the jump counts as refused
-local INIT_CLIMB_ATTACH_AT_GROUND  = 0.35   -- s of air time before the first attach attempt
-local INIT_CLIMB_ATTACH_AT_JUMP    = 0.25
-local INIT_CLIMB_LOCK_TIME    = 0.6   -- s of air time before giving up
-local INIT_CLIMB_MAX_TRIES    = 3
-
--- ---- climb jump: attach verification ----
-local ATTACH_MAX_TRIES = 3  -- attempts within the window; then free fall
-
--- ---- climb jump: hop away (DOWN) ----
-local HOP_VZ    = 620
-local HOP_OUT   = 300
-local HOP_LOCK  = 0.20
-
-local LOCK_ROTATION = true
-
-
--- ---- hug closed-loop (facing + distance hold) ----
-local HUG_TARGET     = 5      -- uu gap to hold (matches observed ~55 rest)
-local HUG_RAY_LEN    = 112     -- fwdRay(80) * 1.4; fan reach
-local HUG_FAN_DEG    = 30      -- side ray splay
-local HUG_YAW_RATE   = 800    -- deg/s slew cap (round-wall track / corner take)
-local HUG_PARALLEL   = 0.90    -- facing.normal above this = gap trusted for dist
-local HUG_IN_GAIN    = 6.0     -- 1/s; inward vel = gain * (gap - target)
-local HUG_IN_MAX     = 400     -- uu/s inward correction cap
-local HUG_WRAP_COS   = -0.70   -- new-normal vs facing dot below this = corner too
-                               -- sharp (~135 deg) -> detach; >= wraps.
-                               -- -0.50~120, -0.70~135, -0.87~150
-local HUG_LOST_TICKS = 4       -- consecutive all-miss frames -> end leap
-local LEAD_RAY_BONUS = 8    -- uu of score preference for the ray angled
-                            -- toward travel; lets it win near-ties so
-                            -- corners are seen before the forward ray
-local ATTACH_MAX_GAP = 55   -- uu of clearance from the capsule surface at
-                            -- which a wall counts as grabbable
-
+-- HUD-canvas visualisation of the checks through TraceViz. Unreal compiles
+-- DrawDebug* out of shipping builds, so the DrawDebugType argument on every
+-- Kismet trace is pinned to None and does nothing; TraceViz is the only
+-- drawing that survives shipping.
+local DEBUG_VOLUMES      = false
+local DEBUG_VOLUME_TIME  = 0.0     -- s each drawn frame persists; 0 = one frame
+local DEBUG_VOLUME_GATES = false   -- threshold bars along the approach line
 
 -- =========================================================================
--- 2. MODULE + STATE
+-- 2. TUNING
+-- Distances are uu from the capsule SURFACE unless a name says otherwise.
+-- =========================================================================
+
+local T = {}
+
+-- ---- wall detection ----
+T.Detect = {
+    CONE_DEG        = 40,     -- max angle between the stick and into-wall
+    INPUT_FLOOR     = 0.6,    -- |Acceleration.XY| that counts as holding a direction (absolute, tiny on purpose)
+    -- The primary check is a capsule sweep: the player's own radius, swept
+    -- forward along the stick, spanning from just above step height to eye
+    -- level. It starts above MaxStepHeight so a rock the player walks over
+    -- is outside the volume entirely.
+    SHAPE           = "capsule",   -- "capsule" | "line" (line is the fallback if the sweep does not report)
+    FOOT_CLEARANCE  = 48,     -- uu above the feet the sweep starts; > MaxStepHeight (45)
+    -- A hit at waist height is not a wall until it also passes:
+    EYE_OFFSET_FRAC = 0.70,   -- of capsule half height, above centre: must also find the face
+    WIDTH_HALF      = 40,     -- uu each side of the approach line: both must find the face
+    REQUIRE_EYE     = true,
+    REQUIRE_WIDTH   = true,
+    SLACK           = 30,     -- uu of extra reach for the eye/width probes on a rough face
+    -- 0 = line probes for the fan/eye/width rays. > 0 = sphere sweeps of
+    -- that radius. Only lines are proven to fill the hit struct on this
+    -- UE4SS build; safe to try, since a sweep that does not report arms nothing.
+    PROBE_RADIUS    = 0,
+    PENETRATION_SLOP = 6,     -- uu of negative gap still treated as contact, not "inside geometry"
+    FAN_HEIGHT_FRAC = 0.45,   -- of half height: the airborne fan's vertical offset
+    FAN_HEIGHT_PAD  = 4,      -- uu kept clear of the capsule end caps
+    WALKABLE_Z_FALLBACK = 0.6428,  -- cos(50 deg), BP_PlayerBase default
+    -- Clearance at which a face counts as grabbable. A plain tunable: the
+    -- component's Const_ForwardRayLength has unverified units/origin and a
+    -- derivation from it once made the latch harder, not easier.
+    ATTACH_GAP      = 55,
+}
+T.Detect.CONE_COS = math.cos(math.rad(T.Detect.CONE_DEG))
+
+-- ---- approach guard: winning the wall from the component's own grab ----
+-- The component latches the moment its forward ray finds a face, and its
+-- tick runs before ours (measured: 240 of 240 frames). So the guard reaches
+-- further than the component does and suppresses CanClimbing while closing,
+-- buying the frames our own hop needs. Suppression is time-boxed: if our
+-- commit never fires the wall goes back to the game, or the player would
+-- get neither.
+T.Guard = {
+    REACH        = 87,     -- uu: arm and suppress from here in
+    COMMIT_WALK  = 21,     -- uu: a grounded walk-in commits here
+    COMMIT_AIR   = 80,     -- uu: an airborne approach commits here (the hold closes the rest)
+    RISE_VZ_MIN  = 5,      -- uu/s of rise required to arm while airborne; a fall is vanilla's
+    TIMEOUT      = 0.45,   -- s armed without committing -> give the wall back
+    COOLDOWN     = 0.80,   -- s of vanilla ownership after giving up, or after a spent jump
+    LOST_TICKS   = 6,      -- consecutive probe misses tolerated before giving up
+    FAN_NEAR_MULT = 2.5,   -- line mode only: below this multiple of the commit gap, re-probe with the fan
+}
+
+-- ---- ascent: the hop before the latch ----
+T.Ascent = {
+    LAUNCH_GRACE  = 0.12,  -- s for the game's jump to leave the ground before it counts as refused
+    LAUNCH_VZ     = 1050,  -- overwrites the game's launch so every arc is identical; nil keeps the game's
+    GRAVITY       = 2.2,   -- owned for the whole ascent (jump.lua is gated off by priority)
+    -- Airborne entry: the mini hop, written straight onto velocity. DoJump
+    -- is a no-op while rising and CanJump refuses while falling.
+    HOP_VZ_ADD    = 500,
+    HOP_VZ_MIN    = 460,
+    HOP_VZ_MAX    = 1000,
+    HOP_IN_SPEED  = 220,   -- uu/s into the wall on the hop frame
+    APPROACH_HOLD = 0.12,  -- s of closing under the lock before the hop fires
+    -- Attach the instant it is viable; these only let the hop read as a hop.
+    MIN_AIR_TIME  = 0.18,
+    MIN_RISE      = 95,    -- uu above launch before the first attempt (or at apex if lower)
+    LOCK_TIME     = 0.72,  -- s of air time before giving up
+    RETRY_INTERVAL = 0.06, -- s between forced attaches that did not take
+    LOST_TICKS    = 5,     -- consecutive all-miss probes -> abort
+    -- Closed loop holding the gap while rising, so the latch does not depend
+    -- on what the wall collision left of the approach momentum.
+    HOLD_GAP      = 8,
+    IN_GAIN       = 14.0,  -- 1/s
+    IN_MAX        = 320,   -- uu/s
+    YAW_RATE      = 900,   -- deg/s slew cap while tracking the face
+}
+
+-- ---- latch watch ----
+-- Forcing climb mode puts the pawn on the wall but the component's own
+-- entry never ran, and its update can exit a state it did not set up. A
+-- forced latch is watched: a drop back to falling while the face is still
+-- in reach is answered once by the component's own external entry, then by
+-- re-forcing, a bounded number of times.
+T.Latch = {
+    HOLD        = 0.40,    -- s after a forced latch to guard it
+    MAX_REFORCE = 6,
+}
+
+-- ---- wall slide: a fast fall into a wall skids to a halt ----
+T.Slide = {
+    VZ_TRIGGER  = -600,    -- uu/s: entry speed at or below this starts a slide
+    VZ_CAP      = 1600,
+    TRANSFER    = 0.45,    -- fraction of entry speed carried into the slide
+    DECEL       = 1400,    -- uu/s^2
+    MIN_V       = 60,      -- uu/s: below this the slide has halted
+    BLOCK_RATIO = 0.4,     -- moved/commanded below this = blocked
+}
+
+-- ---- leap: the wall-plane jump ----
+-- Speed eases from START to END; drive time is derived from the curve's
+-- time-average so travel is exactly DIST. Keep drive + ATTACH_WINDOW under
+-- ~0.5s or the component's own cooldown expires mid-leap.
+T.Leap = {
+    SPEED_START  = 2200,
+    SPEED_END    = 162,
+    EASE         = Easing.EaseOutCirc,
+    DIST         = 175,    -- uu of travel before the attach check
+    ANGLES       = { UP = 0.0, DIAG = 45.0, SIDE = 90.0 },
+    ATTACH_WINDOW = 0.10,  -- s at leap end to confirm a wall
+    ATTACH_TRIES = 3,
+    HOLD_GAP     = 5,      -- uu gap the inward correction holds
+    RAY_LEN      = 112,    -- uu; fan reach (~1.4x the component's own ray)
+    FAN_DEG      = 30,     -- side ray splay
+    YAW_RATE     = 800,    -- deg/s slew cap
+    PARALLEL     = 0.90,   -- facing.normal above this = the gap reading is trusted
+    IN_GAIN      = 6.0,
+    IN_MAX       = 400,
+    WRAP_COS     = -0.70,  -- new normal vs facing below this (~135 deg) = corner too sharp -> detach
+    LOST_TICKS   = 4,
+    LEAD_RAY_BONUS = 8,    -- uu of score preference for the ray angled toward travel
+    NORMAL_SMOOTHING = 12, -- 1/s; higher = snappier facing
+    JUMP_VZ_MIN  = 600,    -- uu/s: rising faster than this out of climb mode is the player's jump
+}
+
+-- ---- dismount: the hop away (jump with the stick down) ----
+T.Dismount = {
+    VZ   = 620,
+    OUT  = 300,   -- uu/s away from the wall
+    LOCK = 0.20,  -- s the push and facing are held
+}
+
+-- ---- top-out: catching the lip mid-leap ----
+-- Two-ray disagreement along the leap's facing: face still there at
+-- shoulder height, gone above it. The latch is what stops the leap sailing
+-- past; the component then runs its own vault with its own state.
+--
+-- NEVER call ClimbUpAtTopEvent by hand. Called outside the component's
+-- state machine it runs against a stale destination and moved the player
+-- across the map into the ocean. A pcall does not help: the call succeeds.
+T.TopOut = {
+    ENABLED     = true,
+    LOW_OFFSET  = -10,     -- uu from capsule centre: must still find the face
+    HIGH_OFFSET = 46,      -- uu above centre: must find nothing
+    MAX_GAP     = 60,
+}
+
+-- ---- log budgets (lines per session) ----
+T.Log = {
+    TRANSITIONS = 120,
+    LATCH       = 64,
+    GIVEUPS     = 12,
+    TELEPORTS   = 6,
+    TELEPORT_JUMP_UU = 1500,   -- a single-frame displacement above this is a teleport, not movement
+}
+
+local TRACE_DRAW_NONE = 0
+local TRACE_COLOR_A   = { R = 1, G = 0, B = 0, A = 1 }
+local TRACE_COLOR_B   = { R = 0, G = 1, B = 0, A = 1 }
+
+-- =========================================================================
+-- 3. MODULE + STATE
 -- =========================================================================
 
 local M = { name = "climb" }
 
--- Published for jump.lua's jump-cut guard during the HOP (which hands
--- gravity back to jump.lua and therefore isn't covered by the priority
--- gate). Hug leaps are protected by ClimbHasPriority itself.
-M.InClimbJump = false
+local Mode = {
+    IDLE = "IDLE", APPROACH = "APPROACH", ASCENT = "ASCENT", LATCHED = "LATCHED",
+    LEAP = "LEAP", DISMOUNT = "DISMOUNT", VAULT = "VAULT",
+}
+M.Mode = Mode.IDLE
+-- Published booleans derived from the mode, for readers that only need these.
 M.InInitClimbState = false
+M.InClimbJump      = false
 
-local comp, compName = nil, nil
-local capsuleRadius = 34 -- this is a fallback for radius, found during runtime test
-local walkableFloorZ = WALKABLE_FLOOR_Z_FALLBACK
+-- Modes in which this file (or the component) owns the pawn: jump.lua is
+-- gated off and the rotation flags are ours.
+local PRIORITY = { [Mode.ASCENT] = true, [Mode.LATCHED] = true,
+                   [Mode.LEAP] = true, [Mode.VAULT] = true }
 
--- ---- fall / climb frame cache ----
-local lastFallVz     = 0
-local prevModeWasClimb  = false
-local prevWallFwd    = { X = 1, Y = 0 }
-local prevClimbInputAlongWall = 0
-local prevClimbInputUpward = 0
-local prevAtTopAnimPlaying = false
-
--- ---- slide state ----
-local slidingDownWall        = false
-local slideV         = 0
-local savedClimbMax  = nil
-
--- ---- climb jump state ----
-local climbJumpState = nil
 local JUMP_DIRECTIONS = {
     { name = "SIDE", sign = -1, x = -1.0, y =  0.0 },
     { name = "DIAG", sign = -1, x = -0.5, y =  0.5 },
@@ -133,353 +260,1440 @@ local JUMP_DIRECTIONS = {
     { name = "DOWN", sign =  0, x =  0.0, y = -1.0 },
 }
 
--- ---- init climb state ----
--- Shadowed by M.InInitClimbState: the two are written together, in
--- StartClimbFrom* and EndInitClimb, and nowhere else.
-local initClimbState = nil
+-- All mutable state. Rebuilt whole on every player cache, so nothing can
+-- survive a respawn by being forgotten in a reset list.
+local function NewState()
+    return {
+        mode = Mode.IDLE, modeTime = 0, inTransition = false,
 
--- ---- flag watch state ----
-local prevFlagIs, prevFlagCan, prevFlagEnding = nil, nil, nil
-local KSL = nil             -- KismetSystemLibrary default object, lazy
+        -- per-pawn constants, filled by OnPlayerCached
+        comp = nil, compName = nil, clsPath = nil,
+        radius = 34, halfH = 90, walkableZ = T.Detect.WALKABLE_Z_FALLBACK,
+        fanOffset = 0, channel = 0,
+        defaultOrient = nil, defaultDesiredRot = nil,
+        KSL = nil,
+        capsuleTraceOk = nil,      -- nil = untested; decided on the first grounded frame
+        grappleCallable = nil,     -- true only if the signature dump shows no parameters
 
--- ---- component hook state ----
-local hooksRegistered = false
-local lastGroundCheck = nil
+        -- mode-scoped state
+        guard  = { armedTime = 0, lostFrames = 0, cooldown = 0, pending = nil },
+        ascent = nil, watch = nil, leap = nil, slide = nil,
 
+        -- carried between frames
+        prev = { wallFwd = { X = 1, Y = 0 }, alongWall = 0, upward = 0,
+                 sideSign = 0, fallVz = 0 },
+        lastGroundCheck = nil,
 
+        -- resource ledger: name -> { owners = {set}, applied = bool, saved = any }
+        own = {},
+        wantSuppress = false, heldSuppress = false,
+
+        -- log budgets and the teleport watchdog
+        log = {}, lastLoc = nil,
+    }
+end
+local S = NewState()
+
+local hooksRegistered = false   -- class-level hooks persist across respawns
 
 -- =========================================================================
--- 3. UTILITIES
+-- 4. UTILITIES
+-- Every game access goes through a pcall. pcall does NOT catch native
+-- access violations, so each dereference is validity-checked individually
+-- and nothing is called on a guessed signature. The raw* functions exist
+-- so pcall gets a static function plus arguments instead of a fresh
+-- closure: these run dozens of times per frame.
 -- =========================================================================
 
 local function dbg(fmt, ...)
     if DEBUG then print(string.format("[PalFeel:climb] " .. fmt .. "\n", ...)) end
 end
-
 local function fdbg(fmt, ...)
     if DEBUG_FRAME then print(string.format("[PalFeel:climb] " .. fmt .. "\n", ...)) end
 end
-
-local function ReadOpt(obj, prop)
-    if obj == nil then return nil end
-    local ok, v = pcall(function() return obj[prop] end)
-    if not ok then return nil end
-    return v
+local function ddbg(fmt, ...)
+    if DEBUG_DISCOVERY then print(string.format("[PalFeel:climb/DISCOVER] " .. fmt .. "\n", ...)) end
 end
 
-local function DisableGlider(playerPawn, cmc)
-    local glider = playerPawn.BP_GliderComponent
-    if glider and glider:IsValid() then
-        local glidereKy = glider.GliderDisableFlag
-        -- Stop the component from ticking or processing activation events
-        cmc:SetGliderDisbleFlag(glidereKy, true)
-    end
+-- true while the named budget has lines left this session
+local function Budget(key, max)
+    local n = S.log[key] or 0
+    if n >= max then return false end
+    S.log[key] = n + 1
+    return true
 end
 
-local function EnableGlider(playerPawn, cmc)
-    local glider = playerPawn.BP_GliderComponent
-    if glider and glider:IsValid() then
-        local glidereKy = glider.GliderDisableFlag
-        -- Restore component functionality
-        cmc:SetGliderDisbleFlag(glidereKy, false)
-    end
+local function rawGet(o, k) return o[k] end
+local function ReadOpt(o, k)
+    if o == nil then return nil end
+    local ok, v = pcall(rawGet, o, k)
+    if ok then return v end
+    return nil
 end
 
-local function DisableMoveInput(pawn)
-    local controller = pawn:GetController()
-    controller:SetIgnoreMoveInput(true)
+local function rawSet(o, k, v) o[k] = v end
+local function WriteOpt(o, k, v)
+    if o == nil then return false end
+    return (pcall(rawSet, o, k, v))
 end
 
-local function EnableMoveInput(pawn)
-    local controller = pawn:GetController()
-    controller:ResetIgnoreMoveInput()
+-- Nested write (obj.field.sub = v), e.g. cmc.Velocity.Z
+local function rawSet2(o, k1, k2, v) o[k1][k2] = v end
+local function WriteOpt2(o, k1, k2, v)
+    if o == nil then return false end
+    return (pcall(rawSet2, o, k1, k2, v))
 end
 
-local originalJumpMax = 1
-local isJumpDisabled = false
--- When the player latches onto a wall and you want to lock out the native jump:
-local function DisableNativeJump(playerPawn, cmc)
-    if isJumpDisabled then return end
-    if playerPawn and playerPawn:IsValid() then  
-        -- Store the original max jump count
-        originalJumpMax = playerPawn.JumpMaxCount
-        -- Set to 0 so ACharacter::CanJump() fails
-        playerPawn.JumpMaxCount = 0
-        isJumpDisabled = true
-    end
+local function rawIsValid(o) return o:IsValid() end
+local function IsLive(o)
+    if o == nil then return false end
+    local ok, v = pcall(rawIsValid, o)
+    return ok and v == true
 end
 
--- When the player leaps off the wall or touches the ground:
-local function EnableNativeJump(playerPawn, cmc)
-    if not isJumpDisabled then return end
-    if playerPawn and playerPawn:IsValid() then
-        -- Restore the original jump count
-        playerPawn.JumpMaxCount = originalJumpMax
-        isJumpDisabled = false
-    end
+local function rawCall(o, m, ...) return o[m](o, ...) end
+-- Returns ok, result...
+local function CallOpt(o, m, ...)
+    if o == nil then return false end
+    return pcall(rawCall, o, m, ...)
 end
 
-local function DisableClimbing(pawn)
-    pawn.BP_PalClimbingComponent.CanClimbing = false
+local function Clamp(value, low, high)
+    if value < low  then return low  end
+    if value > high then return high end
+    return value
 end
 
-local function EnableClimbing(pawn)
-    pawn.BP_PalClimbingComponent.CanClimbing = true
-end
-
-local function DisableForInitClimb(pawn, cmc)
-    DisableClimbing(pawn)
-    DisableMoveInput(pawn)
-    DisableGlider(pawn, cmc)
-end
-
-local function EnableForInitClimb(pawn, cmc)
-    EnableClimbing(pawn)
-    EnableMoveInput(pawn)
-    EnableGlider(pawn, cmc)
-end
-
-local function DisableForAtTopAnim(pawn, cmc)
-    DisableMoveInput(pawn)
-    DisableNativeJump(pawn, cmc)
-end
-
-local function EnableForAtTopAnim(pawn, cmc)
-    EnableMoveInput(pawn)
-    EnableNativeJump(pawn, cmc)
-end
-
-local function DisableForClimbingJump(pawn, cmc)
-    DisableGlider(pawn, cmc)
-    DisableMoveInput(pawn)
-end
-
-local function EnableForClimbingJump(pawn, cmc)
-    EnableGlider(pawn, cmc)
-    EnableMoveInput(pawn)
-end
-
-local function IsLive(obj)
-    if obj == nil then return false end
-    local ok, valid = pcall(function() return obj:IsValid() end)
-    return ok and valid == true
-end
-
-local function GetLoc(pawn)
-    local loc = nil
-    pcall(function() loc = pawn:K2_GetActorLocation() end)
-    if loc == nil then return nil end
-    local out = nil
-    pcall(function() out = { X = loc.X, Y = loc.Y, Z = loc.Z } end)
-    return out
-end
-
--- Unit XY direction, or nil when the vector is too short to have one.
 local function NormalizeXY(x, y)
     local length = math.sqrt(x * x + y * y)
     if length < 1e-3 then return nil end
     return { X = x / length, Y = y / length }
 end
 
-local function EndClimbJumpState(pawn, cmc)
-    if climbJumpState == nil then return end
-    climbJumpState = nil
-    M.InClimbJump = false
-    EnableForClimbingJump(pawn, cmc)
-    CommonState.ClimbHasPriority = false
-    dbg("[Climb.lua] ENDING CLIMB STATE")
+local function rawLoc(p) local l = p:K2_GetActorLocation() return l.X, l.Y, l.Z end
+local function GetLoc(pawn)
+    local ok, x, y, z = pcall(rawLoc, pawn)
+    if not ok or type(z) ~= "number" then return nil end
+    return { X = x, Y = y, Z = z }
 end
 
--- Write the component into the ORGANIC post-attach signature
--- (is=true can=true ending=false). Mode-only left it unaware (no
--- cooldown, 24ms re-grabs); writes without ending=false left is=true
--- stuck after hops. The reconciler remains the safety net.
-local function ForceClimbAttach(cmc)
-    if not IsLive(comp) then
-        dbg("WARN: climb component stale -- attach skipped")
-        return false, false, false
-    end
-
-    local okCan  = pcall(function() comp.CanClimbing = true end)
-    local okMode = pcall(function() cmc:SetMovementMode(6, 5) end)
-    if not okMode then
-        okMode = pcall(function()
-            cmc.MovementMode = 6
-            cmc.CustomMovementMode = 5
-        end)
-    end
-    local okIs = pcall(function()
-        comp.IsClimbing = true
-        comp.IsEnding   = false
-    end)
-
-    return okMode, okCan, okIs
+local function rawFwd(p) local f = p:GetActorForwardVector() return f.X, f.Y end
+-- Horizontal forward direction. While climbing the character is pressed
+-- flat to the wall, so this doubles as the into-wall direction.
+local function WallFwd(pawn)
+    local ok, x, y = pcall(rawFwd, pawn)
+    if not ok or type(x) ~= "number" or type(y) ~= "number" then return nil end
+    return NormalizeXY(x, y)
 end
 
--- Smoothly interpolates and slews the yaw angle directly, preventing vector jitter.
-local function SlewFacingToward(dt, targetX, targetY)
+local function rawAccel(c) local a = c.Acceleration return a.X, a.Y end
+-- Where the player is asking to go. Acceleration rather than Velocity:
+-- pressed against a wall the velocity collapses while the input stays.
+local function GetInputDirection(cmc)
+    local ok, x, y = pcall(rawAccel, cmc)
+    if not ok or type(x) ~= "number" then return nil end
+    local mag = math.sqrt(x * x + y * y)
+    if mag < T.Detect.INPUT_FLOOR then return nil end
+    return { X = x / mag, Y = y / mag }
+end
+
+local function SetHorizVel(cmc, x, y)
+    WriteOpt2(cmc, "Velocity", "X", x)
+    WriteOpt2(cmc, "Velocity", "Y", y)
+end
+
+local function SetVertVel(cmc, z)
+    WriteOpt2(cmc, "Velocity", "Z", z)
+end
+
+local function FaceYaw(pawn, faceDir)
+    if faceDir == nil then return end
+    local yaw = math.deg(math.atan(faceDir.Y, faceDir.X))
+    CallOpt(pawn, "K2_SetActorRotation", { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
+end
+
+-- Slews a yaw angle toward a target direction in angle space, so the result
+-- cannot jitter or shorten. Returns the new angle and its unit vector.
+local function SlewYawToward(currentAngle, targetX, targetY, dt, rateDegPerSec)
     local targetAngle = math.deg(math.atan(targetY, targetX))
-    local currentAngle = climbJumpState.currentYaw or targetAngle
-
-    -- Handle angle wrapping (-180 to 180 delta)
-    local angleDelta = targetAngle - currentAngle
-    while angleDelta >  180 do angleDelta = angleDelta - 360 end
-    while angleDelta < -180 do angleDelta = angleDelta + 360 end
-
-    -- Exponential smoothing (lerp factor based on dt and HUG_YAW_RATE)
-    -- This creates a naturally organic, silky-smooth acceleration curve.
-    local smoothFactor = math.min(1.0, dt * (HUG_YAW_RATE / 45.0))
-    currentAngle = currentAngle + angleDelta * smoothFactor
-    
-    climbJumpState.currentYaw = currentAngle
-
-    local rad = math.rad(currentAngle)
-    climbJumpState.faceDir = { X = math.cos(rad), Y = math.sin(rad) }
+    if currentAngle == nil then currentAngle = targetAngle end
+    local delta = targetAngle - currentAngle
+    while delta >  180 do delta = delta - 360 end
+    while delta < -180 do delta = delta + 360 end
+    local factor = math.min(1.0, dt * (rateDegPerSec / 45.0))
+    local newAngle = currentAngle + delta * factor
+    local rad = math.rad(newAngle)
+    return newAngle, { X = math.cos(rad), Y = math.sin(rad) }
 end
 
--- Sets the inward velocity that pulls toward HUG_TARGET. Only trusted when
--- near-parallel: off-angle, the ray hits obliquely and reads longer than
--- the true perpendicular gap, which would drive the correction backwards.
-local function UpdateGapCorrection(gap, facingAlignment)
-    local gapReadingIsTrustworthy = facingAlignment >= HUG_PARALLEL
-    if not gapReadingIsTrustworthy then
-        climbJumpState.inVel = 0
-        return
+-- Whatever produced the input, the movement component gets zero this tick.
+-- SetIgnoreMoveInput is not honoured by every input path.
+local function DrainMoveInput(cmc)
+    CallOpt(cmc, "ConsumeInputVector")
+end
+
+-- =========================================================================
+-- 5. RESOURCES
+-- Everything this file takes from the game, taken and given back through
+-- one ledger. A resource is applied when its first owner takes it and
+-- released when its last owner gives it. GiveAll(owner) runs on every mode
+-- exit, so an exit cannot leave a hold behind.
+--
+-- Take/Give only change ownership; the game writes happen in Settle. During
+-- a transition Settle is deferred until the new mode has taken what it
+-- needs, so a resource handed from one mode to the next is never released
+-- and re-applied in between.
+-- =========================================================================
+
+local function ApplyClimbSuppression()
+    -- Only ever writes false to suppress, or true to release a suppression
+    -- it applied itself. The game sets CanClimbing false for its own
+    -- reasons (stamina, water) and a blanket true would override those.
+    if not IsLive(S.comp) then return end
+    if S.wantSuppress then
+        WriteOpt(S.comp, "CanClimbing", false)
+        S.heldSuppress = true
+    elseif S.heldSuppress then
+        WriteOpt(S.comp, "CanClimbing", true)
+        S.heldSuppress = false
     end
-
-    local gapError = gap - HUG_TARGET
-    local correction = gapError * HUG_IN_GAIN
-    climbJumpState.inVel = math.max(-HUG_IN_MAX, math.min(HUG_IN_MAX, correction))
 end
 
--- No ray found the wall this frame. Coast on the last known facing; give up
--- once it's been gone long enough to mean the wall genuinely ended.
-local function HandleLostWall(pawn, cmc)
-    climbJumpState.framesWithoutWall = climbJumpState.framesWithoutWall + 1
-    climbJumpState.inVel = 0
+local function rawController(p) return p:GetController() end
+local function GetController(pawn)
+    local ok, c = pcall(rawController, pawn)
+    if ok and IsLive(c) then return c end
+    return nil
+end
 
-    local wallIsGoneForGood = climbJumpState.framesWithoutWall >= HUG_LOST_TICKS
-    if wallIsGoneForGood then
-        EndClimbJumpState(pawn, cmc)
-        return false
+local Resources = {
+    -- SetIgnoreMoveInput is a COUNTER on the controller: true increments,
+    -- false decrements. ResetIgnoreMoveInput assigns the CDO default and
+    -- releases every hold including other systems'; it is never used.
+    moveinput = {
+        take = function(F) CallOpt(GetController(F.pawn), "SetIgnoreMoveInput", true) end,
+        give = function(F) CallOpt(GetController(F.pawn), "SetIgnoreMoveInput", false) end,
+    },
+    glider = {
+        take = function(F)
+            local glider = ReadOpt(F.pawn, "BP_GliderComponent")
+            if IsLive(glider) then
+                CallOpt(F.cmc, "SetGliderDisbleFlag", ReadOpt(glider, "GliderDisableFlag"), true)
+            end
+        end,
+        give = function(F)
+            local glider = ReadOpt(F.pawn, "BP_GliderComponent")
+            if IsLive(glider) then
+                CallOpt(F.cmc, "SetGliderDisbleFlag", ReadOpt(glider, "GliderDisableFlag"), false)
+            end
+        end,
+    },
+    -- JumpMaxCount = 0 makes ACharacter::CanJump fail.
+    nativejump = {
+        take = function(F, r)
+            r.saved = ReadOpt(F.pawn, "JumpMaxCount") or 1
+            WriteOpt(F.pawn, "JumpMaxCount", 0)
+        end,
+        give = function(F, r) WriteOpt(F.pawn, "JumpMaxCount", r.saved or 1) end,
+    },
+    -- The write itself is also applied from the component's ReceiveTick
+    -- pre-hook, the only point provably ahead of its logic this frame.
+    suppress = {
+        take = function() S.wantSuppress = true;  ApplyClimbSuppression() end,
+        give = function() S.wantSuppress = false; ApplyClimbSuppression() end,
+    },
+    -- Rotation is ours while we own the pawn. OrientRotationToMovement left
+    -- on spins the character toward the stick every frame. Restored to the
+    -- SPAWN values: a value read at take time can be the game's own false
+    -- from a climb already in progress.
+    rotation = {
+        take = function(F)
+            WriteOpt(F.cmc, "bUseControllerDesiredRotation", false)
+            WriteOpt(F.cmc, "bOrientRotationToMovement", false)
+        end,
+        give = function(F)
+            local desired = S.defaultDesiredRot
+            if desired == nil then desired = true end
+            WriteOpt(F.cmc, "bUseControllerDesiredRotation", desired)
+            if S.defaultOrient ~= nil then
+                WriteOpt(F.cmc, "bOrientRotationToMovement", S.defaultOrient)
+            end
+        end,
+    },
+    -- ClimbMaxSpeed = 0 doubles as the input lock during a slide.
+    climbmax = {
+        take = function(F, r)
+            r.saved = ReadOpt(F.cmc, "ClimbMaxSpeed")
+            if r.saved ~= nil and not WriteOpt(F.cmc, "ClimbMaxSpeed", 0) then
+                dbg("WARN: ClimbMaxSpeed write failed -- slide input not locked")
+                r.saved = nil
+            end
+        end,
+        give = function(F, r)
+            if r.saved ~= nil then WriteOpt(F.cmc, "ClimbMaxSpeed", r.saved) end
+        end,
+    },
+}
+
+local function SettleResources(F)
+    for name, r in pairs(S.own) do
+        local wanted = next(r.owners) ~= nil
+        if wanted and not r.applied then
+            r.applied = true
+            Resources[name].take(F, r)
+        elseif not wanted and r.applied then
+            r.applied = false
+            Resources[name].give(F, r)
+            S.own[name] = nil
+        elseif not wanted then
+            S.own[name] = nil
+        end
+    end
+end
+
+local function Take(F, name, owner)
+    local r = S.own[name]
+    if r == nil then
+        r = { owners = {}, applied = false }
+        S.own[name] = r
+    end
+    r.owners[owner] = true
+    if not S.inTransition then SettleResources(F) end
+end
+
+local function Give(F, name, owner)
+    local r = S.own[name]
+    if r == nil or not r.owners[owner] then return end
+    r.owners[owner] = nil
+    if not S.inTransition then SettleResources(F) end
+end
+
+local function GiveAll(F, owner)
+    for _, r in pairs(S.own) do r.owners[owner] = nil end
+    if not S.inTransition then SettleResources(F) end
+end
+
+-- =========================================================================
+-- 6. SENSING
+-- Traces on the climbing component's own channel. A hit is normalised to
+-- { normalX, normalY, normalZ, gap } where gap is clearance from the
+-- capsule SURFACE, so every threshold in section 2 means the same thing.
+-- =========================================================================
+
+local function EnsureKSL()
+    if IsLive(S.KSL) then return S.KSL end
+    S.KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    if IsLive(S.KSL) then return S.KSL end
+    return nil
+end
+
+local function rawReadHit(h)
+    local n = h.ImpactNormal
+    return n.X, n.Y, n.Z, h.Distance
+end
+local function ReadHit(hitResult)
+    local ok, nx, ny, nz, dist = pcall(rawReadHit, hitResult)
+    if not ok or type(nx) ~= "number" or type(ny) ~= "number"
+       or type(nz) ~= "number" or type(dist) ~= "number" then
+        return nil
+    end
+    return nx, ny, nz, dist
+end
+
+-- One trace. radius 0 = line; radius > 0 without halfH = sphere; with
+-- halfH = upright capsule. Returns normalX, normalY, normalZ, distance, or nil.
+local function Trace(pawn, from, to, channel, radius, halfH)
+    local KSL = EnsureKSL()
+    if KSL == nil then return nil end
+    local hitResult, ok, didHit = {}, false, nil
+    if halfH ~= nil then
+        ok, didHit = CallOpt(KSL, "CapsuleTraceSingle", pawn, from, to, radius, halfH,
+            channel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+            TRACE_COLOR_A, TRACE_COLOR_B, 0.0)
+    elseif radius > 0 then
+        ok, didHit = CallOpt(KSL, "SphereTraceSingle", pawn, from, to, radius,
+            channel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+            TRACE_COLOR_A, TRACE_COLOR_B, 0.0)
+    else
+        ok, didHit = CallOpt(KSL, "LineTraceSingle", pawn, from, to,
+            channel, false, {}, TRACE_DRAW_NONE, hitResult, true,
+            TRACE_COLOR_A, TRACE_COLOR_B, 0.0)
+    end
+    if not ok or not didHit then return nil end
+    return ReadHit(hitResult)
+end
+
+-- A level probe from the capsule centre (offset up/down by heightOffset and
+-- sideways by lateral; positive lateral is to the left of travel). `origin`
+-- is the frame's location when the caller has it; nothing moves the pawn
+-- before sensing within a tick.
+local function TraceAlongDirection(pawn, direction, rayLength, heightOffset, lateral, origin)
+    local base = origin or GetLoc(pawn)
+    if base == nil then return nil end
+    local start = { X = base.X, Y = base.Y, Z = base.Z + (heightOffset or 0) }
+    if lateral and lateral ~= 0 then
+        start.X = start.X - direction.Y * lateral
+        start.Y = start.Y + direction.X * lateral
+    end
+    local finish = { X = start.X + direction.X * rayLength,
+                     Y = start.Y + direction.Y * rayLength, Z = start.Z }
+    local radius = T.Detect.PROBE_RADIUS
+    local nx, ny, nz, dist = Trace(pawn, start, finish, S.channel, radius, nil)
+    if nx == nil then return nil end
+    -- A sweep's Distance is how far the sphere's CENTRE travelled; the
+    -- surface it touched is one radius further on.
+    return { normalX = nx, normalY = ny, normalZ = nz, gap = dist + radius - S.radius }
+end
+
+-- Vertical extent of the capsule check relative to the actor origin: bottom
+-- just above step height, top at eye level. Half height never drops below
+-- the radius (a capsule shorter than it is wide is a sphere).
+local function CapsuleCheckExtent()
+    local bottom = -S.halfH + T.Detect.FOOT_CLEARANCE
+    local top    =  S.halfH * T.Detect.EYE_OFFSET_FRAC
+    local centre = (bottom + top) * 0.5
+    local half   = math.max((top - bottom) * 0.5, S.radius)
+    return centre, half
+end
+
+-- The capsule check. Because the swept radius IS the player's radius, the
+-- sweep distance is the clearance from the player's surface: gap = Distance.
+local function CapsuleSweepAhead(pawn, direction, maxGap, origin)
+    origin = origin or GetLoc(pawn)
+    if origin == nil then return nil end
+    local zc, half = CapsuleCheckExtent()
+    local from = { X = origin.X, Y = origin.Y, Z = origin.Z + zc }
+    local to   = { X = origin.X + direction.X * maxGap,
+                   Y = origin.Y + direction.Y * maxGap, Z = origin.Z + zc }
+    local nx, ny, nz, dist = Trace(pawn, from, to, S.channel, S.radius, half)
+    if nx == nil then return nil end
+    return { normalX = nx, normalY = ny, normalZ = nz, gap = dist }
+end
+
+-- Decided once, on the first grounded frame: a sweep straight down must
+-- find the floor and report a readable distance, or every wall would be
+-- invisible, silently. Visibility channel: the floor blocks it regardless.
+local function SelfTestCapsuleTrace(pawn)
+    local origin = GetLoc(pawn)
+    if origin == nil then return end
+    local from = { X = origin.X, Y = origin.Y, Z = origin.Z + 150 }
+    local to   = { X = origin.X, Y = origin.Y, Z = origin.Z - 150 }
+    local KSL = EnsureKSL()
+    if KSL == nil then return end
+    local hitResult = {}
+    local ok, didHit = CallOpt(KSL, "CapsuleTraceSingle", pawn, from, to, S.radius, S.halfH,
+        0, false, {}, TRACE_DRAW_NONE, hitResult, true, TRACE_COLOR_A, TRACE_COLOR_B, 0.0)
+    if not ok or not didHit then return end   -- nothing under us yet; next grounded frame
+    local dist = ReadOpt(hitResult, "Distance")
+    S.capsuleTraceOk = (type(dist) == "number")
+    if S.capsuleTraceOk then
+        ddbg("capsule trace self-test: OK (floor at %.1f) -- capsule check active", dist)
+    else
+        ddbg("capsule trace self-test: FAILED -- CapsuleTraceSingle does not fill "
+            .. "the hit struct on this build. Falling back to line probes.")
+    end
+end
+
+local function UsingCapsuleCheck()
+    return T.Detect.SHAPE == "capsule" and S.capsuleTraceOk ~= false
+end
+
+-- Everything that makes a hit a climbable wall, in one place, so detection
+-- and attach cannot drift apart. Returns { faceDir, gap } or nil.
+local function ClassifyWallHit(hit, maxGap)
+    if hit == nil then return nil end
+    -- Deep negative gap: the trace started inside geometry, where UE returns
+    -- a normal facing back down the trace (a perfect head-on wall, always).
+    if hit.gap < -T.Detect.PENETRATION_SLOP then return nil end
+    if hit.gap > maxGap then return nil end
+    -- The game's own line between "walk up it" and "must climb it".
+    if hit.normalZ >= S.walkableZ then return nil end
+    local intoWall = NormalizeXY(-hit.normalX, -hit.normalY)
+    if intoWall == nil then return nil end
+    return { faceDir = intoWall, gap = math.max(hit.gap, 0) }
+end
+
+-- Probes at three heights and keeps the nearest climbable face. `gap` is
+-- the nearest reading (what a hold loop should chase); `centreGap` is the
+-- centre ray alone, the ray the component itself casts, and the one an
+-- attach is judged on.
+local function ProbeWallFan(pawn, direction, rayLength, maxGap, origin)
+    local bestWall, centreGap = nil, nil
+    local function ProbeAt(heightOffset)
+        local wall = ClassifyWallHit(
+            TraceAlongDirection(pawn, direction, rayLength, heightOffset, 0, origin), maxGap)
+        if wall == nil then return nil end
+        if bestWall == nil or wall.gap < bestWall.gap then bestWall = wall end
+        return wall
+    end
+    local centre = ProbeAt(0)
+    if centre ~= nil then centreGap = centre.gap end
+    if S.fanOffset > 0 then
+        ProbeAt(S.fanOffset)
+        ProbeAt(-S.fanOffset)
+    end
+    if bestWall ~= nil then bestWall.centreGap = centreGap end
+    return bestWall
+end
+
+-- The two tests that separate a wall from something merely in the way.
+-- Both probe along the APPROACH direction: "would the player, going this
+-- way, meet a face here".
+local function PassesWallShapeChecks(pawn, direction, reach, origin)
+    local probeReach = reach + T.Detect.SLACK
+    if T.Detect.REQUIRE_EYE then
+        local eye = TraceAlongDirection(pawn, direction, probeReach,
+            S.halfH * T.Detect.EYE_OFFSET_FRAC, 0, origin)
+        if eye == nil then return false, "not at eye level (low obstacle)" end
+        if eye.normalZ >= S.walkableZ then
+            return false, string.format("walkable at eye level (normalZ %.2f)", eye.normalZ)
+        end
+    end
+    if T.Detect.REQUIRE_WIDTH then
+        local w = T.Detect.WIDTH_HALF
+        local left  = TraceAlongDirection(pawn, direction, probeReach, 0,  w, origin)
+        local right = TraceAlongDirection(pawn, direction, probeReach, 0, -w, origin)
+        if left == nil or right == nil then
+            return false, string.format("too narrow (left %s, right %s)",
+                left and "hit" or "miss", right and "hit" or "miss")
+        end
     end
     return true
 end
 
--- Where the player is asking to go, in world space. Acceleration rather
--- than Velocity: pressed against a wall the velocity collapses to zero
--- while the input stays populated.
-local function GetInputDirection(cmc)
-    local acceleration = ReadOpt(cmc, "Acceleration")
-    if acceleration == nil then return nil end
+-- Is the player moving into a wall, rather than past one or up a slope?
+-- Returns { faceDir, gap } or nil plus a short reason.
+local function WallInMovementPath(F, maxGap, useFan)
+    local inputDirection = F.input
+    if inputDirection == nil then return nil, "no input held" end
 
-    local inputX, inputY = 0, 0
-    local readOk = pcall(function() inputX, inputY = acceleration.X, acceleration.Y end)
-    if not readOk then return nil end
-
-    local inputMagnitude = math.sqrt(inputX * inputX + inputY * inputY)
-    local noInputHeld = inputMagnitude < INIT_CLIMB_INPUT_FLOOR
-    if noInputHeld then return nil end
-
-    return { X = inputX / inputMagnitude, Y = inputY / inputMagnitude }
-end
-
--- One level ray from the capsule centre, on the climbing component's own
--- trace channel. Returns { normalX, normalY, normalZ, gap } or nil, where
--- gap is measured from the capsule SURFACE rather than its centre.
-local function TraceAlongDirection(pawn, direction, rayLength)
-    if not IsLive(KSL) then
-        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
-        if not IsLive(KSL) then
-            dbg("[climb] Failed Trace Along")
-            return nil 
+    local rayLength = S.radius + maxGap
+    local hit, wall
+    if UsingCapsuleCheck() then
+        hit = CapsuleSweepAhead(F.pawn, inputDirection, maxGap, F.loc)
+        if hit == nil then return nil, "capsule found nothing" end
+        wall = ClassifyWallHit(hit, maxGap)
+        if wall == nil then
+            if hit.normalZ >= S.walkableZ then
+                return nil, string.format("capsule hit walkable (normalZ %.2f)", hit.normalZ)
+            end
+            return nil, "capsule hit unclassifiable"
+        end
+    elseif useFan then
+        wall = ProbeWallFan(F.pawn, inputDirection, rayLength, maxGap, F.loc)
+        if wall == nil then return nil, "fan found no climbable face" end
+    else
+        hit = TraceAlongDirection(F.pawn, inputDirection, rayLength, 0, 0, F.loc)
+        if hit == nil then return nil, "ray missed" end
+        wall = ClassifyWallHit(hit, maxGap)
+        if wall == nil then
+            if hit.gap < -T.Detect.PENETRATION_SLOP then
+                return nil, string.format("trace inside geometry (gap %.1f)", hit.gap)
+            elseif hit.gap > maxGap then
+                return nil, string.format("beyond reach (gap %.1f > %.0f)", hit.gap, maxGap)
+            elseif hit.normalZ >= S.walkableZ then
+                return nil, string.format("surface walkable (normalZ %.2f)", hit.normalZ)
+            end
+            return nil, "unclassifiable hit"
         end
     end
 
-    local origin = GetLoc(pawn)
-    if origin == nil then return nil end
+    local alignment = inputDirection.X * wall.faceDir.X + inputDirection.Y * wall.faceDir.Y
+    if alignment < T.Detect.CONE_COS then
+        return nil, string.format("outside cone (%.0f deg)",
+            math.deg(math.acos(Clamp(alignment, -1, 1))))
+    end
 
-    local finish = {
-        X = origin.X + direction.X * rayLength,
-        Y = origin.Y + direction.Y * rayLength,
-        Z = origin.Z,
-    }
+    local shapeOk, shapeWhy = PassesWallShapeChecks(F.pawn, inputDirection, rayLength, F.loc)
+    if not shapeOk then return nil, shapeWhy end
+    return wall
+end
 
-    local hitResult, didHit = {}, nil
+-- Three rays in a fan around the leap's facing; the best hit or nil.
+-- Returns { normalX, normalY, gap, rayAngle }: a non-zero rayAngle means the
+-- face is off to that side, which is what identifies a corner.
+local function SenseWall(pawn, wallFacing, leapSideSign, origin)
+    local bestHit, bestScore = nil, math.huge
+    local function CastRay(angleDeg)
+        local a = math.rad(angleDeg)
+        local dir = { X = wallFacing.X * math.cos(a) - wallFacing.Y * math.sin(a),
+                      Y = wallFacing.X * math.sin(a) + wallFacing.Y * math.cos(a) }
+        local hit = TraceAlongDirection(pawn, dir, T.Leap.RAY_LEN, 0, 0, origin)
+        if hit == nil then return end
+        -- The ray angled toward the leap's travel side sees corners first,
+        -- so it wins near-ties.
+        local leading = (leapSideSign ~= 0) and (angleDeg * leapSideSign > 0)
+        local score = hit.gap - (leading and T.Leap.LEAD_RAY_BONUS or 0)
+        if score < bestScore then
+            bestScore = score
+            bestHit = { normalX = hit.normalX, normalY = hit.normalY, gap = hit.gap, rayAngle = angleDeg }
+        end
+    end
+    CastRay(0)
+    if leapSideSign ~= 0 then
+        CastRay(T.Leap.FAN_DEG * leapSideSign)
+        CastRay(-T.Leap.FAN_DEG * leapSideSign)
+    end
+    return bestHit
+end
+
+-- Is the face about to end just above us? Low ray still finds it, high ray
+-- finds nothing: that difference is the lip.
+local function SenseTopEdge(pawn, faceDir, origin)
+    local reach = S.radius + T.TopOut.MAX_GAP
+    local low = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.LOW_OFFSET, 0, origin)
+    if low == nil or low.gap > T.TopOut.MAX_GAP then return false end
+    if low.normalZ >= S.walkableZ then return false end   -- a slope rolling over, not a lip
+    local high = TraceAlongDirection(pawn, faceDir, reach, T.TopOut.HIGH_OFFSET, 0, origin)
+    return high == nil
+end
+
+-- =========================================================================
+-- 7. STATES
+-- Each mode is { enter(F, from, payload), tick(F) -> next, why, payload | nil,
+-- exit(F, to, why) }. Ticks read the Frame and never re-read the game for
+-- what the Frame already holds. ReadModes re-reads the movement mode after
+-- this file's own writes, the only reads that can change mid-tick.
+-- =========================================================================
+
+local function ReadModes(F)
+    F.mode       = ReadOpt(F.cmc, "MovementMode") or 0
+    F.custom     = ReadOpt(F.cmc, "CustomMovementMode") or 0
+    F.isClimbing = (F.mode == 6 and F.custom == 5)
+    F.isWalking  = (F.mode == 1 or F.mode == 2 or (F.mode == 6 and F.custom == 2))
+    F.isFalling  = (F.mode == 3)
+end
+
+local function rawVz(c) return c.Velocity.Z end
+local function ReadFrame(pawn, cmc, dt)
+    local F = { pawn = pawn, cmc = cmc, dt = dt }
+    ReadModes(F)
+    local okVz, vz = pcall(rawVz, cmc)
+    F.vz    = (okVz and type(vz) == "number") and vz or 0
+    F.loc   = GetLoc(pawn)
+    F.input = GetInputDirection(cmc)
+    F.atTop = IsLive(S.comp) and ReadOpt(S.comp, "UpAtTopMode") == true
+    return F
+end
+
+-- This frame's height, from the Frame. Only the slide moves the pawn
+-- mid-tick, and it re-reads for itself.
+local function GetZ(F)
+    return F.loc and F.loc.Z or 0
+end
+
+local function GetLocZ(pawn)
+    local loc = GetLoc(pawn)
+    return loc and loc.Z or nil
+end
+
+-- Writes the component into its organic post-attach signature and forces
+-- climb mode. Reports whether the writes were kept: latched or not.
+local function ForceAttach(F)
+    if not IsLive(S.comp) then
+        dbg("WARN: climb component stale -- attach skipped")
+        return false
+    end
+    -- Direct CanClimbing write: the suppression bookkeeping follows it or a
+    -- later release would believe it still holds the component off.
+    if WriteOpt(S.comp, "CanClimbing", true) then
+        S.wantSuppress = false
+        S.heldSuppress = false
+    end
+    local ok = CallOpt(F.cmc, "SetMovementMode", 6, 5)
+    if not ok then
+        WriteOpt(F.cmc, "MovementMode", 6)
+        WriteOpt(F.cmc, "CustomMovementMode", 5)
+    end
+    WriteOpt(S.comp, "IsClimbing", true)
+    WriteOpt(S.comp, "IsEnding", false)
+    ReadModes(F)
+    return F.isClimbing
+end
+
+-- The component's own external entry: "try to start climbing now", built
+-- for the moment a grapple lands the player against a face. Called only
+-- when the signature dump has shown it takes no arguments.
+local function TryComponentClimbEntry()
+    if S.grappleCallable ~= true or not IsLive(S.comp) then return false end
+    return (CallOpt(S.comp, "TryClimbAfterGrappling"))
+end
+
+-- Bucket and side sign for a climb jump, from the stick in wall space.
+-- Neutral maps to UP.
+local function ClassifyJumpDirection(alongWall, upward)
+    local mag = math.sqrt(alongWall * alongWall + upward * upward)
+    if mag < 1e-3 then return "UP", 0 end
+    local x, y = alongWall / mag, upward / mag
+    local best, bestDot = nil, -math.huge
+    for _, d in ipairs(JUMP_DIRECTIONS) do
+        local len = math.sqrt(d.x * d.x + d.y * d.y)
+        local dot = x * (d.x / len) + y * (d.y / len)
+        if dot > bestDot then bestDot, best = dot, d end
+    end
+    return best.name, best.sign
+end
+
+local States = {}
+
+-- ---- IDLE ---------------------------------------------------------------
+-- Nothing owned. Arms the approach on a walk-in or a rise at a face; a
+-- plain fall is left to the component's organic grab so the wall slide
+-- keeps its entry.
+States[Mode.IDLE] = {
+    enter = function() end,
+    tick = function(F)
+        if F.isClimbing then return Mode.LATCHED, "organic grab" end
+        if F.atTop then return Mode.VAULT, "component vault" end
+
+        if S.guard.cooldown > 0 then
+            S.guard.cooldown = math.max(0, S.guard.cooldown - F.dt)
+            return nil
+        end
+        local rising = F.isFalling and F.vz >= T.Guard.RISE_VZ_MIN
+        if not (F.isWalking or rising) then return nil end
+        -- Without a component to hand the wall to, a hop would spend the
+        -- player's jump for nothing.
+        if not IsLive(S.comp) then return nil end
+
+        local wall = WallInMovementPath(F, T.Guard.REACH, false)
+        if wall == nil then return nil end
+        S.guard.pending = wall
+        return Mode.APPROACH, "face in reach"
+    end,
+    exit = function() end,
+}
+
+-- ---- APPROACH -----------------------------------------------------------
+-- Holds the component off from REACH in and commits once close enough.
+-- Once armed it holds through the whole approach: a jump at a wall arcs
+-- over long before the face is in range, and checking "still rising" every
+-- frame would drop the guard exactly when it is needed.
+local function YieldWall(F, reason, gap)
+    if Budget("giveups", T.Log.GIVEUPS) then
+        ddbg("guard gave up (%s, lastGap=%s) -- wall handed back to the vanilla "
+            .. "grab for %.2fs", reason, gap and string.format("%.1f", gap) or "none",
+            T.Guard.COOLDOWN)
+    end
+    S.guard.cooldown = T.Guard.COOLDOWN
+end
+
+States[Mode.APPROACH] = {
+    enter = function(F)
+        S.guard.armedTime  = 0
+        S.guard.lostFrames = 0
+        Take(F, "suppress", Mode.APPROACH)
+    end,
+    tick = function(F)
+        if F.isClimbing then return Mode.LATCHED, "organic grab" end
+        -- The wall slide's own entry speed: hand off at exactly one boundary.
+        if F.isFalling and F.vz <= T.Slide.VZ_TRIGGER then
+            return Mode.IDLE, "falling hard: wall slide's entry"
+        end
+
+        -- The wall IDLE found this frame is reused rather than re-probed.
+        local wall, why = S.guard.pending, nil
+        S.guard.pending = nil
+        if wall == nil then
+            wall, why = WallInMovementPath(F, T.Guard.REACH, false)
+            -- Line mode only: the single centre ray is blind to a face recessed
+            -- at waist height; the fan gets the second look. The capsule sweep
+            -- already spans the height, so a second call would repeat it.
+            if wall == nil and why ~= "no input held" and not UsingCapsuleCheck() then
+                wall = WallInMovementPath(F, T.Guard.REACH, true)
+            end
+        end
+
+        if wall == nil then
+            -- Releasing the stick is the absence of a request, not a failure
+            -- to converge: no cooldown, ready to re-arm the instant it returns.
+            if why == "no input held" then return Mode.IDLE, "input released" end
+            S.guard.lostFrames = S.guard.lostFrames + 1
+            if S.guard.lostFrames < T.Guard.LOST_TICKS then return nil end
+            YieldWall(F, why or "probe lost the face", nil)
+            return Mode.IDLE, "face lost"
+        end
+        S.guard.lostFrames = 0
+        S.guard.armedTime  = S.guard.armedTime + F.dt
+
+        -- A walk-in commits close, where it reads as intent; an airborne
+        -- approach commits as soon as the hop can still land before contact.
+        local commitGap = F.isWalking and T.Guard.COMMIT_WALK or T.Guard.COMMIT_AIR
+        if wall.gap <= commitGap * T.Guard.FAN_NEAR_MULT and not UsingCapsuleCheck() then
+            local fanned = WallInMovementPath(F, T.Guard.REACH, true)
+            if fanned ~= nil and fanned.gap < wall.gap then wall = fanned end
+        end
+        fdbg("guard: gap=%.1f vz=%.0f walk=%s armed=%.2fs", wall.gap, F.vz,
+            tostring(F.isWalking), S.guard.armedTime)
+
+        if wall.gap <= commitGap then
+            return Mode.ASCENT, F.isWalking and "ground entry" or "air entry", wall
+        end
+        if S.guard.armedTime >= T.Guard.TIMEOUT then
+            YieldWall(F, "no commit before timeout", wall.gap)
+            return Mode.IDLE, "timeout"
+        end
+        return nil
+    end,
+    exit = function(F) GiveAll(F, Mode.APPROACH) end,
+}
+
+-- ---- ASCENT -------------------------------------------------------------
+-- Walk or fly into a face -> hop -> latch. One state for both entries.
+--   launch : ground asks the game to jump and waits for MOVE_Falling
+--            (RequestJump only raises bPressedJump); air is airborne
+--            already and holds APPROACH_HOLD before writing the hop.
+--   rise   : every frame re-probes the face, re-squares to it, and holds
+--            the gap with a closed loop.
+--   attach : the moment the centre gap is inside ATTACH_GAP, on every frame
+--            until the window closes.
+-- Owns: suppression, move input, glider, gravity, rotation (via priority).
+local function AscentFail(F, reason)
+    -- A sequence that spent its jump hands the wall to vanilla for the same
+    -- cooldown a guard give-up takes; otherwise a player still pushing at a
+    -- face this file could not take re-arms next frame and jumps again.
+    S.guard.cooldown = T.Guard.COOLDOWN
+    return Mode.IDLE, reason
+end
+
+-- Ground entry: false until the character has actually left the ground.
+local function AscentConfirmLaunch(F, a)
+    if a.hasLaunched then return true end
+    a.timeSinceRequest = a.timeSinceRequest + F.dt
+    if not F.isFalling then return false end
+    a.hasLaunched = true
+    a.launchZ     = GetZ(F)
+    if T.Ascent.LAUNCH_VZ ~= nil then SetVertVel(F.cmc, T.Ascent.LAUNCH_VZ) end
+    return true
+end
+
+local function AscentMiniHop(F, a)
+    local hopVz = Clamp(F.vz + T.Ascent.HOP_VZ_ADD, T.Ascent.HOP_VZ_MIN, T.Ascent.HOP_VZ_MAX)
+    SetVertVel(F.cmc, hopVz)
+    SetHorizVel(F.cmc, a.faceDir.X * T.Ascent.HOP_IN_SPEED, a.faceDir.Y * T.Ascent.HOP_IN_SPEED)
+    a.phase   = "rise"
+    a.airTime = 0
+    a.launchZ = GetZ(F)
+    dbg("mini hop after %.2fs approach: vz %.0f -> %.0f", a.approachTime, F.vz, hopVz)
+end
+
+-- Air time and rise only let the hop read as a hop before the latch lands.
+-- The apex clause guarantees the gate opens for a minimum-strength hop.
+local function AscentGateOpen(F, a)
+    if a.airTime < T.Ascent.MIN_AIR_TIME then return false end
+    if GetZ(F) - a.launchZ >= T.Ascent.MIN_RISE then return true end
+    return F.vz <= 0
+end
+
+States[Mode.ASCENT] = {
+    enter = function(F, from, wall)
+        local a = {
+            type = F.isWalking and "ground" or "air",
+            faceDir = wall.faceDir,
+            currentYaw = math.deg(math.atan(wall.faceDir.Y, wall.faceDir.X)),
+            phase = "launch", timeSinceRequest = 0, hasLaunched = false,
+            approachTime = 0, airTime = 0, launchZ = GetZ(F),
+            tries = 0, retryCooldown = 0, framesWithoutWall = 0, inVel = 0,
+            refused = false,
+        }
+        S.ascent = a
+        FaceYaw(F.pawn, a.faceDir)
+        Take(F, "suppress",  Mode.ASCENT)
+        Take(F, "moveinput", Mode.ASCENT)
+        Take(F, "glider",    Mode.ASCENT)
+
+        if a.type == "ground" then
+            -- The game's own jump keeps its animation and stamina cost.
+            if not CallOpt(F.pawn, "RequestJump") then a.refused = true end
+        else
+            a.phase = "hold"
+            a.hasLaunched = true
+        end
+        S.log.seq = (S.log.seq or 0) + 1
+        dbg("ascent #%d start: %s entry, gap=%.1f", S.log.seq, a.type, wall.gap)
+    end,
+    tick = function(F)
+        local a = S.ascent
+        if F.isClimbing then return Mode.LATCHED, "climb reached outside the sequence" end
+        if a.refused then return AscentFail(F, "RequestJump call failed") end
+        if not AscentConfirmLaunch(F, a) then
+            if a.timeSinceRequest > T.Ascent.LAUNCH_GRACE then
+                return AscentFail(F, "jump never executed")
+            end
+            return nil
+        end
+
+        if a.phase == "hold" then
+            a.approachTime = a.approachTime + F.dt
+        else
+            a.airTime = a.airTime + F.dt
+            if a.airTime > T.Ascent.LOCK_TIME then
+                return AscentFail(F, "window closed without a latch")
+            end
+        end
+
+        WriteOpt(F.cmc, "GravityScale", T.Ascent.GRAVITY)
+        DrainMoveInput(F.cmc)
+
+        -- Tracks well past grab range so the hold loop can pull a drifting
+        -- ascent back in instead of losing the face.
+        local wall = ProbeWallFan(F.pawn, a.faceDir, S.radius + T.Guard.REACH, T.Guard.REACH, F.loc)
+        if wall == nil then
+            a.framesWithoutWall = a.framesWithoutWall + 1
+            a.inVel = 0
+            if a.framesWithoutWall >= T.Ascent.LOST_TICKS then
+                return AscentFail(F, "wall lost during ascent")
+            end
+        else
+            a.framesWithoutWall = 0
+            a.currentYaw, a.faceDir = SlewYawToward(a.currentYaw, wall.faceDir.X, wall.faceDir.Y,
+                F.dt, T.Ascent.YAW_RATE)
+            a.inVel = Clamp((wall.gap - T.Ascent.HOLD_GAP) * T.Ascent.IN_GAIN,
+                -T.Ascent.IN_MAX, T.Ascent.IN_MAX)
+        end
+        FaceYaw(F.pawn, a.faceDir)
+        SetHorizVel(F.cmc, a.faceDir.X * a.inVel, a.faceDir.Y * a.inVel)
+
+        -- The hold: same tracking and the same loop driving at the face, but
+        -- no attach attempts, so the hop reads as a deliberate move.
+        if a.phase == "hold" then
+            if a.approachTime >= T.Ascent.APPROACH_HOLD then AscentMiniHop(F, a) end
+            return nil
+        end
+
+        a.retryCooldown = math.max(0, a.retryCooldown - F.dt)
+        -- Judged on the centre ray, the one the component re-casts to decide
+        -- whether to keep the climb.
+        local attachGap = wall and (wall.centreGap or wall.gap)
+        if attachGap == nil or a.retryCooldown > 0 or attachGap > T.Detect.ATTACH_GAP
+           or not AscentGateOpen(F, a) then
+            return nil
+        end
+
+        local latched = ForceAttach(F)
+        a.tries         = a.tries + 1
+        a.retryCooldown = T.Ascent.RETRY_INTERVAL
+        if Budget("latch", T.Log.LATCH) then
+            ddbg("attach try %d: gap=%.1f (reach %.1f) rise=%.0f air=%.2fs groundCheck=%s -> %s",
+                a.tries, attachGap, T.Detect.ATTACH_GAP, GetZ(F) - a.launchZ, a.airTime,
+                tostring(S.lastGroundCheck), latched and "LATCHED" or "refused")
+        end
+        if latched then
+            S.watch = { left = T.Latch.HOLD, faceDir = a.faceDir, launchZ = a.launchZ,
+                        reforces = 0, rescued = false, drops = 0 }
+            return Mode.LATCHED, "attached"
+        end
+        return nil
+    end,
+    exit = function(F, to, why)
+        local a = S.ascent
+        S.ascent = nil
+        GiveAll(F, Mode.ASCENT)
+        if Budget("transitions", T.Log.TRANSITIONS) and to ~= Mode.LATCHED then
+            ddbg("ascent #%d end: %s (%s entry, %.2fs aloft) <-- a jump spent without "
+                .. "a latch; wall handed to vanilla for %.2fs",
+                S.log.seq or 0, why or "?", a and a.type or "?", a and a.airTime or 0,
+                T.Guard.COOLDOWN)
+        end
+    end,
+}
+
+-- ---- LATCHED ------------------------------------------------------------
+-- Climbing. Raw stick input goes to the component in wall space, the latch
+-- watch guards a forced attach, the wall slide catches a fast entry, and
+-- the player's jump out of climb mode is classified into LEAP or DISMOUNT.
+-- Owns: rotation (via priority); climbmax while sliding.
+
+local function SlideBegin(F, entryVz)
+    S.slide = { v = math.min(math.abs(entryVz), T.Slide.VZ_CAP) * T.Slide.TRANSFER }
+    Take(F, "climbmax", Mode.LATCHED)
+    dbg("slide start: entryVz=%.0f v0=%.0f", entryVz, S.slide.v)
+end
+
+local function SlideEnd(F, reason)
+    if S.slide == nil then return end
+    S.slide = nil
+    Give(F, "climbmax", Mode.LATCHED)
+    dbg("slide end: %s", reason)
+end
+
+-- Position writes: in climb mode the component's solver owns Velocity.
+local function SlideTick(F)
+    local s = S.slide
+    local deltaZ = s.v * F.dt
+    local z0 = GetLocZ(F.pawn)
+    local ok = CallOpt(F.pawn, "K2_AddActorWorldOffset", { X = 0, Y = 0, Z = -deltaZ }, true, {}, false)
+    if not ok then SlideEnd(F, "K2_AddActorWorldOffset call failed") return end
+    local z1 = GetLocZ(F.pawn)
+    if deltaZ > 0.5 and z0 ~= nil and z1 ~= nil then
+        local moved = z0 - z1
+        if moved < deltaZ * T.Slide.BLOCK_RATIO then
+            SlideEnd(F, string.format("blocked (commanded %.1f, moved %.1f)", deltaZ, moved))
+            return
+        end
+    end
+    s.v = s.v - T.Slide.DECEL * F.dt
+    if s.v <= T.Slide.MIN_V then SlideEnd(F, "decayed to halt") end
+end
+
+-- Discard the camera-derived input vector and feed the stick in wall space.
+local function ApplyRawClimbInput(F)
+    DrainMoveInput(F.cmc)
+    local along, up, mag = Input.GetStick()
+    if mag == 0 then return end
+    local fwd = S.prev.wallFwd
+    local rightX, rightY = -fwd.Y, fwd.X
+    CallOpt(F.pawn, "AddMovementInput", { X = rightX * along, Y = rightY * along, Z = up }, 1.0, false)
+end
+
+-- Runs while a forced latch is under watch. Returns true if the drop was
+-- answered and the pawn is climbing again.
+local function LatchWatchTick(F)
+    local w = S.watch
+    if w == nil then return false end
+    w.left = w.left - F.dt
+    if w.left <= 0 then
+        if Budget("latch", T.Log.LATCH) then
+            ddbg("latch watch over: %s after %d drop(s), %d re-force(s), rescue=%s",
+                F.isClimbing and "HELD" or "not climbing", w.drops, w.reforces, tostring(w.rescued))
+        end
+        S.watch = nil
+        return false
+    end
+    if F.isClimbing then return false end
+
+    -- The component ends its climb into a walking mode from well above the
+    -- ground. A non-falling exit is only a landing if the pawn is back near
+    -- the launch height; otherwise it is a drop like any other.
+    local rise = GetZ(F) - w.launchZ
+    local landed = not F.isFalling and rise < T.Ascent.MIN_RISE * 0.5
+    if landed then S.watch = nil return false end
+
+    local face
+    if UsingCapsuleCheck() then
+        face = CapsuleSweepAhead(F.pawn, w.faceDir, T.Detect.ATTACH_GAP, F.loc)
+    else
+        face = TraceAlongDirection(F.pawn, w.faceDir, S.radius + T.Detect.ATTACH_GAP, 0, 0, F.loc)
+    end
+    if face == nil or face.gap > T.Detect.ATTACH_GAP then S.watch = nil return false end
+
+    w.drops = w.drops + 1
+    -- The component's own flags at the moment of the drop, before anything
+    -- here rewrites them: a CanClimbing of false says it refused on purpose.
+    local how = string.format("rise=%.0f gap=%.1f movement=%d/%d canClimb=%s ending=%s groundCheck=%s",
+        rise, face.gap, F.mode, F.custom, tostring(ReadOpt(S.comp, "CanClimbing")),
+        tostring(ReadOpt(S.comp, "IsEnding")), tostring(S.lastGroundCheck))
+
+    -- The component's own entry first, once. If it takes, its state is set
+    -- up the way its update expects and the drops should stop.
+    if not w.rescued then
+        w.rescued = true
+        if TryComponentClimbEntry() then
+            ReadModes(F)
+            if Budget("latch", T.Log.LATCH) then
+                ddbg("latch DROPPED (#%d, %s): component entry -> %s", w.drops, how,
+                    F.isClimbing and "CLIMBING" or "no effect")
+            end
+            if F.isClimbing then return true end
+        end
+    end
+    if w.reforces >= T.Latch.MAX_REFORCE then
+        -- Not straight back to another hop: the wall goes to vanilla for a
+        -- moment, the same as a guard give-up.
+        S.guard.cooldown = T.Guard.COOLDOWN
+        if Budget("latch", T.Log.LATCH) then
+            ddbg("latch DROPPED #%d: re-force budget spent -- wall handed to vanilla for %.2fs",
+                w.drops, T.Guard.COOLDOWN)
+        end
+        S.watch = nil
+        return false
+    end
+    w.reforces = w.reforces + 1
+
+    -- The component pushes the pawn off the face on the way out and leaves
+    -- it drifting away. Square up and drive back in with the ascent's own
+    -- hold loop before forcing the mode, or each re-force is made from a
+    -- worse position than the last.
+    FaceYaw(F.pawn, w.faceDir)
+    local inVel = Clamp((face.gap - T.Ascent.HOLD_GAP) * T.Ascent.IN_GAIN, 0, T.Ascent.IN_MAX)
+    SetHorizVel(F.cmc, w.faceDir.X * inVel, w.faceDir.Y * inVel)
+
+    local held = ForceAttach(F)
+    if Budget("latch", T.Log.LATCH) then
+        ddbg("latch DROPPED (#%d, %s): re-forced #%d (in %.0f uu/s)", w.drops, how, w.reforces, inVel)
+    end
+    return held
+end
+
+States[Mode.LATCHED] = {
+    enter = function(F, from)
+        -- A fast fall the component caught organically becomes a slide.
+        -- Our own attaches and leap re-attaches arrive slowly by design.
+        if from == Mode.IDLE or from == Mode.APPROACH then
+            local entryVz = math.min(S.prev.fallVz, F.vz)
+            if entryVz <= T.Slide.VZ_TRIGGER then SlideBegin(F, entryVz) end
+        end
+    end,
+    tick = function(F)
+        -- The player's jump out of climb mode. Checked before the latch
+        -- watch, or a jump inside the watch window would be re-forced.
+        if F.isFalling and F.vz > T.Leap.JUMP_VZ_MIN then
+            local bucket, sign = ClassifyJumpDirection(S.prev.alongWall, S.prev.upward)
+            if bucket == "DOWN" then return Mode.DISMOUNT, "jump: hop away" end
+            return Mode.LEAP, "jump: " .. bucket, { bucket = bucket, sign = sign }
+        end
+
+        -- The watch runs every frame so it expires while the latch holds;
+        -- a drop it answers leaves the pawn climbing again.
+        local w = S.watch
+        local answered = LatchWatchTick(F)
+        if not F.isClimbing and not answered then
+            return Mode.IDLE, string.format("left climb mode (movement %d/%d%s)", F.mode, F.custom,
+                w and string.format(", rise %.0f", GetZ(F) - w.launchZ) or "")
+        end
+        if F.atTop then return Mode.VAULT, "component vault" end
+
+        -- This frame's facing first: the stick is decomposed against it, and
+        -- the jump classifier and the leap's initial facing read it later.
+        local fwd = WallFwd(F.pawn)
+        if fwd ~= nil then S.prev.wallFwd = fwd end
+
+        ApplyRawClimbInput(F)
+        if S.slide ~= nil then SlideTick(F) end
+
+        local along, up = Input.GetStick()
+        S.prev.alongWall, S.prev.upward = along, up
+        if along > 0 then S.prev.sideSign = 1 elseif along < 0 then S.prev.sideSign = -1 end
+        return nil
+    end,
+    exit = function(F)
+        SlideEnd(F, "left climb mode")
+        S.watch = nil
+        GiveAll(F, Mode.LATCHED)
+    end,
+}
+
+-- ---- LEAP ---------------------------------------------------------------
+-- Driven wall-plane leap: an eased speed along the leap direction, an
+-- inward correction that holds the gap, and a scheduled attach window at
+-- the end. Owns: move input, glider, gravity (0 during the drive), rotation.
+
+local function LeapGapCorrection(l, gap, alignment)
+    -- Off-angle the ray hits obliquely and reads longer than the true gap,
+    -- which would drive the correction backwards.
+    if alignment < T.Leap.PARALLEL then l.inVel = 0 return end
+    l.inVel = Clamp((gap - T.Leap.HOLD_GAP) * T.Leap.IN_GAIN, -T.Leap.IN_MAX, T.Leap.IN_MAX)
+end
+
+-- Turns this frame's wall reading into a facing update and a gap
+-- correction. Returns nil to continue, or a reason to end the leap.
+local function LeapTrackSurface(F, l, hit)
+    if hit == nil then
+        l.framesWithoutWall = l.framesWithoutWall + 1
+        l.inVel = 0
+        if l.framesWithoutWall >= T.Leap.LOST_TICKS then return "wall lost" end
+        return nil
+    end
+    l.framesWithoutWall = 0
+
+    local toward = NormalizeXY(-hit.normalX, -hit.normalY)
+    if toward == nil then return nil end   -- not vertical enough to face
+
+    -- Smooth the raw normal to remove high-frequency trace jitter.
+    local cur = l.smoothFaceDir or l.faceDir
+    local k = math.min(1.0, F.dt * T.Leap.NORMAL_SMOOTHING)
+    local sm = NormalizeXY(cur.X + (toward.X - cur.X) * k, cur.Y + (toward.Y - cur.Y) * k) or toward
+    l.smoothFaceDir = sm
+
+    local alignment = l.faceDir.X * sm.X + l.faceDir.Y * sm.Y
+    if alignment < T.Leap.WRAP_COS then return "corner too sharp" end
+
+    l.currentYaw, l.faceDir = SlewYawToward(l.currentYaw, sm.X, sm.Y, F.dt, T.Leap.YAW_RATE)
+    LeapGapCorrection(l, hit.gap, alignment)
+    return nil
+end
+
+local function LeapApplyVelocity(F, l)
+    local alongX, alongY = -l.faceDir.Y, l.faceDir.X
+    local progress = math.min(l.deltaTime / l.driveTime, 1.0)
+    local speed = T.Leap.EASE(T.Leap.SPEED_START, T.Leap.SPEED_END, progress)
+    local inward = l.inVel or 0
+    SetHorizVel(F.cmc,
+        alongX * l.dirSide * speed + l.faceDir.X * inward,
+        alongY * l.dirSide * speed + l.faceDir.Y * inward)
+    SetVertVel(F.cmc, l.dirUp * speed)
+    FaceYaw(F.pawn, l.faceDir)
+end
+
+States[Mode.LEAP] = {
+    enter = function(F, from, jump)
+        local ang  = math.rad(T.Leap.ANGLES[jump.bucket])
+        local mean = T.Leap.SPEED_START / 6 + 5 * T.Leap.SPEED_END / 6
+        local fwd  = S.prev.wallFwd
+        S.leap = {
+            kind = jump.bucket, deltaTime = 0, faceDir = fwd,
+            currentYaw = math.deg(math.atan(fwd.Y, fwd.X)),
+            dirUp = math.cos(ang), dirSide = math.sin(ang) * jump.sign,
+            driveTime = T.Leap.DIST / mean,
+            tries = 0, framesWithoutWall = 0, inVel = 0, smoothFaceDir = nil,
+        }
+        Take(F, "glider",    Mode.LEAP)
+        Take(F, "moveinput", Mode.LEAP)
+        dbg("leap [%s%s]: drive %.0fms", jump.bucket,
+            jump.sign ~= 0 and (jump.sign > 0 and "/R" or "/L") or "", S.leap.driveTime * 1000)
+    end,
+    tick = function(F)
+        local l = S.leap
+        DrainMoveInput(F.cmc)
+        l.deltaTime = l.deltaTime + F.dt
+        if F.isClimbing then return Mode.LATCHED, "leap attached" end
+        if not F.isFalling then return Mode.IDLE, "leap ended: not falling" end
+
+        -- Catch the top-out before anything else, while rising only.
+        if T.TopOut.ENABLED and l.dirUp > 0 and SenseTopEdge(F.pawn, l.faceDir, F.loc) then
+            if ForceAttach(F) then
+                dbg("top-out caught mid-leap")
+                return Mode.LATCHED, "top-out"
+            end
+        end
+
+        local inWindow  = l.deltaTime < l.driveTime + T.Leap.ATTACH_WINDOW
+        local atAttach  = l.deltaTime >= l.driveTime
+        local hit = SenseWall(F.pawn, l.faceDir, l.dirSide, F.loc)
+
+        if inWindow then
+            WriteOpt(F.cmc, "GravityScale", 0.0)
+            local why = LeapTrackSurface(F, l, hit)
+            if why ~= nil then return Mode.IDLE, "leap ended: " .. why end
+            LeapApplyVelocity(F, l)
+        end
+        if atAttach then
+            LeapApplyVelocity(F, l)
+            if l.tries < T.Leap.ATTACH_TRIES and hit ~= nil and hit.gap <= T.Detect.ATTACH_GAP then
+                l.tries = l.tries + 1
+                if ForceAttach(F) then return Mode.LATCHED, "leap attached" end
+            end
+            if l.deltaTime > l.driveTime + T.Leap.ATTACH_WINDOW then
+                return Mode.IDLE, "leap ended: window closed"
+            end
+        end
+        return nil
+    end,
+    exit = function(F)
+        S.leap = nil
+        GiveAll(F, Mode.LEAP)
+    end,
+}
+
+-- ---- DISMOUNT -----------------------------------------------------------
+-- The hop away. A normal-ish jump: no priority, so jump.lua's gravity bands
+-- resume at once. Owns: move input, glider, for the lock window only.
+States[Mode.DISMOUNT] = {
+    enter = function(F)
+        S.leap = { deltaTime = 0, faceDir = S.prev.wallFwd }
+        Take(F, "glider",    Mode.DISMOUNT)
+        Take(F, "moveinput", Mode.DISMOUNT)
+        SetVertVel(F.cmc, T.Dismount.VZ)
+        SetHorizVel(F.cmc, -S.prev.wallFwd.X * T.Dismount.OUT, -S.prev.wallFwd.Y * T.Dismount.OUT)
+        dbg("dismount: out=%d vz=%d lock=%.2fs", T.Dismount.OUT, T.Dismount.VZ, T.Dismount.LOCK)
+    end,
+    tick = function(F)
+        local l = S.leap
+        DrainMoveInput(F.cmc)
+        l.deltaTime = l.deltaTime + F.dt
+        if F.isClimbing then return Mode.LATCHED, "re-grabbed during dismount" end
+        if not F.isFalling then return Mode.IDLE, "dismount landed" end
+        if l.deltaTime >= T.Dismount.LOCK then return Mode.IDLE, "dismount lock over" end
+        local awayX, awayY = -l.faceDir.X, -l.faceDir.Y
+        SetHorizVel(F.cmc, awayX * T.Dismount.OUT, awayY * T.Dismount.OUT)
+        FaceYaw(F.pawn, { X = awayX, Y = awayY })
+        return nil
+    end,
+    exit = function(F)
+        S.leap = nil
+        GiveAll(F, Mode.DISMOUNT)
+    end,
+}
+
+-- ---- VAULT --------------------------------------------------------------
+-- The component's own top-out animation owns the pawn; input and the native
+-- jump are held off so it cannot be cancelled early.
+States[Mode.VAULT] = {
+    enter = function(F)
+        Take(F, "moveinput",  Mode.VAULT)
+        Take(F, "nativejump", Mode.VAULT)
+    end,
+    tick = function(F)
+        if F.atTop then return nil end
+        if F.isClimbing then return Mode.LATCHED, "vault over, still climbing" end
+        return Mode.IDLE, "vault over"
+    end,
+    exit = function(F) GiveAll(F, Mode.VAULT) end,
+}
+
+-- ---- transitions --------------------------------------------------------
+
+local function SetMode(F, next, why, payload)
+    local from = S.mode
+    S.inTransition = true
+    States[from].exit(F, next, why)
+    S.mode     = next
+    S.modeTime = 0
+    ReadModes(F)
+    States[next].enter(F, from, payload)
+
+    -- Priority is a function of the mode: jump.lua is gated off and the
+    -- rotation flags are ours while it holds.
+    local priority = PRIORITY[next] == true
+    if priority then Take(F, "rotation", "priority") else Give(F, "rotation", "priority") end
+    CommonState.ClimbHasPriority = priority
+
+    S.inTransition = false
+    SettleResources(F)
+
+    M.Mode = next
+    M.InInitClimbState = (next == Mode.ASCENT)
+    M.InClimbJump      = (next == Mode.LEAP or next == Mode.DISMOUNT)
+    if Budget("transitions", T.Log.TRANSITIONS) then
+        ddbg("%s -> %s (%s)", from, next, why or "?")
+    end
+end
+
+-- =========================================================================
+-- 8. VISUALISATION (TraceViz; inert unless DEBUG_VOLUMES)
+-- The capsule drawn IS the capsule check: same origin, extent, reach and
+-- channel as CapsuleSweepAhead. The eye and width sweeps are the filters.
+-- The green ring appears only when all of it would count as a wall.
+-- =========================================================================
+
+local COLOR_GUARD  = { R = 1.0,  G = 0.25, B = 0.10, A = 1.0 }
+local COLOR_COMMIT = { R = 0.15, G = 1.0,  B = 0.25, A = 1.0 }
+local COLOR_ATTACH = { R = 0.20, G = 0.55, B = 1.0,  A = 1.0 }
+local COLOR_PROBE  = { R = 1.0,  G = 0.0,  B = 0.0,  A = 1.0 }
+local COLOR_HIT    = { R = 0.0,  G = 1.0,  B = 0.0,  A = 1.0 }
+local COLOR_RANGE  = { R = 0.35, G = 0.85, B = 1.0,  A = 0.8 }
+local VIZ_MIN_PROBE_RADIUS = 18
+local vizCategory = nil
+
+local function VizCategory()
+    if vizCategory == nil and Viz ~= nil then
+        pcall(function() vizCategory = Viz.MakeCategory("PalFeel.Climb") end)
+    end
+    return vizCategory
+end
+
+local function DrawGate(origin, dir, dist, color, cat)
+    local x, y = origin.X + dir.X * dist, origin.Y + dir.Y * dist
     pcall(function()
-        didHit = KSL:LineTraceSingle(pawn, origin, finish,
-            ReadOpt(comp, "Const_RayChannel") or 0, false, {}, 0,
-            hitResult, true,
-            { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 }, 0.0)
+        Viz.DrawLine({ X = x, Y = y, Z = origin.Z - S.halfH * 0.5 },
+                     { X = x, Y = y, Z = origin.Z + S.halfH * 0.5 },
+                     color, 2.0, DEBUG_VOLUME_TIME, cat)
     end)
-    if not didHit then return nil end
-
-    local normalX, normalY, normalZ, distanceFromCentre
-    pcall(function() normalX = hitResult.ImpactNormal.X end)
-    pcall(function() normalY = hitResult.ImpactNormal.Y end)
-    pcall(function() normalZ = hitResult.ImpactNormal.Z end)
-    pcall(function() distanceFromCentre = hitResult.Distance end)
-
-    local hitIsReadable = type(normalX) == "number"
-        and type(normalY) == "number"
-        and type(normalZ) == "number"
-        and type(distanceFromCentre) == "number"
-    if not hitIsReadable then return nil end
-    fdbg("[climb] hit is readable!")
-    return {
-        normalX = normalX,
-        normalY = normalY,
-        normalZ = normalZ,
-        gap     = distanceFromCentre - capsuleRadius,
-    }
 end
 
--- Is the player moving into a wall, rather than past one or up a slope?
--- Returns the wall as { faceDir, gap } so the starter has a direction to
--- launch along and face; nil when any condition fails.
-local function WallInMovementPath(pawn, cmc)
-    local inputDirection = GetInputDirection(cmc)
-    if inputDirection == nil then return nil end
-
-    -- Ray length is derived from the grab distance, so "the ray hit" and
-    -- "the wall is close enough" are one statement instead of two knobs.
-    local rayLength = capsuleRadius + INIT_CLIMB_MAX_GAP
-    local hit = TraceAlongDirection(pawn, inputDirection, rayLength)
-    if hit == nil then return nil end
-      
-    -- A hit closer than the capsule radius means the trace started inside
-    -- geometry, where UE returns a normal facing back down the trace --
-    -- which would read as a perfectly head-on wall every time.
-    local traceStartedInsideGeometry = hit.gap < 0
-    if traceStartedInsideGeometry then return nil end
-
-    -- The game's own line between "walk up it" and "must climb it".
-    local surfaceIsTooSteepToWalk = hit.normalZ < walkableFloorZ
-    if not surfaceIsTooSteepToWalk then return nil end
-    
-    local intoWall = NormalizeXY(-hit.normalX, -hit.normalY)
-    if intoWall == nil then return nil end
-
-    local approachAlignment = inputDirection.X * intoWall.X + inputDirection.Y * intoWall.Y
-    local isHeadOnApproach = approachAlignment >= INIT_CLIMB_CONE_COS
-    if not isHeadOnApproach then return nil end
-    fdbg("[climb] Walking into wall!")
-    return { faceDir = intoWall, gap = hit.gap }
+local function DrawSweep(from, to, radius, cat)
+    local hit = nil
+    pcall(function()
+        hit = Viz.SphereTrace(from, to, radius, {
+            Channel = S.channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+            HitColor = COLOR_PROBE, MissColor = COLOR_PROBE,
+            DrawImpactNormal = false, DrawSweptVolume = true })
+    end)
+    if hit and hit.bBlockingHit and hit.Location then
+        pcall(function() Viz.DrawSphere(hit.Location, radius, 12, COLOR_HIT, 1.5, DEBUG_VOLUME_TIME, cat) end)
+        return hit
+    end
+    return nil
 end
 
+local function VisualiseClimbChecks(F)
+    if not DEBUG_VOLUMES or Viz == nil then return end
+    local origin = F.loc
+    if origin == nil then return end
+    local dir = F.input or WallFwd(F.pawn)
+    if dir == nil then return end
 
--- pcall does NOT protect against native AVs: every dereference is
--- individually null-checked.
+    local cat    = VizCategory()
+    local radius = math.max(T.Detect.PROBE_RADIUS, VIZ_MIN_PROBE_RADIUS)
+    local reach  = S.radius + T.Guard.REACH
+
+    local function Sweep(h, lateral, len)
+        local sx, sy = origin.X - dir.Y * lateral, origin.Y + dir.X * lateral
+        return DrawSweep({ X = sx, Y = sy, Z = origin.Z + h },
+                         { X = sx + dir.X * len, Y = sy + dir.Y * len, Z = origin.Z + h }, radius, cat)
+    end
+
+    local face = nil
+    if UsingCapsuleCheck() then
+        local zc, half = CapsuleCheckExtent()
+        pcall(function()
+            face = Viz.CapsuleTrace(
+                { X = origin.X, Y = origin.Y, Z = origin.Z + zc },
+                { X = origin.X + dir.X * T.Guard.REACH, Y = origin.Y + dir.Y * T.Guard.REACH, Z = origin.Z + zc },
+                S.radius, half,
+                { Channel = S.channel, Duration = DEBUG_VOLUME_TIME, Category = cat,
+                  HitColor = COLOR_RANGE, MissColor = COLOR_RANGE,
+                  DrawImpactNormal = true, DrawSweptVolume = true })
+        end)
+        if face and not face.bBlockingHit then face = nil end
+    else
+        local waist = Sweep(0, 0, reach)
+        local low   = (S.fanOffset > 0) and Sweep(-S.fanOffset, 0, reach) or nil
+        face = waist or low
+    end
+
+    local eye   = Sweep(S.halfH * T.Detect.EYE_OFFSET_FRAC, 0, reach)
+    local left  = Sweep(0,  T.Detect.WIDTH_HALF, reach)
+    local right = Sweep(0, -T.Detect.WIDTH_HALF, reach)
+    if face and eye and left and right and face.ImpactPoint then
+        pcall(function() Viz.DrawSphere(face.ImpactPoint, radius * 1.8, 24, COLOR_HIT, 3.0, DEBUG_VOLUME_TIME, cat) end)
+    end
+
+    if DEBUG_VOLUME_GATES then
+        DrawGate(origin, dir, S.radius + T.Guard.REACH,       COLOR_GUARD,  cat)
+        DrawGate(origin, dir, S.radius + T.Guard.COMMIT_AIR,  COLOR_COMMIT, cat)
+        DrawGate(origin, dir, S.radius + T.Guard.COMMIT_WALK, COLOR_COMMIT, cat)
+        DrawGate(origin, dir, S.radius + T.Detect.ATTACH_GAP, COLOR_ATTACH, cat)
+    end
+end
+
+-- Any single-frame displacement large enough to be a teleport, with the
+-- mode this file was in when it happened. This file writes movement modes,
+-- velocities and component flags, and any of those can hand the pawn to
+-- game code that relocates it.
+local function WatchForTeleport(F)
+    local here = F.loc
+    if here == nil then S.lastLoc = nil return end
+    local last = S.lastLoc
+    S.lastLoc = here
+    if last == nil then return end
+    local dx, dy, dz = here.X - last.X, here.Y - last.Y, here.Z - last.Z
+    local moved = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if moved < T.Log.TELEPORT_JUMP_UU then return end
+    if not Budget("teleports", T.Log.TELEPORTS) then return end
+    ddbg("TELEPORT: moved %.0fuu in one frame (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) | mode=%s "
+        .. "phase=%s suppressed=%s movement=%d/%d",
+        moved, last.X, last.Y, last.Z, here.X, here.Y, here.Z, S.mode,
+        S.ascent and S.ascent.phase or "-", tostring(S.wantSuppress), F.mode, F.custom)
+end
+
+-- =========================================================================
+-- 9. HOOKS
+-- Class-level BP function hooks: registered once per session (the class
+-- persists across respawns; re-registering would double-fire), instance-
+-- filtered in the callbacks.
+-- =========================================================================
+
 local function FindClimbingComponent(pawn)
-    local ok, arr = pcall(function() return pawn.BlueprintCreatedComponents end)
+    local ok, arr = pcall(rawGet, pawn, "BlueprintCreatedComponents")
     if not ok or arr == nil then return nil, nil end
-    local n = 0
-    pcall(function() n = #arr end)
+    local okN, n = pcall(function() return #arr end)
+    if not okN then return nil, nil end
     for i = 1, n do
-        local okC, c = pcall(function() return arr[i] end)
-        if okC and c ~= nil and IsLive(c) then
-            local okN, name = pcall(function() return c:GetFullName() end)
-            if okN and type(name) == "string" and name:find("Climb") then
+        local okC, c = pcall(rawGet, arr, i)
+        if okC and IsLive(c) then
+            local okName, name = CallOpt(c, "GetFullName")
+            if okName and type(name) == "string" and name:find("Climb") then
                 return c, name
             end
         end
@@ -487,951 +1701,164 @@ local function FindClimbingComponent(pawn)
     return nil, nil
 end
 
--- =========================================================================
--- 4. GEOMETRY
--- =========================================================================
-
-local function GetZ(pawn)
-    local l = GetLoc(pawn)
-    return l and l.Z or nil
-end
-
--- The pawn's horizontal forward direction. During climbing the character is
--- pressed flat against the wall, so this doubles as the into-wall direction.
-local function WallFwd(pawn)
-    if pawn == nil then return nil end
-
-    local forwardX, forwardY = nil, nil
-    local readSucceeded = pcall(function()
-        local forward = pawn:GetActorForwardVector()
-        forwardX = forward.X
-        forwardY = forward.Y
-    end)
-
-    local gotUsableNumbers = readSucceeded
-        and type(forwardX) == "number"
-        and type(forwardY) == "number"
-    if not gotUsableNumbers then return nil end
-
-    local horizontalLength =
-        math.sqrt(forwardX * forwardX + forwardY * forwardY)
-    if horizontalLength < 1e-4 then return nil end
-
-    return { X = forwardX / horizontalLength, Y = forwardY / horizontalLength }
-end
-
-local function SetHorizVel(cmc, x, y)
-    pcall(function()
-        cmc.Velocity.X = x
-        cmc.Velocity.Y = y
-    end)
-end
-
-local function FaceYaw(pawn, faceDir)
-    if not LOCK_ROTATION or faceDir == nil then return end
-    local yaw = math.deg(math.atan(faceDir.Y, faceDir.X))
-    pcall(function()
-        pawn:K2_SetActorRotation({ Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
-    end)
-end
-
--- =========================================================================
---  INIT CLIMB SEQUENCE
--- =========================================================================
-
-local function EndInitClimb(pawn, cmc, reason)
-    if not M.InInitClimbState then return end
-    initClimbState     = nil
-    pawn.JumpMaxCount = originalJumpMax
-    EnableForInitClimb(pawn, cmc)
-    M.InInitClimbState = false
-    dbg("init climb end: %s", reason or "?")
-end
-
--- Two-sensor agreement, same pair and same thresholds the climb jump uses:
--- the ray must see the wall AND the swept capsule must be blocked by it.
--- Returns whether the pawn came out of this in climb mode.
-local function TryInitClimbAttach(pawn, cmc)
-    local hasAttemptsLeft = initClimbState.tries < INIT_CLIMB_MAX_TRIES
-    if not hasAttemptsLeft then return false end
-
-    local wall = TraceAlongDirection(pawn, initClimbState.faceDir, HUG_RAY_LEN)
-    local wallIsInReach = (wall ~= nil) and (wall.gap <= ATTACH_MAX_GAP)
-    if wall == nil then return nil end
-    local traceStartedInsideGeometry = wall.gap < 0
-    if traceStartedInsideGeometry then return nil end
-    local surfaceIsTooSteepToWalk = wall.normalZ < walkableFloorZ
-    if not surfaceIsTooSteepToWalk then return nil end
-    if not wallIsInReach then return false end
-
-    local pawnYaw = 0
-    pcall(function() pawnYaw = pawn:K2_GetActorRotation().Yaw end)
-    local wantedYaw = math.deg(math.atan(initClimbState.faceDir.Y, initClimbState.faceDir.X))
-    local facingErrorDeg = math.abs(((pawnYaw - wantedYaw + 180) % 360) - 180)
-
-    dbg("attach: facingErr=%.1f gap=%.1f normalZ=%.2f rise=%.0f",
-        facingErrorDeg, wall.gap, wall.normalZ, GetZ(pawn) - cmc.Velocity.Z)
-
-    ForceClimbAttach(cmc)
-    initClimbState.tries = initClimbState.tries + 1
-
-    -- Read back rather than trusting the write: ForceClimbAttach reports
-    -- whether its calls succeeded, not whether the component kept the mode.
-    local movementMode       = cmc.MovementMode
-    local customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
-    return movementMode == 6 and customMovementMode == 5
-end
-
--- Square up to the wall and hand off to the game's own jump. Nothing has
--- left the ground when this returns -- Jump only raises bPressedJump, and
--- the character's movement tick is what acts on it.
-local function StartClimbFromGround(pawn, cmc, wall)
-    initClimbState = {
-        type      = "ground",
-        deltaTime = 0,
-        faceDir   = wall.faceDir,
-        tries     = 0,
-        timeSinceRequest = 0
-    }
-
-    -- Degree correction bounded by the detection cone.
-    FaceYaw(pawn, wall.faceDir)
-
-    local jumpRequested = pcall(function() pawn:RequestJump() end)
-    if not jumpRequested then
-        dbg("init climb: Jump() call failed -- aborting")
-        initClimbState = nil
-        return
-    end
-
-    M.InInitClimbState = true
-    DisableForInitClimb(pawn, cmc)
-
-    dbg("init climb from ground: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
-        wall.gap, wall.faceDir.X, wall.faceDir.Y,
-        tostring(ReadOpt(cmc, "JumpZVelocity")))
-end
-
-local function StartClimbFromJump(pawn, cmc, wall)
-    initClimbState = {
-        type      = "jump",
-        deltaTime = 0,
-        faceDir   = wall.faceDir,
-        tries     = 0,
-        timeSinceRequest = 0
-    }
-
-    -- Degree correction bounded by the detection cone.
-    FaceYaw(pawn, wall.faceDir)
-    originalJumpMax = pawn.JumpMaxCount
-    pawn.JumpMaxCount = originalJumpMax + 1
-    local jumpRequested = pcall(function() pawn:RequestJump() end)
-    if not jumpRequested then
-        dbg("init climb: Jump() call failed -- aborting")
-        initClimbState = nil
-        return
-    end
-
-    M.InInitClimbState = true
-    DisableForInitClimb(pawn, cmc)
-
-    dbg("init climb from jump: gap=%.1f face=(%+.2f,%+.2f) jumpZ=%s",
-        wall.gap, wall.faceDir.X, wall.faceDir.Y,
-        tostring(ReadOpt(cmc, "JumpZVelocity")))
-end
-
-
-local function DriveInitClimb(dt, pawn, cmc)
-    initClimbState.timeSinceRequest = initClimbState.timeSinceRequest + dt
-
-    if not initClimbState.hasLaunched then
-        local hasLeftTheGround = (cmc.MovementMode == 3)
-        if not hasLeftTheGround then
-            local jumpWasRefused =
-                initClimbState.timeSinceRequest > INIT_CLIMB_LAUNCH_GRACE
-            if jumpWasRefused then
-                EndInitClimb(pawn, cmc, "jump never executed")
-            end
-            return
-        end
-        initClimbState.hasLaunched = true
-    end
-
-    initClimbState.deltaTime = initClimbState.deltaTime + dt
-    FaceYaw(pawn, initClimbState.faceDir)
-    
-    -- Are we past the window for jumping to climb?
-    local windowHasClosed = initClimbState.deltaTime > INIT_CLIMB_LOCK_TIME
-    if windowHasClosed then
-        EndInitClimb(pawn, cmc, "window closed without a latch")
-        return
-    end
-    
-    local hasClearedTheGround = false 
-
-    if initClimbState.type == "ground" then
-        hasClearedTheGround = initClimbState.deltaTime >= INIT_CLIMB_ATTACH_AT_GROUND
-    elseif initClimbState.type == "jump" then
-        hasClearedTheGround = initClimbState.deltaTime >= INIT_CLIMB_ATTACH_AT_JUMP
-    end
-
-    if not hasClearedTheGround then return end
-    EnableForInitClimb(pawn, cmc)
-
-    -- Fourth, after we lept into the air, try to attach to wall
-    local hasLatched = TryInitClimbAttach(pawn, cmc)
-    if hasLatched then
-        fdbg("driveinit: t=%.3f launched=%s mode=%d tries=%d",
-            initClimbState.deltaTime, tostring(initClimbState.hasLaunched),
-            cmc.MovementMode, initClimbState.tries)
-        EndInitClimb(pawn, cmc, "latched")
-    else 
-        fdbg("[climb.lua] FAILED, MISSED LATCH")
-    end
-end
-
--- =========================================================================
--- 5. WALL SLIDE
--- Fast fall into a wall skids down to a halt instead of latching dead.
--- Position writes (mode 6: the climb solver owns Velocity);
--- ClimbMaxSpeed = 0 doubles as the input lock.
--- =========================================================================
-
-local function BeginWallSlide(cmc, entryVz)
-    local v = math.min(math.abs(entryVz), VZ_CAP)
-    slideV  = v * TRANSFER
-    slidingDownWall = true
-    savedClimbMax = ReadOpt(cmc, "ClimbMaxSpeed")
-    if savedClimbMax ~= nil then
-        local ok = pcall(function() cmc.ClimbMaxSpeed = 0 end)
-        if not ok then
-            dbg("WARN: ClimbMaxSpeed write failed -- input not locked")
-            savedClimbMax = nil
-        end
-    else
-        dbg("WARN: ClimbMaxSpeed unreadable -- input not locked")
-    end
-    dbg("slide start: entryVz=%.0f v0=%.0f (est dist %.0f uu) lock=%s",
-        entryVz, slideV, (slideV * slideV) / (2 * DECEL),
-        tostring(savedClimbMax ~= nil))
-end
-
-local function EndWallSlide(cmc, reason)
-    if not slidingDownWall then return end
-    slidingDownWall = false
-    slideV  = 0
-    if savedClimbMax ~= nil then
-        pcall(function() cmc.ClimbMaxSpeed = savedClimbMax end)
-        savedClimbMax = nil
-    end
-    dbg("slide end: %s", reason or "?")
-end
-
-local function TickWallSlide(dt, pawn, cmc)
-    local deltaZ = slideV * dt
-    local z0 = GetZ(pawn)
-    local okMove = pcall(function()
-        pawn:K2_AddActorWorldOffset({ X = 0, Y = 0, Z = -deltaZ }, true, {}, false)
-    end)
-    if not okMove then
-        EndWallSlide(cmc, "K2_AddActorWorldOffset call failed")
-        return
-    end
-    if z0 ~= nil then
-        local z1 = GetZ(pawn)
-        if z1 ~= nil and deltaZ > 0.5 then
-            local moved = z0 - z1
-            if moved < deltaZ * BLOCK_RATIO then
-                EndWallSlide(cmc, string.format(
-                    "blocked (commanded %.1f, moved %.1f)", deltaZ, moved))
-                return
-            end
-        end
-    end
-    slideV = slideV - DECEL * dt
-    if slideV <= MIN_SLIDE_V then
-        EndWallSlide(cmc, "decayed to halt")
-    end
-end
-
--- Arm on a genuine fast-fall climb entry only: forced attaches land at
--- low vz and never arm mid climb jump (cj guard; FIX A supplies fresh
--- mode state so the guard holds on the post-attach frame).
-local function UpdateWallSlide(dt, pawn, cmc, isClimbing)
-    if isClimbing and not prevModeWasClimb and climbJumpState == nil then
-        local entryVz = math.min(lastFallVz, cmc.Velocity.Z)
-        if entryVz <= VZ_TRIGGER then
-            BeginWallSlide(cmc, entryVz)
-        end
-    end
-
-    if slidingDownWall and not isClimbing then
-        EndWallSlide(cmc, "left climb mode")
-    end
-
-    if slidingDownWall and isClimbing then
-        TickWallSlide(dt, pawn, cmc)
-    end
-end
-
--- =========================================================================
--- 6. CLIMB JUMP
--- Detach detection -> angle-bucket classification -> driven wall-plane
--- leap with a scheduled attach window, or DOWN hop away.
--- =========================================================================
-
-
-
--- Fires three traces in a fan around the current wall facing and returns
--- the best hit, or nil if the wall was lost this frame.
---
--- Returns a table: { normalX, normalY, gap, rayAngle }
---   gap      = distance from the capsule SURFACE to the wall (not center)
---   rayAngle = which ray won, in degrees; 0 = straight ahead, sign gives
---              which side. Non-zero means the wall is off to that side,
---              which is what identifies a corner.
-local function SenseWall(pawn, wallFacing, leapSideSign)
-    if not IsLive(KSL) then return nil end
-
-    local origin = GetLoc(pawn)
-    if origin == nil then return nil end
-
-    local traceChannel = ReadOpt(comp, "Const_RayChannel") or 0
-    local bestHit = nil
-    local bestScore = math.huge
-
-    local function CastRay(rayAngleDegrees)
-        local angle = math.rad(rayAngleDegrees)
-        local cosAngle, sinAngle = math.cos(angle), math.sin(angle)
-        local directionX = wallFacing.X * cosAngle - wallFacing.Y * sinAngle
-        local directionY = wallFacing.X * sinAngle + wallFacing.Y * cosAngle
-
-        local hitResult, didHit = {}, nil
-        pcall(function()
-            didHit = KSL:LineTraceSingle(pawn, origin,
-                { X = origin.X + directionX * HUG_RAY_LEN,
-                  Y = origin.Y + directionY * HUG_RAY_LEN,
-                  Z = origin.Z },
-                traceChannel, false, {}, 0, hitResult, true,
-                {R=1,G=0,B=0,A=1}, {R=0,G=1,B=0,A=1}, 0.0)
-        end)
-        if not didHit then return end
-
-        local normalX, normalY, distanceFromCenter = nil, nil, nil
-        pcall(function() normalX = hitResult.ImpactNormal.X end)
-        pcall(function() normalY = hitResult.ImpactNormal.Y end)
-        pcall(function() distanceFromCenter = hitResult.Distance end)
-        if type(normalX) ~= "number" or type(distanceFromCenter) ~= "number" then
-            return
-        end
-
-        local gapFromCapsuleSurface = distanceFromCenter - capsuleRadius
-
-        -- The ray angled toward the leap's travel side sees corners before
-        -- the forward ray does, so it wins near-ties. The ray angled away
-        -- gets no such preference.
-        local isLeadingRay = (leapSideSign ~= 0)
-            and (rayAngleDegrees * leapSideSign > 0)
-        local score = gapFromCapsuleSurface - (isLeadingRay and LEAD_RAY_BONUS or 0)
-
-        if score < bestScore then
-            bestScore = score
-            bestHit = {
-                normalX  = normalX,
-                normalY  = normalY,
-                gap      = gapFromCapsuleSurface,
-                rayAngle = rayAngleDegrees,
-            }
-        end
-    end
-
-    CastRay(0)
-    if leapSideSign ~= 0 then
-        CastRay(HUG_FAN_DEG * leapSideSign)
-        CastRay(-HUG_FAN_DEG * leapSideSign)
-    end
-
-    return bestHit
-end
-
--- Drives the leap: along-wall travel from the eased speed curve, the
--- inward correction that holds the gap, and the vertical component.
-local function ApplyHugVelocity(pawn, cmc)
-    local faceDir = climbJumpState.faceDir
-    local alongWallX, alongWallY = -faceDir.Y, faceDir.X
-
-    local leapProgress =
-        math.min(climbJumpState.deltaTime / climbJumpState.driveTime, 1.0)
-    local driveSpeed = LEAP_EASE(LEAP_SPEED_START, LEAP_SPEED_END, leapProgress)
-
-    local inwardSpeed = climbJumpState.inVel or 0
-
-    SetHorizVel(cmc,
-        alongWallX * climbJumpState.dirSide * driveSpeed + faceDir.X * inwardSpeed,
-        alongWallY * climbJumpState.dirSide * driveSpeed + faceDir.Y * inwardSpeed)
-    pcall(function() cmc.Velocity.Z = climbJumpState.dirUp * driveSpeed end)
-
-    FaceYaw(pawn, faceDir)
-end
-
--- The leap's scheduled end: both sensors must confirm a wall before the
--- attach is forced. Gives up once the window closes.
-local function TryAttachToWall(pawn, cmc, wallHit) 
-    local hasAttemptsLeft = climbJumpState.tries < ATTACH_MAX_TRIES
-    local wallIsInReach   = (wallHit ~= nil) and (wallHit.gap <= ATTACH_MAX_GAP)
-
-    fdbg("[climb.lua] TRYING TO LATCH ON TO WALL")
-
-    if hasAttemptsLeft and wallIsInReach then
-        ForceClimbAttach(cmc)
-        climbJumpState.tries = climbJumpState.tries + 1
-    end
-
-    local attachWindowHasClosed = climbJumpState.deltaTime > climbJumpState.driveTime + ATTACH_WINDOW
-    if attachWindowHasClosed then
-        EndClimbJumpState(pawn, cmc)
-    end
-end
-
--- Returns bucket, sideSign. Angle is measured from the wall-up axis in
--- the wall plane. Neutral maps to UP (BotW: no direction held = straight
--- up). Velocity-based for now; see the input diagnostic in
--- DetectClimbJump.
-local function ClassifyJumpDirection(inputAlongWall, inputUpward)
-    local inputX = inputAlongWall
-    local inputY = inputUpward
-    local inputMagnitude = math.sqrt(inputX * inputX + inputY * inputY)
-
-    local noInputHeld = inputMagnitude < 1e-3
-    if noInputHeld then
-        return "UP", 0
-    end
-
-    inputX = inputX / inputMagnitude
-    inputY = inputY / inputMagnitude
-    dbg("[climb.lua] inputX: %s , inputY: %s", inputX, inputY)
-    local closestDirection = nil
-    local closestDot = -math.huge
-
-    for _, direction in ipairs(JUMP_DIRECTIONS) do
-        local length = math.sqrt(direction.x * direction.x + direction.y * direction.y)
-        local dot = inputX * (direction.x / length) + inputY * (direction.y / length)
-        if dot > closestDot then
-            closestDot = dot
-            closestDirection = direction
-        end
-    end
-
-    return closestDirection.name, closestDirection.sign
-end
-
--- Turns this frame's wall reading into a facing update and a gap correction.
--- Returns false when the leap should end.
-local function TrackWallSurface(dt, pawn, cmc, wallHit)
-    local wallWasFound = wallHit ~= nil
-    if not wallWasFound then
-        return HandleLostWall(pawn, cmc)
-    end
-
-    climbJumpState.framesWithoutWall = 0
-
-    -- ImpactNormal is unit length in 3D, so on any wall that isn't
-    -- perfectly vertical its horizontal part is shorter than 1.
-    -- Renormalize before using it as a 2D direction.
-    local towardWallX = -wallHit.normalX
-    local towardWallY = -wallHit.normalY
-    local horizontalLength =
-        math.sqrt(towardWallX * towardWallX + towardWallY * towardWallY)
-
-    local surfaceIsVerticalEnough = horizontalLength > 1e-3
-    if not surfaceIsVerticalEnough then
-        return true
-    end
-
-    towardWallX = towardWallX / horizontalLength
-    towardWallY = towardWallY / horizontalLength
-
-    -- NEW: Smooth the raw ray normal vector to eliminate high-frequency raycast jitter
-    local smoothness = 12.0 -- Higher = snappier, Lower = smoother
-    local currentSmooth = climbJumpState.smoothFaceDir or climbJumpState.faceDir
-    local smoothedX = currentSmooth.X + (towardWallX - currentSmooth.X) * math.min(1.0, dt * smoothness)
-    local smoothedY = currentSmooth.Y + (towardWallY - currentSmooth.Y) * math.min(1.0, dt * smoothness)
-    
-    local smoothLen = math.sqrt(smoothedX * smoothedX + smoothedY * smoothedY)
-    if smoothLen > 1e-3 then
-        smoothedX = smoothedX / smoothLen
-        smoothedY = smoothedY / smoothLen
-    end
-    climbJumpState.smoothFaceDir = { X = smoothedX, Y = smoothedY }
-
-    local facingAlignment =
-            climbJumpState.faceDir.X * smoothedX +
-            climbJumpState.faceDir.Y * smoothedY
-
-    local cornerIsTooSharpToWrap = facingAlignment < HUG_WRAP_COS
-    if cornerIsTooSharpToWrap then
-        EndClimbJumpState(pawn, cmc)
-        return false
-    end
-
-    -- Pass the smoothed direction to the slewing logic
-    SlewFacingToward(dt, smoothedX, smoothedY)
-    UpdateGapCorrection(wallHit.gap, facingAlignment)
-    return true
-end
-
--- One-shot out-struct characterization: a floor's normal is +1.00 by
--- definition, distinguishing a populated normal from a zero-init struct
--- (vertical walls cannot). Runs once per pawn.
-local function CharacterizeTraceStruct(pawn)
-    if not IsLive(KSL) then
-        KSL = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
-        if not IsLive(KSL) then return end
-    end
-    local l = GetLoc(pawn)
-    if l == nil then return end
-    local out, hit = {}, nil
-    local ok = pcall(function()
-        hit = KSL:LineTraceSingle(pawn, l,
-            { X = l.X, Y = l.Y, Z = l.Z - 200 },
-            ReadOpt(comp, "Const_RayChannel") or 0, false, {},
-            0, out, true,
-            { R = 1.0, G = 0.0, B = 0.0, A = 1.0 },
-            { R = 0.0, G = 1.0, B = 0.0, A = 1.0 }, 0.0)
-    end)
-    if not ok then dbg("floor trace: call failed") return end
-    local nz, dist = "?", "?"
-    pcall(function() nz   = string.format("%+.2f", out.ImpactNormal.Z) end)
-    pcall(function() dist = string.format("%.1f", out.Distance) end)
-    dbg("floor trace: hit=%s dist=%s normalZ=%s  (+1.00 = normals live, "
-        .. "+0.00 = struct dead)", tostring(hit), dist, nz)
-end
-
-local function BeginWallHugLeap(pawn, cmc, bucket, sideSign)
-    local ang  = math.rad(LEAP_ANGLES[bucket])
-    local mean = LEAP_SPEED_START / 6 + 5 * LEAP_SPEED_END / 6
-    local initialYaw = math.deg(math.atan(prevWallFwd.Y, prevWallFwd.X))
-
-    climbJumpState = { mode = "hug", kind = bucket, deltaTime = 0, faceDir = prevWallFwd,
-            currentYaw = initialYaw, -- NEW: Track continuous yaw angle
-            dirUp   = math.cos(ang),
-            dirSide = math.sin(ang) * sideSign,
-            driveTime  = LEAP_DIST / mean,
-            l0 = GetLoc(pawn),
-            probes = 0, tries = 0, logged = false,
-            framesWithoutWall = 0}
-    M.InClimbJump = true
-    dbg("climb jump [%s%s] -> eased leap (%d->%d dist=%d driveTime=%.0fms)",
-        bucket, sideSign ~= 0 and (sideSign > 0 and "/R" or "/L") or "",
-        LEAP_SPEED_START, LEAP_SPEED_END, LEAP_DIST, climbJumpState.driveTime * 1000)
-end
-
-local function BeginHopAway(pawn, cmc, bucket)
-    climbJumpState = { mode = "hop", kind = bucket, deltaTime = 0, faceDir = prevWallFwd,
-           l0 = GetLoc(pawn) }
-    M.InClimbJump = true
-    -- The hop is a normal-ish jump: release climb priority so jump.lua's
-    -- gravity bands resume next tick. Without this, a gated jump.lua and
-    -- a hop that doesn't manage gravity leaves NOBODY owning
-    -- GravityScale -- and a preceding hug left it at 0.
-    CommonState.ClimbHasPriority = false
-
-    pcall(function() cmc.Velocity.Z = HOP_VZ end)
-    SetHorizVel(cmc, -prevWallFwd.X * HOP_OUT, -prevWallFwd.Y * HOP_OUT)
-    dbg("climb jump [%s] -> hop away (out=%d vz=%d lock=%.2fs)",
-        bucket, HOP_OUT, HOP_VZ, HOP_LOCK)
-end
-
-
-
-
-local function DidClimbJumpStart(cmc, mode)
-    local notGrounded = mode == 3
-    local ascendingFast = cmc.Velocity.Z > 600
-    return climbJumpState == nil and prevModeWasClimb and notGrounded and ascendingFast
-end
-
--- classify the jump and launch.
-local function StartClimbJump(pawn, cmc)
-    local bucket, sign = ClassifyJumpDirection(prevClimbInputAlongWall, prevClimbInputUpward)
-    EndWallSlide(cmc, "climb jump")
-    DisableForClimbingJump(pawn, cmc)
-    if bucket == "DOWN" then
-        BeginHopAway(pawn, cmc, bucket)
-    else
-        BeginWallHugLeap(pawn, cmc, bucket, sign)
-    end
-end
-
--- Per-frame driver for a wall-hug climb jump. Ends when the leap attaches,
--- lands, loses the wall, or runs out its window.
-local function TickHugWall(dt, pawn, cmc, mode, isClimbing)
-    if isClimbing then
-        dbg("I started climbing after jump...")
-        EndClimbJumpState(pawn, cmc)
-        return
-    end
-
-    local hasLeftFalling = mode ~= 3
-    if hasLeftFalling then
-        dbg("I have stopped falling after climb jump..?")
-        EndClimbJumpState(pawn, cmc)
-        return
-    end
-
-    local isWithinLeapWindow = climbJumpState.deltaTime < climbJumpState.driveTime + ATTACH_WINDOW
-    local hasReachedAttachWindow = climbJumpState.deltaTime >= climbJumpState.driveTime 
-    local wallHit = SenseWall(pawn, climbJumpState.faceDir, climbJumpState.dirSide)
-  
-    if isWithinLeapWindow then
-        pcall(function() cmc.GravityScale = 0.0 end)
-        local leapShouldContinue = TrackWallSurface(dt, pawn, cmc, wallHit)
-        if not leapShouldContinue then return end
-        ApplyHugVelocity(pawn, cmc)
-    end
-
-    -- If time spent in jumpstate is greater than the time we should be in it, ignoring the time it takes to do the attach animation
-    if hasReachedAttachWindow then
-        ApplyHugVelocity(pawn, cmc)
-        TryAttachToWall(pawn, cmc, wallHit)
-    end
-end
-
--- Per-frame driver for the hop-off. Pushes away from the wall for a fixed
--- window, then hands control back. No wall sensing — this is a dismount.
-local function TickHopOffWall(dt, pawn, cmc, mode)
-    -- Landing inside the lock window must release control rather than keep
-    -- shoving the pawn along the ground.
-    local hasLeftFalling = mode ~= 3
-    if hasLeftFalling then
-        EndClimbJumpState(pawn, cmc)
-        return
-    end
-
-    local isWithinPushWindow = climbJumpState.deltaTime < HOP_LOCK
-    if not isWithinPushWindow then
-        EndClimbJumpState(pawn, cmc)
-        return
-    end
-
-    -- faceDir points INTO the wall, so the hop travels and faces the
-    -- opposite direction.
-    local intoWallDir = climbJumpState.faceDir
-    local awayFromWallX = -intoWallDir.X
-    local awayFromWallY = -intoWallDir.Y
-
-    SetHorizVel(cmc, awayFromWallX * HOP_OUT, awayFromWallY * HOP_OUT)
-    FaceYaw(pawn, { X = awayFromWallX, Y = awayFromWallY })
-end
-
--- Hub function for anything with ticking the jump
-local function TickClimbJump(dt, pawn, cmc, mode, isClimbing)
-    if climbJumpState == nil then return end
-
-    climbJumpState.deltaTime = climbJumpState.deltaTime + dt
-
-    if climbJumpState.mode == "hug" then
-        TickHugWall(dt, pawn, cmc, mode, isClimbing)
-    else
-        TickHopOffWall(dt, pawn, cmc, mode)
-    end
-end
-
-local function ApplyRawClimbInput(pawn, cmc)
-    if prevWallFwd == nil then return end
-
-    -- Discard the camera-derived vector first, or ours sums with it.
-    pcall(function() cmc:ConsumeInputVector() end)
-
-    local stickAlongWall, stickUpward, stickMagnitude = Input.GetStick()
-
-    local stickIsCentred = stickMagnitude == 0
-    if stickIsCentred then return end
-
-    local wallRightX, wallRightY = -prevWallFwd.Y, prevWallFwd.X
-
-    local inputX = wallRightX * stickAlongWall
-    local inputY = wallRightY * stickAlongWall
-    local inputZ = stickUpward
-
-    pcall(function()
-        pawn:AddMovementInput({ X = inputX, Y = inputY, Z = inputZ }, 1.0, false)
-    end)
-end
-
--- =========================================================================
--- 7. CLIMB PRIORITY + COMPONENT HOOKS
--- ClimbHasPriority is the translated truth: the game's climb state is
--- raw data (drops to Falling mid-leap); this flag means "climbing, as
--- the mod understands it".
--- =========================================================================
-
--- Level-set while in climb mode; held while a hug leap is in flight;
--- otherwise a short watchdog releases it. The watchdog is the safety net
--- for exit paths not explicitly enumerated (e.g. stamina-out detach) --
--- a latched priority would otherwise permanently disable jump.lua.
-local function UpdateClimbPriority(pawn, cmc, isClimbing)
-    local shouldTakePriority = false
-
-    if isClimbing then
-        shouldTakePriority = true
-    elseif climbJumpState ~= nil and climbJumpState.mode == "hug" then
-        shouldTakePriority = true
-    elseif CommonState.ClimbHasPriority then
-        dbg("climb priority released (watchdog)")
-    end
-
-    if shouldTakePriority and not CommonState.ClimbHasPriority then
-        pcall(function() cmc.bUseControllerDesiredRotation = false end)
-        CommonState.ClimbHasPriority = true
-    elseif not shouldTakePriority then
-        pcall(function() cmc.bUseControllerDesiredRotation = true end)
-        CommonState.ClimbHasPriority = false
-    end
-end
-
 local function IsOurComponent(Context)
-    local obj = nil
-    pcall(function() obj = Context:get() end)
-    if obj == nil or compName == nil then return false end
-    local name = nil
-    pcall(function() name = obj:GetFullName() end)
-    return name == compName
+    local ok, obj = pcall(function() return Context:get() end)
+    if not ok or obj == nil or S.compName == nil then return false end
+    local okName, name = CallOpt(obj, "GetFullName")
+    return okName and name == S.compName
 end
 
 local function NoOp() end
 
--- Class-level BP function hooks: register once per session (the class
--- object persists across respawns; re-registering would double-fire).
--- Instance-filtered in the callbacks. pcall-guarded registration logs
--- whether each function name actually exists on the class.
 local function RegisterComponentHooks()
-    if hooksRegistered or comp == nil then return end
+    if hooksRegistered or S.clsPath == nil then return end
+    local clsPath = S.clsPath
 
-    local clsPath = nil
-    -- GetClass():GetFullName() on a live component: same pattern that
-    -- safely identified ABP_Player_C. (The known-crash case was
-    -- GetClass() on the holster's placeholder UObject, not this.)
-    pcall(function() clsPath = comp:GetClass():GetFullName() end)
-    if type(clsPath) ~= "string" then
-        dbg("hook reg: component class path unreadable -- skipped")
-        return
-    end
-    clsPath = clsPath:match("(%S+)$")   -- strip "BlueprintGeneratedClass "
-
-    -- Vault-to-top: advisory clear (UpdateClimbPriority re-asserts while
-    -- still in 6/5 during the vault curve, which is fine -- jump.lua has
-    -- no business during a scripted vault). Registered pre-hook.
     local okTop, errTop = pcall(function()
         RegisterHook(clsPath .. ":ClimbUpAtTopEvent", function(Context)
             if not IsOurComponent(Context) then return end
-            CommonState.ClimbHasPriority = false
-            dbg("ClimbUpAtTopEvent fired -- priority released")
+            dbg("ClimbUpAtTopEvent fired")
         end)
     end)
-    dbg("hook ClimbUpAtTopEvent: %s",
-        okTop and "registered" or ("FAILED: " .. tostring(errTop)))
+    ddbg("hook ClimbUpAtTopEvent: %s", okTop and "registered" or ("FAILED: " .. tostring(errTop)))
 
-    -- Ground contact: the return value only exists post-execution, so
-    -- NoOp pre-slot + post callback (established pattern). Return value
-    -- expected as the final vararg; logged raw on change for first-run
-    -- characterization.
+    -- Ground contact as the component sees it. The return value only exists
+    -- post-execution: NoOp pre-slot, post callback, value as the last vararg.
     local okGnd, errGnd = pcall(function()
         RegisterHook(clsPath .. ":GroundCheck", NoOp, function(Context, ...)
             if not IsOurComponent(Context) then return end
             local args = { ... }
             local ret = nil
-            if #args > 0 then
-                pcall(function() ret = args[#args]:get() end)
-            end
-            if ret ~= lastGroundCheck then
-                lastGroundCheck = ret
-                dbg("GroundCheck -> %s", tostring(ret))
-            end
-            if ret == true and CommonState.ClimbHasPriority then
-                CommonState.ClimbHasPriority = false
-                dbg("GroundCheck true -- priority released")
+            if #args > 0 then pcall(function() ret = args[#args]:get() end) end
+            if ret ~= S.lastGroundCheck then
+                S.lastGroundCheck = ret
+                if Budget("latch", T.Log.LATCH) then ddbg("GroundCheck -> %s", tostring(ret)) end
             end
         end)
     end)
-    dbg("hook GroundCheck: %s",
-        okGnd and "registered" or ("FAILED: " .. tostring(errGnd)))
+    ddbg("hook GroundCheck: %s", okGnd and "registered" or ("FAILED: " .. tostring(errGnd)))
+
+    -- ReceiveTick pre-hook: the only point in the frame provably ahead of
+    -- the component's own logic. A suppression written here lands THIS frame.
+    local okTick, errTick = pcall(function()
+        RegisterHook(clsPath .. ":ReceiveTick", function(Context)
+            if not IsOurComponent(Context) then return end
+            ApplyClimbSuppression()
+        end)
+    end)
+    ddbg("hook ReceiveTick: %s -- if FAILED, the component's tick is native and the "
+        .. "grab decision cannot be pre-empted this way",
+        okTick and "registered" or ("FAILED: " .. tostring(errTick)))
+
+    -- Signatures of the component's entry/exit functions, read from the
+    -- UFunction objects without calling anything. Decides whether
+    -- TryClimbAfterGrappling is provably no-arg, the only condition under
+    -- which the latch watch may invoke it.
+    pcall(function()
+        for _, fname in ipairs({ "TryClimbAfterGrappling", "StartClimbing", "StartClimb",
+                                 "StartClimbByNetwork", "RequestEndClimbing" }) do
+            local fn = nil
+            for _, base in ipairs({ clsPath, "/Script/Pal.PalClimbingComponent" }) do
+                if not IsLive(fn) then
+                    pcall(function() fn = StaticFindObject(base .. ":" .. fname) end)
+                end
+            end
+            if not IsLive(fn) then
+                ddbg("sig %s: not found", fname)
+            else
+                local params = {}
+                pcall(function()
+                    fn:ForEachProperty(function(prop)
+                        local n, t = "?", "?"
+                        pcall(function() n = prop:GetFName():ToString() end)
+                        pcall(function() t = prop:GetClass():GetFName():ToString() end)
+                        params[#params + 1] = n .. ":" .. t
+                    end)
+                end)
+                ddbg("sig %s(%s)", fname, table.concat(params, ", "))
+                if fname == "TryClimbAfterGrappling" then
+                    local noArgs = (#params == 0)
+                        or (#params == 1 and params[1]:sub(1, 11) == "ReturnValue")
+                    S.grappleCallable = noArgs
+                    ddbg("TryClimbAfterGrappling: %s", noArgs and "no-arg, latch watch may use it"
+                        or "has parameters, latch watch will NOT call it")
+                end
+            end
+        end
+    end)
 
     hooksRegistered = true
 end
 
 -- =========================================================================
--- 8. LIFECYCLE
+-- 10. LIFECYCLE
 -- =========================================================================
 
 function M.OnPlayerCached(pawn, cmc)
-    comp, compName = FindClimbingComponent(pawn)
-    lastFallVz     = 0
-    prevModeWasClimb  = false
-    prevWallFwd    = { X = 1, Y = 0 }
-    slidingDownWall        = false
-    slideV         = 0
-    savedClimbMax  = nil
-    climbJumpState             = nil
-    M.InClimbJump  = false
-    CommonState.ClimbHasPriority = false   -- belt; main.lua's Reset is braces
-    prevFlagIs, prevFlagCan, prevFlagEnding = nil, nil, nil
-    lastGroundCheck = nil
-    KSL            = nil
-    walkableFloorZ = ReadOpt(cmc, "WalkableFloorZ") or WALKABLE_FLOOR_Z_FALLBACK
-    initClimbState     = nil
-    M.InInitClimbState = false
-  
-    pcall(function()
-      capsuleRadius = pawn.CapsuleComponent.CapsuleRadius
-    end)
-  
-    if comp == nil then
-        dbg("climbing component NOT FOUND")
-    else
-        dbg("component: %s  ClimbMaxSpeed=%s  fwdRay=%s",
-            compName, tostring(ReadOpt(cmc, "ClimbMaxSpeed")),
-            tostring(ReadOpt(comp, "Const_ForwardRayLength")))
-        CharacterizeTraceStruct(pawn)
-        RegisterComponentHooks()
+    -- Whatever the previous pawn's modes still owned is given back on this
+    -- one (the controller survives a respawn and keeps its counters), then
+    -- every piece of state starts over.
+    local F0 = { pawn = pawn, cmc = cmc, dt = 0 }
+    for name, r in pairs(S.own) do
+        if r.applied then r.applied = false; Resources[name].give(F0, r) end
+    end
+    S = NewState()
+    CommonState.ClimbHasPriority = false
+    M.Mode, M.InInitClimbState, M.InClimbJump = Mode.IDLE, false, false
+
+    S.comp, S.compName = FindClimbingComponent(pawn)
+    S.walkableZ = ReadOpt(cmc, "WalkableFloorZ") or T.Detect.WALKABLE_Z_FALLBACK
+    S.defaultOrient     = ReadOpt(cmc, "bOrientRotationToMovement")
+    S.defaultDesiredRot = ReadOpt(cmc, "bUseControllerDesiredRotation")
+    local capsule = ReadOpt(pawn, "CapsuleComponent")
+    S.radius = ReadOpt(capsule, "CapsuleRadius")     or S.radius
+    S.halfH  = ReadOpt(capsule, "CapsuleHalfHeight") or S.halfH
+    -- Fan rays must leave from the cylindrical section of the capsule, where
+    -- Distance - radius is the true perpendicular gap.
+    S.fanOffset = math.max(0, math.min(T.Detect.FAN_HEIGHT_FRAC * S.halfH,
+        S.halfH - S.radius - T.Detect.FAN_HEIGHT_PAD))
+
+    if S.comp == nil then
+        ddbg("climbing component NOT FOUND")
+        return
+    end
+    S.channel = ReadOpt(S.comp, "Const_RayChannel") or 0
+    local okCls, clsName = pcall(function() return S.comp:GetClass():GetFullName() end)
+    if okCls and type(clsName) == "string" then
+        S.clsPath = clsName:match("(%S+)$")   -- strip "BlueprintGeneratedClass "
+    end
+    ddbg("component: %s  ClimbMaxSpeed=%s  fwdRay=%s  rayChannel=%s", S.compName,
+        tostring(ReadOpt(cmc, "ClimbMaxSpeed")),
+        tostring(ReadOpt(S.comp, "Const_ForwardRayLength")), tostring(S.channel))
+    ddbg("geom: capsuleR=%.1f halfH=%.1f fanOffset=%.1f | attachGap=%.1f guardReach=%.1f",
+        S.radius, S.halfH, S.fanOffset, T.Detect.ATTACH_GAP, T.Guard.REACH)
+    RegisterComponentHooks()
+    if Discover ~= nil then
+        Discover.OnPlayerCached({ pawn = pawn, cmc = cmc, comp = S.comp,
+            compName = S.compName, clsPath = S.clsPath, log = ddbg })
     end
 end
-
--- FIX B: remember fall speed only while falling; grounded clears it so a
--- stale hard-fall value cannot arm a slide on a later gentle entry.
-local function CacheFallSpeed(mode, cmc)
-    if mode == 3 then
-        lastFallVz = cmc.Velocity.Z
-    else
-        lastFallVz = 0
-    end
-end
-
-
-local function LogComponentFlagEdges(mode, custom)
-    if not DEBUG then return end
-    local palgame_isClimbing     = ReadOpt(comp, "IsClimbing")
-    local palgame_canClimb    = ReadOpt(comp, "CanClimbing")
-    local palgame_isEndingClimb = ReadOpt(comp, "IsEnding")
-    if palgame_isClimbing ~= prevFlagIs or palgame_canClimb ~= prevFlagCan or palgame_isEndingClimb ~= prevFlagEnding then
-        dbg("flags: isClimbing=%s canClimb=%s endingClimb=%s (mode %d/%d)",
-            tostring(palgame_isClimbing), tostring(palgame_canClimb), tostring(palgame_isEndingClimb), mode, custom)
-        prevFlagIs, prevFlagCan, prevFlagEnding = palgame_isClimbing, palgame_canClimb, palgame_isEndingClimb
-    end
-end
-
--- Cache the climb frame for next tick's detach classification.
-local function CacheClimbFrame(pawn, cmc, inClimb, isClimbingAtTop)
-    if inClimb then
-        -- Facing first: the input decomposition below needs THIS frame's
-        -- wall facing, not the previous frame's.
-        local faceDir = WallFwd(pawn)
-        if faceDir ~= nil then
-            prevWallFwd = faceDir
-        end
-
-        -- {X , Y, Z} where Z is the vertical direction 
-        local stickAlongWall, stickUpward = Input.GetStick()
-        prevClimbInputAlongWall = stickAlongWall
-        prevClimbInputUpward    = stickUpward
-        prevClimbZ = GetZ(pawn)
-    end
-    prevModeWasClimb = inClimb
-    prevAtTopAnimPlaying = isClimbingAtTop
-end
-
-
--- Hub for starting a climb. All functions here are theoretical and don't yet exist.
-local probeFrameCounter = 0
-
-local function TickInitClimbStart(dt, pawn, cmc, climbComp, isWalking)
-    if not M.InInitClimbState then
-        -- Rate limit ONLY the probe. PROBE_FRAME_INTERVAL = 1 reproduces the
-        -- original exactly; the counter is primed whenever a start is
-        -- impossible so the first eligible frame always probes.
-        local canStartFromHere =
-            isWalking or (cmc.MovementMode == 3 and cmc.Velocity.Z > -250)
-        if not canStartFromHere then
-            probeFrameCounter = PROBE_FRAME_INTERVAL
-            return
-        end
-        probeFrameCounter = probeFrameCounter + 1
-        if probeFrameCounter < PROBE_FRAME_INTERVAL then return end
-        probeFrameCounter = 0
-
-        -- First, are we moving into a wall we're allowed to climb?
-        local wallAhead = WallInMovementPath(pawn, cmc)
-        local isMovingIntoWall = (wallAhead ~= nil)  
-        if isMovingIntoWall then
-            dbg("[NEW] startclimbing...!")
-            local isJumping = cmc.MovementMode == 3 and cmc.Velocity.Z > -250
-            dbg("[NEW] startclimbing...! Walking: %s , Jumping: %s", isWalking, isJumping)
-            if isWalking then              
-                StartClimbFromGround(pawn, cmc, wallAhead)
-            elseif isJumping then              
-                StartClimbFromJump(pawn, cmc, wallAhead)
-            end
-        end
-    end
-
-    if M.InInitClimbState then      
-        fdbg("driveinit: t=%.3f launched=%s mode=%d tries=%d",
-            initClimbState.deltaTime, tostring(initClimbState.hasLaunched),
-            cmc.MovementMode, initClimbState.tries)
-        DriveInitClimb(dt, pawn, cmc)
-    end
-end
-
 
 function M.OnTick(dt, pawn, cmc)
-    local movementMode    = cmc.MovementMode
-    local customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
-    local isClimbing = (movementMode == 6 and customMovementMode == 5)
-    local isWalking = (movementMode == 1 or movementMode == 2 or (movementMode == 6 and customMovementMode == 2))
-    local climbingComponent = pawn.BP_PalClimbingComponent
-    local isClimbingAtTop = false
-    if climbingComponent ~= nil then
-        isClimbingAtTop = climbingComponent.UpAtTopMode
+    if Discover ~= nil then Discover.OnTick() end
+
+    local F = ReadFrame(pawn, cmc, dt)
+    if S.capsuleTraceOk == nil and T.Detect.SHAPE == "capsule" and F.isWalking then
+        SelfTestCapsuleTrace(pawn)
+    end
+    WatchForTeleport(F)
+    VisualiseClimbChecks(F)
+
+    -- Run to completion: a mode entered this frame ticks this frame, so a
+    -- commit, a latch or a jump is acted on without a frame of delay.
+    S.modeTime = S.modeTime + dt
+    for _ = 1, 4 do
+        local next, why, payload = States[S.mode].tick(F)
+        if next == nil or next == S.mode then break end
+        SetMode(F, next, why, payload)
     end
 
-    -- Tick climb starts
-    if not isClimbing and not M.InClimbJump then
-        TickInitClimbStart(dt, pawn, cmc, climbingComponent, isWalking)
-    end
-
-    -- Guard against early animation cancels
-    if isClimbingAtTop then
-        DisableForAtTopAnim(pawn, cmc)
-    end
-    if prevAtTopAnimPlaying and not isClimbingAtTop then
-        EnableForAtTopAnim(pawn, cmc)
-    end
-
-    customMovementMode  = ReadOpt(cmc, "CustomMovementMode") or 0
-    CacheFallSpeed(cmc.MovementMode, cmc)
-    LogComponentFlagEdges(cmc.MovementMode, customMovementMode)
-
-    -- Tick climb jumps
-    if DidClimbJumpStart(cmc, movementMode) and not isClimbingAtTop then
-        StartClimbJump(pawn, cmc)
-    end
-    TickClimbJump(dt, pawn, cmc, movementMode, isClimbing)
-    
-   -- Fix vanilla climbing input values
-    if isClimbing then
-        ApplyRawClimbInput(pawn, cmc)
-    end
-
-    -- Refresh values that may have changes from the start of the frame
-    movementMode    = cmc.MovementMode
-    customMovementMode = ReadOpt(cmc, "CustomMovementMode") or 0
-    isClimbing = (movementMode == 6 and customMovementMode == 5)
-
-    UpdateClimbPriority(pawn, cmc, isClimbing)
-    UpdateWallSlide(dt, pawn, cmc, isClimbing)
-
-    -- Cache values for next frame comparisons
-    CacheClimbFrame(pawn, cmc, isClimbing, isClimbingAtTop)
+    S.prev.fallVz = F.isFalling and F.vz or 0
 end
 
 return M

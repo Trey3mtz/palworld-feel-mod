@@ -94,12 +94,42 @@ local TURN_COOLDOWN   = 0.35    -- s before another turn may trigger
 local PEAK_DECAY      = 300     -- uu/s^2 the tracked peak bleeds off
 local SKID_FN         = Easing.EaseOutQuad
 
-local SKID_TIME          = 0.25
+local SKID_TIME          = 0.32   -- s; the clip is half-turned at 0.32
 local SKID_END_PEAK_FRAC = 0.45   -- end speed as a fraction of tracked PEAK
 local SKID_END_FLOOR     = 150    -- uu/s absolute floor
 local LAUNCH_HOLD        = 0.20   -- s reasserting launch, so the write takes
 
-local PIVOT_TIME = 0.24                 -- s
+-- Facing during the turn. Two modes, chosen per turn by whether the skid
+-- montage actually started:
+--   montage playing : the clip turns the body 180 deg inside its own bones,
+--                     so the capsule must NOT rotate underneath it or the
+--                     two stack to 360. Instead the capsule yaw is snapped
+--                     to the launch heading in one frame at PIVOT_SNAP_TIME,
+--                     the moment the clip is fully round. The animated pose
+--                     then faces exactly where the new capsule forward
+--                     points, so the snap is invisible, and the montage
+--                     blend-out hands off to locomotion facing the same way.
+--                     The montage's blend-out must start at the same time:
+--                     BlendOut = length - PIVOT_SNAP_TIME (0.633 - 0.55 =
+--                     ~0.08 s) with Blend Out Trigger Time -1.
+--   no montage      : the capsule is eased over PIVOT_TIME as before.
+-- SKID_CLIP_ROOT_MOTION: the clip's heading lives on its root bone and the
+-- sequence has Enable Root Motion on, so the engine strips the turn from the
+-- rendered pose. The capsule then carries the whole turn, eased over
+-- PIVOT_CLIP_TIME (clip length minus blend-out) with PIVOT_CLIP_FN. This is
+-- the only stack-free arrangement: rotation in one place.
+-- false: legacy clip with the turn baked into pelvis; the capsule snaps at
+-- PIVOT_SNAP_POS (always shows a flip during blend-out).
+local SKID_CLIP_ROOT_MOTION = false
+local PIVOT_CLIP_TIME = 0.55
+local PIVOT_CLIP_FN   = Easing.EaseInOutSine
+local PIVOT_SNAP_POS  = 0.51            -- montage position (s) to snap at.
+                                        -- Must sit one frame BEFORE blend-out
+                                        -- starts (length - BlendOut), so the
+                                        -- capsule is already round when the
+                                        -- first blended frame renders.
+local PIVOT_SNAP_TIME = 0.60            -- s from trigger; fallback only
+local PIVOT_TIME = 0.24                 -- s, ease fallback (no montage)
 local PIVOT_FN   = Easing.EaseOutCirc   -- (from, to, alpha), like SKID_FN
 
 local SPRINT_PEAK      = 450    -- peak above this = sprint-class turn
@@ -107,20 +137,24 @@ local LAUNCH_FRAC      = 0.85   -- sprint-class
 local LAUNCH_FRAC_WALK = 0.51   -- 51% of the sprint launch
 
 -- ---- skid animation ----
--- PLACEHOLDER clips (resident dodge montages) until authored skids exist.
--- Both target DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
--- come from the montage assets themselves.
+-- Authored clip, shipped in TheJumpIsAPal_P.pak. Must be the AM_ montage,
+-- never the AS_ sequence it wraps: Montage_Play only accepts a UAnimMontage
+-- and silently no-ops on a sequence.
+-- Targets DefaultSlot on SK_PalHuman_Skeleton; blend 0.10 in / 0.35 out
+-- come from the montage asset itself.
+local SKID_ANIM_ENABLED = true   -- false: sliding turn runs, no montage plays
+
 local SKID_MONTAGES = {
-    sprint = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_FlipBwd.AM_Player_Female_FlipBwd",
-    walk   = "/Game/Pal/Animation/Character/Player/Female/Dodge/AM_Player_Female_RollFwd.AM_Player_Female_RollFwd",
+    sprint = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
+    walk   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
 }
 
 -- ---- debug ----
 local DEBUG      = true
 local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
-local DEBUG_ANIM = true    -- IsWalking/IsSprint flips
-local DEBUG_CHANNELS = true -- lean-channel resting values, via the ABP hook
+local DEBUG_CHANNELS = false -- one-shot lean-channel resting values at spawn
+local DEBUG_TURN_TRACE = true -- per-tick trace while a turn owns velocity
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -134,7 +168,6 @@ local originalRotationRateYaw = nil
 -- ---- animation state ----
 local animInstance = nil
 local animInstanceAddress = nil
-local prevAnimIsWalking, prevAnimIsSprint = nil, nil
 
 -- ---- walk-cap state ----
 local desired   = nil     -- game's intended walk top speed (captured)
@@ -159,13 +192,15 @@ local peakSpeed, turnCool = 0, 0
 local skidX, skidY, skidSpeed, skidEndSpeed = 0, 0, 0, 0
 local launchX, launchY, launchSpeed = 0, 0, 0
 local pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
+local pivotSnap, pivotDone = false, false   -- snap mode this turn; yaw applied
+local activeSkidMontage = nil               -- montage started for this turn
 
 -- ---- wall contact state ----
 local prevSpd = nil
 local wallT   = 0
 
 -- ---- skid animation state ----
-local skidMontageCache = {}    -- class -> montage handle
+local skidMontageCache = {}    -- asset path -> montage handle
 
 -- =========================================================================
 -- 3. UTILITIES
@@ -173,6 +208,14 @@ local skidMontageCache = {}    -- class -> montage handle
 
 local function dbg(fmt, ...)
     if DEBUG then print(string.format("[PalFeel:hmove] " .. fmt .. "\n", ...)) end
+end
+
+-- Safe full-name read for diagnostics; unresolved pointers must print as a
+-- distinct token rather than erroring out of the surrounding log line.
+local function FullNameOf(obj)
+    if not (obj and obj:IsValid()) then return "<nil>" end
+    local ok, name = pcall(function() return obj:GetFullName() end)
+    return ok and name or "<unreadable>"
 end
 
 -- Read a property that may not exist under this exact name.
@@ -306,13 +349,35 @@ end
 -- use so the graph reads the value the same frame it is set.
 -- =========================================================================
 
-local function GetSkidMontage(class)
-    local montage = skidMontageCache[class]
+-- Sole loader for the skid clips, keyed by asset path so classes sharing
+-- a clip share one lookup.
+--
+-- The clip is made resident by the BPModLoader ModActor, which holds a hard
+-- reference to it; BPModLoader spawns that actor on every map load, so the
+-- package is loaded and rooted for the life of the world and
+-- StaticFindObject hits. UE4SS LoadAsset is NOT a substitute: it resolves
+-- through the Asset Registry, which only knows the base game's
+-- AssetRegistry.bin, so for a mod pak asset it returns nil without loading.
+-- It stays as a fallback for assets that are in the registry.
+local function LoadSkidMontage(path)
+    local montage = skidMontageCache[path]
     if montage and montage:IsValid() then return montage end
-    montage = StaticFindObject(SKID_MONTAGES[class])
-    if montage and not montage:IsValid() then montage = nil end
-    skidMontageCache[class] = montage
+    montage = StaticFindObject(path)
+    if not (montage and montage:IsValid()) then
+        montage = nil
+        local ok, err = pcall(function() montage = LoadAsset(path) end)
+        if not ok then
+            dbg("LoadAsset threw for %s: %s", path, tostring(err))
+        elseif montage and not montage:IsValid() then
+            montage = nil
+        end
+    end
+    skidMontageCache[path] = montage
     return montage
+end
+
+local function GetSkidMontage(class)
+    return LoadSkidMontage(SKID_MONTAGES[class])
 end
 
 local function ResolveAnimInstance()
@@ -344,57 +409,6 @@ local function CacheAnimInstance()
     return true
 end
 
--- Read-only. Catches the speed at which the ABP flips IsWalking / IsSprint.
-local function LogAnimState(frame)
-    if not DEBUG_ANIM then return end
-    if animInstance == nil or not animInstance:IsValid() then
-        if not CacheAnimInstance() then return end
-    end
-
-    local animIsWalking = ReadOpt(animInstance, "IsWalking")
-    local animIsSprint  = ReadOpt(animInstance, "IsSprint")
-    local stateFlipped  = (animIsWalking ~= prevAnimIsWalking)
-                       or (animIsSprint  ~= prevAnimIsSprint)
-
-    if stateFlipped then
-        dbg("anim flip: IsWalking=%s IsSprint=%s  ourSpd=%.0f abpSpeed=%s",
-            tostring(animIsWalking), tostring(animIsSprint), frame.spd,
-            tostring(ReadOpt(animInstance, "Speed")))
-    end
-
-    prevAnimIsWalking, prevAnimIsSprint = animIsWalking, animIsSprint
-end
-
--- BoneListOnlySpines / BoneListFullBody are TMap<FName, UPalBoneInfo*>.
--- They are UE4SS TMap userdata, not Lua tables, so pairs() fails on them.
--- FName:get() also yields an FName OBJECT, not a string -- tostring() on
--- that prints the userdata pointer, which is why the first pass logged
--- addresses instead of bone names.
-local function LogBoneList(targetAnimInstance, listPropertyName)
-    local boneList = ReadOpt(targetAnimInstance, listPropertyName)
-    if boneList == nil then
-        dbg("%s unreachable", listPropertyName)
-        return
-    end
-
-    local boneNames = {}
-    local iterated = pcall(function()
-        boneList:ForEach(function(boneNameKey, _boneInfo)
-            local boneName = boneNameKey:get()
-            local converted, boneNameString = pcall(function()
-                return boneName:ToString()
-            end)
-            boneNames[#boneNames + 1] = converted and boneNameString or "<unreadable>"
-        end)
-    end)
-
-    if not iterated then
-        dbg("%s ForEach failed", listPropertyName)
-        return
-    end
-    dbg("%s (%d): %s", listPropertyName, #boneNames, table.concat(boneNames, ", "))
-end
-
 local function FormatRotator(rotator)
     if rotator == nil then return "nil" end
     return string.format("[P %.2f Y %.2f R %.2f]",
@@ -414,17 +428,6 @@ local function LogAnimChannels(targetAnimInstance)
     local aimRotatorForSpine = ReadOpt(targetAnimInstance, "AimRotatorForSpine")
     local overrideTransform  = ReadOpt(targetAnimInstance, "BP_OverrideTransform")
 
-    local overrideTranslation = "nil"
-    if overrideTransform ~= nil then
-        local gotTranslation, translation =
-            pcall(function() return overrideTransform.Translation end)
-        if gotTranslation and translation ~= nil then
-            overrideTranslation = string.format("(%.1f,%.1f,%.1f)",
-                translation.X or 0.0, translation.Y or 0.0, translation.Z or 0.0)
-        end
-        
-    end
-
     dbg("channels: bOverride=%s alpha=%.2f rideWeight=%.2f rideRot=%s aimSpine=%s xformT=%s",
         tostring(overrideEnabled),
         overrideAlpha or 0.0,
@@ -435,26 +438,11 @@ local function LogAnimChannels(targetAnimInstance)
 end
 
 
--- /Game/ path: RefreshBlueprintHooks rebinds this on every pawn
--- construction. Registered as a POST hook; main.lua's Register() fills the
--- pre slot with NoOp, which UE4SS requires even for post-only hooks.
-local ANIM_CHANNEL_LOG_INTERVAL = 0.5
-local animChannelLogTimer = 0
-
-local function TickAnimChannelLog(deltaTime)
-    if not DEBUG_CHANNELS then return end
-    if animInstance == nil or not animInstance:IsValid() then return end
-    animChannelLogTimer = animChannelLogTimer + deltaTime
-    if animChannelLogTimer < ANIM_CHANNEL_LOG_INTERVAL then return end
-    animChannelLogTimer = 0
-    LogAnimChannels(animInstance)
-end
 
 -- Either variant still playing suppresses a new play: both live in
 -- DefaultGroup, so Montage_Play would cut the other mid-skid otherwise.
 local function IsAnySkidPlaying(anim)
-    for class in pairs(SKID_MONTAGES) do
-        local montage = skidMontageCache[class]
+    for _, montage in pairs(skidMontageCache) do
         if montage and montage:IsValid() then
             local playing = false
             pcall(function() playing = anim:Montage_IsPlaying(montage) end)
@@ -464,13 +452,62 @@ local function IsAnySkidPlaying(anim)
     return false
 end
 
+-- One-shot skeleton comparison. A montage whose Skeleton differs from the
+-- mesh's live skeleton is rejected by Montage_Play with no engine warning,
+-- so the two full names are printed side by side to make it visible.
+local function LogSkidSkeletons(pawn)
+    local mesh = pawn and pawn:IsValid() and pawn.Mesh or nil
+    local meshSkeleton = nil
+    if mesh and mesh:IsValid() then
+        local skeletalMesh = ReadOpt(mesh, "SkeletalMesh")
+                          or ReadOpt(mesh, "SkinnedAsset")
+        if skeletalMesh and skeletalMesh:IsValid() then
+            meshSkeleton = ReadOpt(skeletalMesh, "Skeleton")
+        end
+    end
+    dbg("mesh skeleton: %s", FullNameOf(meshSkeleton))
+
+    for class in pairs(SKID_MONTAGES) do
+        local montage = GetSkidMontage(class)
+        dbg("montage %s: obj=%s skeleton=%s", class,
+            FullNameOf(montage),
+            FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
+    end
+end
+
+-- Returns true when the montage actually started, so the turn can choose
+-- its facing mode: snap when the clip carries the rotation, ease otherwise.
 local function PlaySkidAnimation(class)
+    if not SKID_ANIM_ENABLED then return false end
     local montage = GetSkidMontage(class)
-    if montage == nil then return end
+    if montage == nil then
+        dbg("skid play %s: montage not resolved (%s)", class, SKID_MONTAGES[class])
+        return false
+    end
     local anim = ResolveAnimInstance()
-    if anim == nil then return end
-    if IsAnySkidPlaying(anim) then return end
-    pcall(function() anim:Montage_Play(montage, 1.0, 0, 0.0, true) end)
+    if anim == nil then
+        dbg("skid play %s: no anim instance", class)
+        return false
+    end
+    if IsAnySkidPlaying(anim) then return false end
+    -- Montage_Play returns the montage length, or 0.0 when the montage is
+    -- rejected (incompatible skeleton, missing slot). Both are silent, so
+    -- the return value is the only signal separating them from a good play.
+    local played = 0.0
+    local ok = pcall(function()
+        played = anim:Montage_Play(montage, 1.0, 0, 0.0, true) or 0.0
+    end)
+    if not ok then
+        dbg("skid play %s: Montage_Play threw", class)
+        return false
+    elseif played <= 0.0 then
+        dbg("skid play %s: Montage_Play REJECTED (returned 0) -- "
+            .. "skeleton mismatch or missing slot", class)
+        return false
+    end
+    dbg("skid play %s: playing, length=%.3f", class, played)
+    activeSkidMontage = montage
+    return true
 end
 
 -- =========================================================================
@@ -486,11 +523,44 @@ end
 -- keeps running instead of fighting this write.
 local function TickPivot(pawn)
     if not moveInputLocked then return end
+    if pivotDone then return end
     if not (pawn and pawn:IsValid()) then return end
 
-    local pivotAlpha = math.min(pivotT / PIVOT_TIME, 1.0)
-    local rotation   = pawn:K2_GetActorRotation()
-    rotation.Yaw     = PIVOT_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+    local rotation = pawn:K2_GetActorRotation()
+    if pivotSnap and SKID_CLIP_ROOT_MOTION then
+        local pivotAlpha = math.min(pivotT / PIVOT_CLIP_TIME, 1.0)
+        rotation.Yaw = PIVOT_CLIP_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+        pivotDone    = pivotAlpha >= 1.0
+    elseif pivotSnap then
+        -- The clip is turning the body; leave the capsule alone until the
+        -- clip is nearly round, then set the yaw in one frame. Lua ticks
+        -- after this frame's animation was evaluated, so the snap must land
+        -- BEFORE blend-out begins: once the montage reports stopped the
+        -- first hand-off frame has already rendered against the old yaw
+        -- (one frame facing the wrong way). Read the clip position and
+        -- snap at PIVOT_SNAP_POS; the stopped flag and PIVOT_SNAP_TIME are
+        -- fallbacks only.
+        local why = nil
+        local anim = ResolveAnimInstance()
+        if anim and activeSkidMontage and activeSkidMontage:IsValid() then
+            pcall(function()
+                if not anim:Montage_IsPlaying(activeSkidMontage) then
+                    why = "montage stopped"
+                elseif anim:Montage_GetPosition(activeSkidMontage) >= PIVOT_SNAP_POS then
+                    why = "PIVOT_SNAP_POS"
+                end
+            end)
+        end
+        if why == nil and pivotT >= PIVOT_SNAP_TIME then why = "PIVOT_SNAP_TIME" end
+        if why == nil then return end
+        dbg("pivot snap at t=%.3f (%s)", pivotT, why)
+        rotation.Yaw = pivotTargetYaw
+        pivotDone    = true
+    else
+        local pivotAlpha = math.min(pivotT / PIVOT_TIME, 1.0)
+        rotation.Yaw = PIVOT_FN(pivotStartYaw, pivotTargetYaw, pivotAlpha)
+        pivotDone    = pivotAlpha >= 1.0
+    end
     pawn:K2_SetActorRotation(rotation, false)
 end
 
@@ -515,7 +585,8 @@ local function BeginTurn(f, dot, pawn)
         (sprintClass and LAUNCH_FRAC or LAUNCH_FRAC_WALK)
 
     LockMoveInput(pawn)
-    PlaySkidAnimation(sprintClass and "sprint" or "walk")
+    pivotSnap = PlaySkidAnimation(sprintClass and "sprint" or "walk")
+    pivotDone = false
 
     local currentRotation = pawn:K2_GetActorRotation()
     pivotT                = 0
@@ -546,13 +617,46 @@ end
 
 -- Reassert for a few frames so PhysCustom's per-frame decay cannot bleed
 -- the exit speed.
+-- Input stays locked until the facing is final as well: unlocking while
+-- the capsule still faces the old heading would let orient-to-movement
+-- start its own rotation and fight the snap.
 local function TickLaunchPhase(cmc, pawn)
     cmc.Velocity.X = launchX * launchSpeed
     cmc.Velocity.Y = launchY * launchSpeed
-    if turnT >= LAUNCH_HOLD then
+    if turnT >= LAUNCH_HOLD and pivotDone then
         phase, turnCool = PHASE_NONE, TURN_COOLDOWN
         UnlockMoveInput(pawn)
     end
+end
+
+-- Per-tick trace while a turn is active: capsule yaw against velocity
+-- heading, montage state, and the ABP's locomotion flags. Exists to catch
+-- the game rotating the capsule or dropping the montage on its own.
+local function TraceTurn(f, pawn)
+    if not DEBUG_TURN_TRACE then return end
+    local yaw = -1
+    if pawn and pawn:IsValid() then
+        local ok, rot = pcall(function() return pawn:K2_GetActorRotation() end)
+        if ok and rot then yaw = rot.Yaw end
+    end
+    local velYaw = (f.spd > 1e-3) and math.deg(math.atan(f.vy, f.vx)) or 0
+    local playing, pos = "?", -1
+    local anim = ResolveAnimInstance()
+    if anim then
+        for _, montage in pairs(skidMontageCache) do
+            if montage and montage:IsValid() then
+                pcall(function()
+                    playing = tostring(anim:Montage_IsPlaying(montage))
+                    pos     = anim:Montage_GetPosition(montage)
+                end)
+            end
+        end
+    end
+    dbg("trace t=%.3f ph=%d yaw=%.0f vel=%.0f spd=%.0f montage=%s@%.2f walk=%s sprint=%s lock=%s",
+        pivotT, phase, yaw, velYaw, f.spd, playing, pos,
+        tostring(anim and ReadOpt(anim, "IsWalking")),
+        tostring(anim and ReadOpt(anim, "IsSprint")),
+        tostring(moveInputLocked))
 end
 
 -- Once started, only physical invalidation stops it. Input release and
@@ -561,6 +665,7 @@ local function RunCommittedTurn(dt, cmc, f, pawn)
     if not IsTurnCapableMode(f.mode, f.custom) then
         dbg("turn aborted: mode=%d/%d", f.mode, f.custom)
         phase, turnCool = PHASE_NONE, TURN_COOLDOWN
+        pivotDone = true
         UnlockMoveInput(pawn)
         return false
     end
@@ -570,6 +675,7 @@ local function RunCommittedTurn(dt, cmc, f, pawn)
     -- which would restart the pivot mid-way through it.
     pivotT = pivotT + dt
     TickPivot(pawn)
+    TraceTurn(f, pawn)
 
     -- Launch direction is captured at the trigger and deliberately NOT
     -- re-steered: letting live input rewrite it allowed the player to cancel
@@ -866,17 +972,15 @@ function M.OnPlayerCached(pawn, cmc)
     -- shoves the new pawn along the dead pawn's stored direction.
     phase, turnT, turnCool, peakSpeed = PHASE_NONE, 0, 0, 0
     pivotT, pivotStartYaw, pivotTargetYaw = 0, 0, 0
+    pivotSnap, pivotDone = false, false
+    activeSkidMontage    = nil
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
 
     -- The old pawn's anim instance may still report valid, in which case
-    -- LogAnimState would never re-resolve and animInstanceAddress would stay
-    -- nil -- silently disarming the ABP hook for the rest of the session.
-    
+    -- the lazy re-cache on the next tick would never fire and
+    -- animInstanceAddress would stay stale for the rest of the session.
     animInstance, animInstanceAddress = nil, nil
-    prevAnimIsWalking, prevAnimIsSprint = nil, nil
-    animChannelLogTimer = 0
-    
 
     if not pawn or not pawn:IsValid() then return end
 
@@ -894,17 +998,9 @@ function M.OnPlayerCached(pawn, cmc)
     -- fact that the module cache is populated lazily on the first tick.
     local resolvedAnimInstance = ResolveAnimInstance()
     if resolvedAnimInstance and resolvedAnimInstance:IsValid() then
-        local animClass = nil
-        pcall(function() animClass = resolvedAnimInstance:GetClass() end)
-        if animClass and animClass:IsValid() then
-            local named, className = pcall(function() return animClass:GetFullName() end)
-            dbg("anim class: %s", named and className or "class name read failed")
-        end
-        LogBoneList(resolvedAnimInstance, "BoneListOnlySpines")
-        LogBoneList(resolvedAnimInstance, "BoneListFullBody")
-        LogAnimChannels(resolvedAnimInstance)   -- one baseline read at spawn
-            resolvedAnimInstance.DebugEnableLeaning            = true
-            resolvedAnimInstance.AnimNotifyForceDisableLeaning = false
+        if DEBUG_CHANNELS then LogAnimChannels(resolvedAnimInstance) end
+        resolvedAnimInstance.DebugEnableLeaning            = true
+        resolvedAnimInstance.AnimNotifyForceDisableLeaning = false
     end
 
     -- Report the sprint fields before touching anything (fills the baseline).
@@ -945,6 +1041,23 @@ function M.OnPlayerCached(pawn, cmc)
         tostring(ReadOpt(cmc, "AirControlBoostMultiplier")),
         tostring(ReadOpt(cmc, "AirControlBoostVelocityThreshold")),
         tostring(ReadOpt(cmc, "FallingLateralFriction")))
+
+    -- Preload skid clips, once per distinct asset. This runs on every
+    -- spawn and world reload by design: a reload GCs the montage, and this
+    -- is the first game-thread point where a sync load is acceptable. When
+    -- the clip is still resident it costs one StaticFindObject per path.
+    local seen = {}
+    for _, path in pairs(SKID_MONTAGES) do
+        if not SKID_ANIM_ENABLED then break end
+        if not seen[path] then
+            seen[path] = true
+            if LoadSkidMontage(path) == nil then
+                dbg("skid montage failed to load: %s", path)
+            end
+        end
+    end
+
+    LogSkidSkeletons(pawn)
 end
 
 -- A deceleration no braking path can produce while input is held means the
@@ -978,8 +1091,11 @@ end
 
 function M.OnTick(dt, pawn, cmc)
     local frame = ReadFrame(cmc)
-    LogAnimState(frame)
-    TickAnimChannelLog(dt)
+    -- Lazy: the pawn's components are not initialised at construction, so
+    -- the instance is resolved on the first tick that can see it.
+    if animInstance == nil or not animInstance:IsValid() then
+        CacheAnimInstance()
+    end
     TickLeanProbe()
 
     -- Above every early return: an abort while airborne would otherwise
@@ -1009,10 +1125,6 @@ function M.OnTick(dt, pawn, cmc)
 
     CaptureGameWalkCap(cmc)
     AdvanceBuildupEase(dt, cmc)
-    local debugEnableLeaning  = ReadOpt(animInstance, "DebugEnableLeaning")
-    local forceDisableLeaning = ReadOpt(animInstance, "AnimNotifyForceDisableLeaning")
-    dbg("debugEnableLeaning: %s", debugEnableLeaning)
-    dbg("forceDisableLeaning: %s",forceDisableLeaning)
 end
 
 return M
