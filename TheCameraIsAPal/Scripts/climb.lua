@@ -260,8 +260,11 @@ T.Anim = {
     --     forward and the blend-out hands off to locomotion facing the
     --     same way. SNAP_POS must sit one frame before the clip's
     --     blend-out starts (length - BlendOut), or the flip shows.
+    -- Mixamo clips keep the armature root static and put the turn on Hips,
+    -- so they are baked clips: root motion would strip nothing. Set true
+    -- only after moving the hip yaw onto the root in a DCC pass.
     AWAY = {
-        CLIP_ROOT_MOTION = true,
+        CLIP_ROOT_MOTION = false,
         TURN_TIME = 0.45,                  -- s; match clip length minus blend-out
         TURN_FN   = Easing.EaseInOutSine,
         SNAP_POS  = 0.50,                  -- s montage position (baked clip only)
