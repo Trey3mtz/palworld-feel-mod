@@ -22,8 +22,13 @@
 --   ASCENT    the hop: launch, hold the face, attach when viable
 --   LATCHED   climbing; the latch watch, the wall slide, raw stick input
 --   LEAP      the wall-plane jump: drive, track the face, re-attach
---   DISMOUNT  the hop away from the wall
+--   DISMOUNT  the hop away from the wall, and the turn that goes with it
 --   VAULT     the component's own top-out; we only hold input off
+--
+-- Animation rides on top of the modes (section 6): every climb event that
+-- has an authored clip plays it as it happens, and nothing about the
+-- movement depends on a clip having played. The one place the two meet is
+-- the dismount turn, where the clip and the capsule must not both rotate.
 -- =========================================================================
 
 -- =========================================================================
@@ -197,10 +202,71 @@ T.Leap = {
 }
 
 -- ---- dismount: the hop away (jump with the stick down) ----
+-- The push lasts LOCK or until the turn is done, whichever is later: move
+-- input and the rotation flags are held until the capsule has finished
+-- coming round, so neither the stick nor the game can rotate the body
+-- under the clip.
 T.Dismount = {
     VZ   = 620,
     OUT  = 300,   -- uu/s away from the wall
-    LOCK = 0.20,  -- s the push and facing are held
+    LOCK = 0.20,  -- s the push and facing are held (at least)
+    -- Capsule turn when no away clip plays. 0 = snap on the first frame,
+    -- the pre-animation behaviour.
+    FALLBACK_TURN_TIME = 0.0,
+    FALLBACK_TURN_FN   = Easing.EaseOutCirc,
+    DEFAULT_TURN_SIDE  = 1,    -- +1 right / -1 left when the stick has no lateral lean
+}
+
+-- ---- animation ----
+-- Authored montages shipped in TheJumpIsAPal_P.pak. Must be the AM_
+-- montage, never the AS_ sequence it wraps: Montage_Play only accepts a
+-- UAnimMontage and returns 0 for anything else. Blend in/out come from the
+-- assets. A key with no path, or a path that does not resolve, plays
+-- nothing and changes nothing about the movement.
+T.Anim = {
+    ENABLED     = true,
+    RATE        = 1.0,     -- play rate for every climb clip
+    STOP_BLEND  = 0.20,    -- s blend-out when this file stops its own clip (slide end)
+    GRAB_ON_ORGANIC  = true,   -- grab clip when the component latched on its own
+    GRAB_AFTER_LEAP  = true,   -- grab clip on a leap or dismount re-attach
+    MONTAGES = {
+        -- jumps out of the climb: bucket + side from ClassifyJumpDirection
+        climbjump_left       = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpLeft.AM_Player_Female_Climb_JmpLeft",
+        climbjump_right      = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpRight.AM_Player_Female_Climb_JmpRight",
+        climbjump_up         = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUp.AM_Player_Female_Climb_JmpUp",
+        climbjump_up_left    = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpLeft.AM_Player_Female_Climb_JmpUpLeft",
+        climbjump_up_right   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpRight.AM_Player_Female_Climb_JmpUpRight",
+        climbjump_away_left  = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayLeft.AM_Player_Female_Climb_JmpAwayLeft",
+        climbjump_away_right = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayRight.AM_Player_Female_Climb_JmpAwayRight",
+        -- entries: the walk-in launch, the airborne mini hop, the latch
+        climbinit_ground     = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromGrnd.AM_Player_Female_Climb_InitFromGrnd",
+        climbinit_hop        = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromHop.AM_Player_Female_Climb_InitFromHop",
+        climbinit_grab       = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbGrab.AM_Player_Female_ClimbGrab",
+        -- the wall slide; stopped by this file when the slide halts
+        climbslide           = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbSlide.AM_Player_Female_ClimbSlide",
+    },
+    -- The away clips turn the body 180 deg inside the animation. Rotation
+    -- must live in exactly one place or the clip and the capsule stack to
+    -- 360. Which arrangement applies is an asset fact, set per clip:
+    --   CLIP_ROOT_MOTION = true  : the turn is on the root bone and the
+    --     sequence has Enable Root Motion on. The ABP does not consume
+    --     montage root motion, so the rendered pose stays square to the
+    --     capsule and the capsule carries the whole turn, eased over
+    --     TURN_TIME. Smooth, stack-free, and the recommended authoring.
+    --   CLIP_ROOT_MOTION = false : the turn is baked into pelvis/spine.
+    --     The capsule is frozen while the clip turns the body, then snapped
+    --     to the away heading in one frame at SNAP_POS, the moment the
+    --     clip is fully round, so the pose lands exactly on the new
+    --     forward and the blend-out hands off to locomotion facing the
+    --     same way. SNAP_POS must sit one frame before the clip's
+    --     blend-out starts (length - BlendOut), or the flip shows.
+    AWAY = {
+        CLIP_ROOT_MOTION = true,
+        TURN_TIME = 0.45,                  -- s; match clip length minus blend-out
+        TURN_FN   = Easing.EaseInOutSine,
+        SNAP_POS  = 0.50,                  -- s montage position (baked clip only)
+        SNAP_TIME = 0.55,                  -- s from the jump: fallback when the position cannot be read
+    },
 }
 
 -- ---- top-out: catching the lip mid-leap ----
@@ -236,6 +302,7 @@ local TRACE_COLOR_B   = { R = 0, G = 1, B = 0, A = 1 }
 -- =========================================================================
 
 local M = { name = "climb" }
+M.Tuning = T   -- read-only for other subsystems and the test harness
 
 local Mode = {
     IDLE = "IDLE", APPROACH = "APPROACH", ASCENT = "ASCENT", LATCHED = "LATCHED",
@@ -279,6 +346,9 @@ local function NewState()
         guard  = { armedTime = 0, lostFrames = 0, cooldown = 0, pending = nil },
         ascent = nil, watch = nil, leap = nil, slide = nil,
 
+        -- the climb clip this file last started (handle + key), if any
+        anim = { montage = nil, key = nil },
+
         -- carried between frames
         prev = { wallFwd = { X = 1, Y = 0 }, alongWall = 0, upward = 0,
                  sideSign = 0, fallVz = 0 },
@@ -295,6 +365,14 @@ end
 local S = NewState()
 
 local hooksRegistered = false   -- class-level hooks persist across respawns
+local montageCache = {}         -- asset path -> montage handle; rebuilt per pawn
+
+-- Climb-jump clip for a ClassifyJumpDirection bucket and side sign.
+local JUMP_ANIM_KEYS = {
+    UP   = { [0]  = "climbjump_up" },
+    SIDE = { [-1] = "climbjump_left",    [1] = "climbjump_right" },
+    DIAG = { [-1] = "climbjump_up_left", [1] = "climbjump_up_right" },
+}
 
 -- =========================================================================
 -- 4. UTILITIES
@@ -406,10 +484,13 @@ local function SetVertVel(cmc, z)
     WriteOpt2(cmc, "Velocity", "Z", z)
 end
 
+local function SetYawDeg(pawn, yaw)
+    CallOpt(pawn, "K2_SetActorRotation", { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
+end
+
 local function FaceYaw(pawn, faceDir)
     if faceDir == nil then return end
-    local yaw = math.deg(math.atan(faceDir.Y, faceDir.X))
-    CallOpt(pawn, "K2_SetActorRotation", { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }, false)
+    SetYawDeg(pawn, math.deg(math.atan(faceDir.Y, faceDir.X)))
 end
 
 -- Slews a yaw angle toward a target direction in angle space, so the result
@@ -574,7 +655,107 @@ local function GiveAll(F, owner)
 end
 
 -- =========================================================================
--- 6. SENSING
+-- 6. ANIMATION
+-- One authored montage per climb event. Every play is event-driven (a mode
+-- entry, the hop, the slide), never per tick. Montage_Play on DefaultGroup
+-- replaces whatever was playing, so a grab after a leap cuts the leap clip
+-- by itself; only the slide loop needs an explicit stop. Nothing here can
+-- fail the climb: a missing asset, a missing anim instance or a rejected
+-- play logs once and the state machine runs exactly as it does without
+-- animations.
+-- =========================================================================
+
+-- The clip is made resident by the BPModLoader ModActor, which holds a hard
+-- reference to it and is spawned on every map load, so StaticFindObject
+-- hits. UE4SS LoadAsset resolves through the Asset Registry, which only
+-- knows the base game's assets; it stays as a fallback for assets that are
+-- in the registry.
+local function ResolveMontage(path)
+    local montage = montageCache[path]
+    if IsLive(montage) then return montage end
+    montage = nil
+    pcall(function() montage = StaticFindObject(path) end)
+    if not IsLive(montage) then
+        montage = nil
+        pcall(function() montage = LoadAsset(path) end)
+        if not IsLive(montage) then montage = nil end
+    end
+    montageCache[path] = montage
+    return montage
+end
+
+local function rawAnimInstance(p) return p.Mesh:GetAnimInstance() end
+-- Resolved per play rather than cached: the instance is replaced on a mesh
+-- swap and a stale handle would fail silently.
+local function GetAnimInstance(pawn)
+    local ok, anim = pcall(rawAnimInstance, pawn)
+    if ok and IsLive(anim) then return anim end
+    return nil
+end
+
+-- Plays the clip for `key`. Returns the montage and its length when the
+-- play took, nil otherwise. Montage_Play returns the length, or 0.0 when
+-- the montage is rejected (incompatible skeleton, missing slot); both are
+-- silent, so the return value is the only signal.
+local function PlayClimbAnim(F, key)
+    if not T.Anim.ENABLED then return nil end
+    local path = T.Anim.MONTAGES[key]
+    if path == nil then return nil end
+    local montage = ResolveMontage(path)
+    if montage == nil then
+        if Budget("anim_" .. key, 1) then ddbg("anim %s: montage not resolved (%s)", key, path) end
+        return nil
+    end
+    local anim = GetAnimInstance(F.pawn)
+    if anim == nil then
+        if Budget("anim_noinstance", 1) then ddbg("anim %s: no anim instance on the pawn mesh", key) end
+        return nil
+    end
+    local ok, length = CallOpt(anim, "Montage_Play", montage, T.Anim.RATE, 0, 0.0, true)
+    if not ok or type(length) ~= "number" or length <= 0.0 then
+        if Budget("anim_" .. key, 1) then
+            ddbg("anim %s: Montage_Play %s", key,
+                ok and "REJECTED (returned 0) -- skeleton mismatch or missing slot" or "threw")
+        end
+        return nil
+    end
+    S.anim.montage, S.anim.key = montage, key
+    dbg("anim %s: playing, length=%.3f", key, length)
+    return montage, length
+end
+
+-- Stops the clip this file last started, if it is still playing. With
+-- `onlyKey`, only that clip: a slide end must not cut a jump clip that has
+-- since replaced it. Other systems' montages are never touched.
+local function StopClimbAnim(F, blendOut, onlyKey)
+    local montage = S.anim.montage
+    if montage == nil then return end
+    if onlyKey ~= nil and S.anim.key ~= onlyKey then return end
+    S.anim.montage, S.anim.key = nil, nil
+    local anim = GetAnimInstance(F.pawn)
+    if anim == nil or not IsLive(montage) then return end
+    local ok, playing = CallOpt(anim, "Montage_IsPlaying", montage)
+    if ok and playing then
+        CallOpt(anim, "Montage_Stop", blendOut or T.Anim.STOP_BLEND, montage)
+    end
+end
+
+-- Playback position (s) of the clip this file last started, or nil when it
+-- is no longer playing (finished, or cut by another montage).
+local function ClimbAnimPosition(F)
+    local montage = S.anim.montage
+    if montage == nil then return nil end
+    local anim = GetAnimInstance(F.pawn)
+    if anim == nil then return nil end
+    local ok, playing = CallOpt(anim, "Montage_IsPlaying", montage)
+    if not ok or not playing then return nil end
+    local okPos, pos = CallOpt(anim, "Montage_GetPosition", montage)
+    if okPos and type(pos) == "number" then return pos end
+    return nil
+end
+
+-- =========================================================================
+-- 7. SENSING
 -- Traces on the climbing component's own channel. A hit is normalised to
 -- { normalX, normalY, normalZ, gap } where gap is clearance from the
 -- capsule SURFACE, so every threshold in section 2 means the same thing.
@@ -849,7 +1030,7 @@ local function SenseTopEdge(pawn, faceDir, origin)
 end
 
 -- =========================================================================
--- 7. STATES
+-- 8. STATES
 -- Each mode is { enter(F, from, payload), tick(F) -> next, why, payload | nil,
 -- exit(F, to, why) }. Ticks read the Frame and never re-read the game for
 -- what the Frame already holds. ReadModes re-reads the movement mode after
@@ -1074,6 +1255,7 @@ local function AscentMiniHop(F, a)
     a.phase   = "rise"
     a.airTime = 0
     a.launchZ = GetZ(F)
+    PlayClimbAnim(F, "climbinit_hop")
     dbg("mini hop after %.2fs approach: vz %.0f -> %.0f", a.approachTime, F.vz, hopVz)
 end
 
@@ -1103,8 +1285,10 @@ States[Mode.ASCENT] = {
         Take(F, "glider",    Mode.ASCENT)
 
         if a.type == "ground" then
-            -- The game's own jump keeps its animation and stamina cost.
+            -- The game's own jump keeps its stamina cost; the walk-in clip
+            -- then takes the slot over the jump pose.
             if not CallOpt(F.pawn, "RequestJump") then a.refused = true end
+            if not a.refused then PlayClimbAnim(F, "climbinit_ground") end
         else
             a.phase = "hold"
             a.hasLaunched = true
@@ -1207,6 +1391,7 @@ States[Mode.ASCENT] = {
 local function SlideBegin(F, entryVz)
     S.slide = { v = math.min(math.abs(entryVz), T.Slide.VZ_CAP) * T.Slide.TRANSFER }
     Take(F, "climbmax", Mode.LATCHED)
+    PlayClimbAnim(F, "climbslide")
     dbg("slide start: entryVz=%.0f v0=%.0f", entryVz, S.slide.v)
 end
 
@@ -1214,6 +1399,7 @@ local function SlideEnd(F, reason)
     if S.slide == nil then return end
     S.slide = nil
     Give(F, "climbmax", Mode.LATCHED)
+    StopClimbAnim(F, T.Anim.STOP_BLEND, "climbslide")
     dbg("slide end: %s", reason)
 end
 
@@ -1329,9 +1515,18 @@ States[Mode.LATCHED] = {
     enter = function(F, from)
         -- A fast fall the component caught organically becomes a slide.
         -- Our own attaches and leap re-attaches arrive slowly by design.
-        if from == Mode.IDLE or from == Mode.APPROACH then
+        local organic = (from == Mode.IDLE or from == Mode.APPROACH)
+        if organic then
             local entryVz = math.min(S.prev.fallVz, F.vz)
             if entryVz <= T.Slide.VZ_TRIGGER then SlideBegin(F, entryVz) end
+        end
+        -- The grab clip, unless the slide clip already has the slot. A
+        -- vault that ends still climbing is not a grab.
+        if S.slide == nil and from ~= Mode.VAULT then
+            local grab = (from == Mode.ASCENT)
+                or (organic and T.Anim.GRAB_ON_ORGANIC)
+                or ((from == Mode.LEAP or from == Mode.DISMOUNT) and T.Anim.GRAB_AFTER_LEAP)
+            if grab then PlayClimbAnim(F, "climbinit_grab") end
         end
     end,
     tick = function(F)
@@ -1439,6 +1634,8 @@ States[Mode.LEAP] = {
         }
         Take(F, "glider",    Mode.LEAP)
         Take(F, "moveinput", Mode.LEAP)
+        local keys = JUMP_ANIM_KEYS[jump.bucket]
+        if keys ~= nil and keys[jump.sign] ~= nil then PlayClimbAnim(F, keys[jump.sign]) end
         dbg("leap [%s%s]: drive %.0fms", jump.bucket,
             jump.sign ~= 0 and (jump.sign > 0 and "/R" or "/L") or "", S.leap.driveTime * 1000)
     end,
@@ -1487,15 +1684,74 @@ States[Mode.LEAP] = {
 
 -- ---- DISMOUNT -----------------------------------------------------------
 -- The hop away. A normal-ish jump: no priority, so jump.lua's gravity bands
--- resume at once. Owns: move input, glider, for the lock window only.
+-- resume at once. Owns: move input, glider, rotation, for the lock window.
+--
+-- The turn: the body must end up facing away from the wall, and the away
+-- clip turns it 180 deg on its own. So the capsule yaw is driven by exactly
+-- one of three plans, chosen at entry from what actually started playing:
+--   ease : capsule eased from the wall heading to the away heading over
+--          TURN_TIME. Used with a root-motion clip (whose turn the engine
+--          strips from the pose) and, over FALLBACK_TURN_TIME, when no clip
+--          played at all. 0 s = the old first-frame snap.
+--   snap : capsule frozen while a baked clip turns the body, then set to
+--          the away heading in one frame at SNAP_POS, when the pose is
+--          fully round, so nothing visible moves at the snap.
+-- Velocity is independent of facing throughout: the push away is written
+-- every frame regardless of where the capsule points.
+
+local function DismountTurnSide()
+    local side = S.prev.alongWall
+    if side == 0 then side = S.prev.sideSign end
+    if side == 0 then side = T.Dismount.DEFAULT_TURN_SIDE end
+    return side > 0 and 1 or -1
+end
+
+local function DismountFinishTurn(F, turn)
+    if turn.done then return end
+    turn.done = true
+    SetYawDeg(F.pawn, turn.fromYaw + 180 * turn.side)
+end
+
+local function DismountTurnTick(F, l)
+    local turn = l.turn
+    if turn.done then return end
+    turn.t = turn.t + F.dt
+    if turn.mode == "ease" then
+        local alpha = 1.0
+        if turn.duration > 0 then alpha = math.min(turn.t / turn.duration, 1.0) end
+        if alpha >= 1.0 then DismountFinishTurn(F, turn) return end
+        SetYawDeg(F.pawn, turn.fromYaw + 180 * turn.side * turn.fn(0.0, 1.0, alpha))
+        return
+    end
+    -- snap: wait for the clip to come round. A clip that is no longer
+    -- playing (finished or cut) cannot be waited on, so snap now.
+    local pos = ClimbAnimPosition(F)
+    if pos == nil or pos >= T.Anim.AWAY.SNAP_POS or turn.t >= turn.duration then
+        DismountFinishTurn(F, turn)
+    end
+end
+
 States[Mode.DISMOUNT] = {
     enter = function(F)
-        S.leap = { deltaTime = 0, faceDir = S.prev.wallFwd }
+        local fwd  = S.prev.wallFwd
+        local side = DismountTurnSide()
+        local turn = { fromYaw = math.deg(math.atan(fwd.Y, fwd.X)), side = side, t = 0, done = false }
+        local clip = PlayClimbAnim(F, side > 0 and "climbjump_away_right" or "climbjump_away_left")
+        if clip == nil then
+            turn.mode, turn.duration, turn.fn = "ease", T.Dismount.FALLBACK_TURN_TIME, T.Dismount.FALLBACK_TURN_FN
+        elseif T.Anim.AWAY.CLIP_ROOT_MOTION then
+            turn.mode, turn.duration, turn.fn = "ease", T.Anim.AWAY.TURN_TIME, T.Anim.AWAY.TURN_FN
+        else
+            turn.mode, turn.duration = "snap", T.Anim.AWAY.SNAP_TIME
+        end
+        S.leap = { deltaTime = 0, faceDir = fwd, turn = turn }
         Take(F, "glider",    Mode.DISMOUNT)
         Take(F, "moveinput", Mode.DISMOUNT)
+        Take(F, "rotation",  Mode.DISMOUNT)
         SetVertVel(F.cmc, T.Dismount.VZ)
-        SetHorizVel(F.cmc, -S.prev.wallFwd.X * T.Dismount.OUT, -S.prev.wallFwd.Y * T.Dismount.OUT)
-        dbg("dismount: out=%d vz=%d lock=%.2fs", T.Dismount.OUT, T.Dismount.VZ, T.Dismount.LOCK)
+        SetHorizVel(F.cmc, -fwd.X * T.Dismount.OUT, -fwd.Y * T.Dismount.OUT)
+        dbg("dismount: out=%d vz=%d lock=%.2fs turn=%s/%s %.2fs", T.Dismount.OUT, T.Dismount.VZ,
+            T.Dismount.LOCK, turn.mode, side > 0 and "R" or "L", turn.duration)
     end,
     tick = function(F)
         local l = S.leap
@@ -1503,13 +1759,17 @@ States[Mode.DISMOUNT] = {
         l.deltaTime = l.deltaTime + F.dt
         if F.isClimbing then return Mode.LATCHED, "re-grabbed during dismount" end
         if not F.isFalling then return Mode.IDLE, "dismount landed" end
-        if l.deltaTime >= T.Dismount.LOCK then return Mode.IDLE, "dismount lock over" end
-        local awayX, awayY = -l.faceDir.X, -l.faceDir.Y
-        SetHorizVel(F.cmc, awayX * T.Dismount.OUT, awayY * T.Dismount.OUT)
-        FaceYaw(F.pawn, { X = awayX, Y = awayY })
+        DismountTurnTick(F, l)
+        -- The lock outlasts LOCK only while the turn is still coming round.
+        if l.deltaTime >= T.Dismount.LOCK and l.turn.done then return Mode.IDLE, "dismount lock over" end
+        SetHorizVel(F.cmc, -l.faceDir.X * T.Dismount.OUT, -l.faceDir.Y * T.Dismount.OUT)
         return nil
     end,
-    exit = function(F)
+    exit = function(F, to)
+        -- Back to locomotion with the pose and the capsule agreeing: a turn
+        -- cut short (a landing) finishes in one frame. A re-grab squares
+        -- to the wall on its own.
+        if S.leap ~= nil and to == Mode.IDLE then DismountFinishTurn(F, S.leap.turn) end
         S.leap = nil
         GiveAll(F, Mode.DISMOUNT)
     end,
@@ -1560,7 +1820,7 @@ local function SetMode(F, next, why, payload)
 end
 
 -- =========================================================================
--- 8. VISUALISATION (TraceViz; inert unless DEBUG_VOLUMES)
+-- 9. VISUALISATION (TraceViz; inert unless DEBUG_VOLUMES)
 -- The capsule drawn IS the capsule check: same origin, extent, reach and
 -- channel as CapsuleSweepAhead. The eye and width sweeps are the filters.
 -- The green ring appears only when all of it would count as a wall.
@@ -1678,7 +1938,7 @@ local function WatchForTeleport(F)
 end
 
 -- =========================================================================
--- 9. HOOKS
+-- 10. HOOKS
 -- Class-level BP function hooks: registered once per session (the class
 -- persists across respawns; re-registering would double-fire), instance-
 -- filtered in the callbacks.
@@ -1791,7 +2051,7 @@ local function RegisterComponentHooks()
 end
 
 -- =========================================================================
--- 10. LIFECYCLE
+-- 11. LIFECYCLE
 -- =========================================================================
 
 function M.OnPlayerCached(pawn, cmc)
@@ -1803,6 +2063,7 @@ function M.OnPlayerCached(pawn, cmc)
         if r.applied then r.applied = false; Resources[name].give(F0, r) end
     end
     S = NewState()
+    montageCache = {}
     CommonState.ClimbHasPriority = false
     M.Mode, M.InInitClimbState, M.InClimbJump = Mode.IDLE, false, false
 
