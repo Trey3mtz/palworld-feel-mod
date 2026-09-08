@@ -102,7 +102,7 @@ function M.OnTick(dt, pawn, cmc)
     elseif vz < PositiveThreshold then
         cmc.GravityScale = LowGravity             
     else
-        cmc.GravityScale = TargetGravityExtreme   
+        cmc.GravityScale = VanillaGravity   
     end
 
     if vz < -0.01 and jumpInitiated then
