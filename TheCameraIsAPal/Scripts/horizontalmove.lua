@@ -24,14 +24,22 @@
 --                      turn trigger (the plant), classed walk/sprint by the
 --                      same peak test as the launch. Placeholder clips
 --                      until authored skids exist.
+-- Lean animation     : looping walk/sprint lean cycles on DefaultSlot,
+--                      chosen from a signed heading-rate signal (engine
+--                      steer prediction blended with the measured rate),
+--                      cross-faded by the montage's own blend-in, phase-
+--                      matched so the feet never skip, play-rate synced
+--                      to ground speed. Sprinting straight plays the
+--                      authored sprint cycle. See section 7.
 -- Air                : bUseSeparateBrakingFriction is GLOBAL, so it must be
 --                      toggled off while falling or the ground stop value
 --                      lands on the air as drag. See OnTick.
 --
 -- Layout: 1 tuning · 2 state · 3 utilities · 4 frame sampling ·
 --         5 walk-cap ease · 6 animation (montage + probes) ·
---         7 sliding turn · 8 arc retention · 9 air/ground braking ·
---         10 landing · 11 buildup · 12 lifecycle
+--         7 movement montages (lean + sprint) · 8 sliding turn ·
+--         9 arc retention · 10 air/ground braking · 11 landing ·
+--         12 buildup · 13 lifecycle
 -- =========================================================================
 
 local Easing = require("easingfunctions")
@@ -149,12 +157,68 @@ local SKID_MONTAGES = {
     walk   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
 }
 
+-- ---- movement montages: lean cycles + straight sprint ----
+-- Looping locomotion cycles on DefaultSlot, same pak and skeleton as the
+-- skid. Must be the AM_ montages (see SKID_MONTAGES). Author them with a
+-- looping section; a clip that runs out is restarted at phase 0, which
+-- is a visible hitch, so looping in the asset is the smooth path.
+local MOVE_ANIM_ENABLED    = true   -- master switch for this layer
+local MOVE_SPRINT_STRAIGHT = true   -- play MOVE_ANIMS.sprint when sprinting
+                                    -- without a lean (false = vanilla sprint)
+local MOVE_ANIMS = {
+    -- Lean
+    sprintlean_left  = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint_LeanLeft.AM_Player_Female_Sprint_LeanLeft",
+    sprintlean_right = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint_LeanRight.AM_Player_Female_Sprint_LeanRight",
+    walklean_left    = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Walk_LeanLeft.AM_Player_Female_Walk_LeanLeft",
+    walklean_right   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Walk_LeanRight.AM_Player_Female_Walk_LeanRight",
+
+    -- New Sprint anim
+    sprint = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint.AM_Player_Female_Sprint",
+}
+
+-- Ground speed each cycle was authored at. Play rate = speed / reference,
+-- so the stride stays planted as speed changes. nil walk = the game's own
+-- walk cap captured at spawn.
+local MOVE_CLIP_SPEED = { walk = nil, sprint = SPRINT_MAX_SPEED }
+local MOVE_RATE_MIN, MOVE_RATE_MAX = 0.65, 1.35
+local MOVE_RATE_EPSILON = 0.02   -- skip the SetPlayRate call below this delta
+
+-- Lean signal: signed heading rate in deg/s, + = turning right.
+-- Two sources blended:
+--   predicted : the engine's own steer, friction * sin(input vs velocity).
+--               Same-frame, no lag -- the lean starts the frame the stick
+--               moves, not once the body has already come round.
+--   measured  : yaw delta of the velocity vector per second. Truth, one
+--               frame late, and it carries the arc-retention rescale.
+local LEAN_PREDICT_WEIGHT = 0.6    -- 1.0 = input only, 0.0 = measured only
+local LEAN_SIGNAL_TAU     = 0.07   -- s, low-pass on the blended signal
+local LEAN_RATE_CLAMP     = 720    -- deg/s, spike guard on the raw sample
+local LEAN_ENTER_RATE     = 95     -- deg/s that commits a side
+local LEAN_EXIT_RATE      = 40     -- deg/s that releases it (hysteresis)
+local LEAN_MIN_HOLD       = 0.16   -- s a side is held before release/flip
+local LEAN_RELEASE_TIME   = 0.08   -- s the signal must stay under the exit
+                                   -- rate before the side lets go. A flip
+                                   -- passes through zero faster than this,
+                                   -- so it goes side-to-side in ONE
+                                   -- cross-fade instead of via straight.
+local LEAN_MIN_SPEED      = 120    -- uu/s, below this no lean and no sprint cycle
+local LEAN_MIN_ANALOG     = 0.35   -- stick must be actively held
+local LEAN_INVERT         = false  -- flip if the clips lean out of the turn
+
+-- Blend-out on release. Blend-IN is the montage asset's own value and is
+-- also what cross-fades the outgoing cycle when a new one starts.
+local LEAN_BLEND_OUT_RELEASE = 0.30   -- signal dropped below exit rate
+local LEAN_BLEND_OUT_STOP    = 0.12   -- movement ended / airborne / turn took over
+local LEAN_PHASE_MATCH       = true   -- start the next cycle at the outgoing
+                                      -- cycle's normalised position
+
 -- ---- debug ----
 local DEBUG      = true
 local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
 local DEBUG_CHANNELS = false -- one-shot lean-channel resting values at spawn
 local DEBUG_TURN_TRACE = true -- per-tick trace while a turn owns velocity
+local DEBUG_LEAN = false      -- per-tick lean signal (60Hz spam; edge changes always log)
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -201,6 +265,21 @@ local wallT   = 0
 
 -- ---- skid animation state ----
 local skidMontageCache = {}    -- asset path -> montage handle
+
+-- ---- movement montage state ----
+local moveMontageCache  = {}   -- asset path -> montage handle (separate from
+                               -- the skid cache: IsAnySkidPlaying walks that)
+local moveClipLength    = {}   -- MOVE_ANIMS key -> clip length (s)
+local activeMoveKey     = nil  -- MOVE_ANIMS key playing, or nil
+local activeMoveMontage = nil
+local activeMoveRate    = 0
+local moveApiChecked    = false -- one-shot: which montage calls exist
+local hasIsAnyMontagePlaying = false
+local leanRate      = 0        -- filtered signed heading rate, deg/s
+local leanSide      = 0        -- committed side: -1 left, 0 none, +1 right
+local leanHoldT     = 0        -- s since the side was committed
+local leanQuietT    = 0        -- s the signal has sat under the exit rate
+local prevHeadingYaw = nil     -- last velocity yaw, for the measured rate
 
 -- =========================================================================
 -- 3. UTILITIES
@@ -359,8 +438,9 @@ end
 -- through the Asset Registry, which only knows the base game's
 -- AssetRegistry.bin, so for a mod pak asset it returns nil without loading.
 -- It stays as a fallback for assets that are in the registry.
-local function LoadSkidMontage(path)
-    local montage = skidMontageCache[path]
+local function LoadMontageInto(cache, path)
+    if path == nil then return nil end
+    local montage = cache[path]
     if montage and montage:IsValid() then return montage end
     montage = StaticFindObject(path)
     if not (montage and montage:IsValid()) then
@@ -372,8 +452,12 @@ local function LoadSkidMontage(path)
             montage = nil
         end
     end
-    skidMontageCache[path] = montage
+    cache[path] = montage
     return montage
+end
+
+local function LoadSkidMontage(path)
+    return LoadMontageInto(skidMontageCache, path)
 end
 
 local function GetSkidMontage(class)
@@ -473,6 +557,14 @@ local function LogSkidSkeletons(pawn)
             FullNameOf(montage),
             FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
     end
+    if MOVE_ANIM_ENABLED then
+        for key, path in pairs(MOVE_ANIMS) do
+            local montage = LoadMontageInto(moveMontageCache, path)
+            dbg("move montage %s: obj=%s skeleton=%s", key,
+                FullNameOf(montage),
+                FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
+        end
+    end
 end
 
 -- Returns true when the montage actually started, so the turn can choose
@@ -511,7 +603,256 @@ local function PlaySkidAnimation(class)
 end
 
 -- =========================================================================
--- 7. SLIDING TURN
+-- 7. MOVEMENT MONTAGES: lean cycles + straight sprint
+-- One layer, one active montage at a time, all in DefaultGroup:
+--   desired key  = f(gait, committed lean side)
+--   switch       = Montage_Play of the new cycle. The engine blends the
+--                  outgoing same-group montage out over the incoming one's
+--                  BlendIn, so every side flip and gait change is a
+--                  cross-fade. The start position is phase-matched to the
+--                  outgoing cycle so the stride does not skip.
+--   release      = Montage_Stop with a blend-out chosen by WHY it released.
+--   rate         = ground speed / authored speed, re-synced each tick.
+-- The skid owns the slot while it plays: this layer never cuts a skid and
+-- never plays over a montage it did not start (game attacks, emotes).
+-- =========================================================================
+
+local function GetMoveMontage(key)
+    return LoadMontageInto(moveMontageCache, MOVE_ANIMS[key])
+end
+
+-- Reflection probe, run once on the first live instance: IsAnyMontagePlaying
+-- is BP-callable on UAnimInstance in 5.1, but the guard must degrade to
+-- "assume free" rather than throw every tick if a build hides it.
+local function CheckMoveApi(anim)
+    if moveApiChecked then return end
+    moveApiChecked = true
+    hasIsAnyMontagePlaying =
+        pcall(function() return anim:IsAnyMontagePlaying() end)
+    dbg("move anim api: IsAnyMontagePlaying=%s", tostring(hasIsAnyMontagePlaying))
+end
+
+local function IsOurMovePlaying(anim)
+    if not (activeMoveMontage and activeMoveMontage:IsValid()) then return false end
+    local playing = false
+    pcall(function() playing = anim:Montage_IsPlaying(activeMoveMontage) end)
+    return playing
+end
+
+-- A montage neither the skid nor this layer started (game attack, emote,
+-- glider unfurl). Playing over it would cut the game's clip, and the game
+-- would then cut ours back the next time it plays -- a flicker war.
+local function IsForeignMontagePlaying(anim)
+    if not hasIsAnyMontagePlaying then return false end
+    local any = false
+    pcall(function() any = anim:IsAnyMontagePlaying() end)
+    if not any then return false end
+    if IsOurMovePlaying(anim) then return false end
+    if IsAnySkidPlaying(anim) then return false end
+    return true
+end
+
+local function ClipLength(key, montage)
+    local len = moveClipLength[key]
+    if len and len > 0 then return len end
+    len = ReadOpt(montage, "SequenceLength") or 0
+    if len > 0 then moveClipLength[key] = len end
+    return len
+end
+
+-- Signed heading rate for this frame, folded into the filtered signal.
+-- Sign convention is UE yaw: X forward, Y right, positive = clockwise from
+-- above = turning right. cross(vel, input) > 0 puts the stick to the right
+-- of travel, and atan(vy, vx) rising is the same right turn, so the two
+-- sources agree without a flip.
+local function UpdateLeanSignal(dt, f)
+    local measured = 0
+    if f.spd >= LEAN_MIN_SPEED then
+        local yaw = math.deg(math.atan(f.vy, f.vx))
+        if prevHeadingYaw ~= nil and dt > 1e-4 then
+            local delta = ((yaw - prevHeadingYaw + 180) % 360) - 180
+            measured = delta / dt
+        end
+        prevHeadingYaw = yaw
+    else
+        prevHeadingYaw = nil
+    end
+
+    local predicted = 0
+    if f.imag > 1e-3 and f.spd > 1e-3 and f.analog >= LEAN_MIN_ANALOG then
+        -- CalcVelocity rotates velocity toward AccelDir at alpha dt*Friction,
+        -- i.e. an angular rate of Friction * sin(angle) rad/s.
+        local sinAngle = (f.vx * f.iy - f.vy * f.ix) / f.spd
+        predicted = math.deg(GROUND_FRICTION * sinAngle)
+    end
+
+    local raw = LEAN_PREDICT_WEIGHT * predicted
+              + (1 - LEAN_PREDICT_WEIGHT) * measured
+    raw = math.max(-LEAN_RATE_CLAMP, math.min(LEAN_RATE_CLAMP, raw))
+    if LEAN_INVERT then raw = -raw end
+
+    local alpha = 1
+    if LEAN_SIGNAL_TAU > 0 then alpha = 1 - math.exp(-dt / LEAN_SIGNAL_TAU) end
+    leanRate = leanRate + (raw - leanRate) * alpha
+end
+
+-- Commit / release / flip the lean side with hysteresis and a minimum
+-- hold. A side once committed is not released by a single quiet frame,
+-- and a flip is a fresh commit (needs the enter rate, restarts the hold).
+local function UpdateLeanSide(dt)
+    local mag  = math.abs(leanRate)
+    local sign = (leanRate >= 0) and 1 or -1
+    leanHoldT  = leanHoldT + dt
+
+    if mag < LEAN_EXIT_RATE then leanQuietT = leanQuietT + dt
+    else leanQuietT = 0 end
+
+    if leanSide == 0 then
+        if mag >= LEAN_ENTER_RATE then
+            leanSide, leanHoldT = sign, 0
+        end
+    elseif leanHoldT >= LEAN_MIN_HOLD then
+        if sign ~= leanSide and mag >= LEAN_ENTER_RATE then
+            leanSide, leanHoldT = sign, 0
+        elseif leanQuietT >= LEAN_RELEASE_TIME then
+            leanSide = 0
+        end
+    end
+end
+
+-- Which cycle this frame wants, and why nothing when nil. Gait comes from
+-- the movement mode (custom 2 = Sprint), not from speed: the sprint cycle
+-- must swap in the frame the game enters sprint, before speed has built.
+local function DesiredMoveKey(f)
+    if not MOVE_ANIM_ENABLED then return nil, "disabled" end
+    if phase ~= PHASE_NONE then return nil, "turn" end
+    if not IsTurnCapableMode(f.mode, f.custom) then return nil, "stop" end
+    if f.spd < LEAN_MIN_SPEED then return nil, "stop" end
+    if f.imag <= 1e-3 or f.analog < LEAN_MIN_ANALOG then return nil, "release" end
+
+    local sprinting = (f.mode == 6 and f.custom == 2)
+    if leanSide ~= 0 then
+        local gait = sprinting and "sprintlean" or "walklean"
+        local side = (leanSide < 0) and "_left" or "_right"
+        return gait .. side, nil
+    end
+    if sprinting and MOVE_SPRINT_STRAIGHT then return "sprint", nil end
+    return nil, "release"
+end
+
+local function MoveRateFor(key, f)
+    local ref = MOVE_CLIP_SPEED.walk or desired or START_CAP
+    if key == "sprint" or key:sub(1, 6) == "sprint" then
+        ref = MOVE_CLIP_SPEED.sprint or sprintCap or SPRINT_MAX_SPEED
+    end
+    if ref <= 0 then return 1.0 end
+    return math.max(MOVE_RATE_MIN, math.min(MOVE_RATE_MAX, f.spd / ref))
+end
+
+local function SyncMoveRate(anim, key, f)
+    local rate = MoveRateFor(key, f)
+    if math.abs(rate - activeMoveRate) < MOVE_RATE_EPSILON then return end
+    local ok = pcall(function() anim:Montage_SetPlayRate(activeMoveMontage, rate) end)
+    if ok then activeMoveRate = rate end
+end
+
+local function StopMoveMontage(anim, reason)
+    if activeMoveMontage and activeMoveMontage:IsValid() and anim then
+        local blendOut = (reason == "release") and LEAN_BLEND_OUT_RELEASE
+                                                or LEAN_BLEND_OUT_STOP
+        pcall(function() anim:Montage_Stop(blendOut, activeMoveMontage) end)
+        dbg("move anim: %s -> none (%s, blend %.2f)", activeMoveKey, reason, blendOut)
+    end
+    activeMoveKey, activeMoveMontage, activeMoveRate = nil, nil, 0
+end
+
+-- Start `key`, cross-fading from whatever this layer had. The outgoing
+-- cycle's normalised position seeds the incoming one so a left->right flip
+-- or walk->sprint change keeps the feet where they were.
+local function StartMoveMontage(anim, key, f)
+    local montage = GetMoveMontage(key)
+    if montage == nil then
+        dbg("move anim %s: montage not resolved (%s)", key, MOVE_ANIMS[key])
+        return false
+    end
+
+    local startPos = 0.0
+    if LEAN_PHASE_MATCH and activeMoveKey ~= nil and IsOurMovePlaying(anim) then
+        local outLen = ClipLength(activeMoveKey, activeMoveMontage)
+        local inLen  = ClipLength(key, montage)
+        if outLen > 0 and inLen > 0 then
+            local outPos = 0
+            pcall(function() outPos = anim:Montage_GetPosition(activeMoveMontage) end)
+            startPos = (outPos / outLen) % 1.0 * inLen
+        end
+    end
+
+    local rate   = MoveRateFor(key, f)
+    local played = 0.0
+    -- bStopAllMontages=false: only DefaultGroup (the outgoing cycle) is
+    -- blended out; a game montage in another group is left alone.
+    local ok = pcall(function()
+        played = anim:Montage_Play(montage, rate, 0, startPos, false) or 0.0
+    end)
+    if not ok or played <= 0.0 then
+        dbg("move anim %s: Montage_Play %s", key, ok and "REJECTED (returned 0)" or "threw")
+        activeMoveKey, activeMoveMontage, activeMoveRate = nil, nil, 0
+        return false
+    end
+    moveClipLength[key] = moveClipLength[key] or played
+    dbg("move anim: %s -> %s (rate %.2f, start %.2f/%.2f)",
+        tostring(activeMoveKey), key, rate, startPos, played)
+    activeMoveKey, activeMoveMontage, activeMoveRate = key, montage, rate
+    return true
+end
+
+local function UpdateMoveAnim(dt, f)
+    if not MOVE_ANIM_ENABLED then return end
+    UpdateLeanSignal(dt, f)
+    UpdateLeanSide(dt)
+
+    local anim = ResolveAnimInstance()
+    if anim == nil then
+        activeMoveKey, activeMoveMontage, activeMoveRate = nil, nil, 0
+        return
+    end
+    CheckMoveApi(anim)
+
+    local key, reason = DesiredMoveKey(f)
+    if DEBUG_LEAN then
+        dbg("lean rate=%+.0f side=%+d hold=%.2f want=%s active=%s",
+            leanRate, leanSide, leanHoldT, tostring(key), tostring(activeMoveKey))
+    end
+
+    if key == nil then
+        if reason ~= "release" and reason ~= "disabled" then leanSide = 0 end
+        if activeMoveKey ~= nil then StopMoveMontage(anim, reason) end
+        return
+    end
+
+    -- Something else owns the slot. Ours, if it was playing, has already
+    -- been cut by that play: drop the bookkeeping so we re-enter cleanly
+    -- once the slot frees, and do not fight for it now.
+    if IsAnySkidPlaying(anim) or IsForeignMontagePlaying(anim) then
+        activeMoveKey, activeMoveMontage, activeMoveRate = nil, nil, 0
+        return
+    end
+
+    if key == activeMoveKey then
+        if IsOurMovePlaying(anim) then
+            SyncMoveRate(anim, key, f)
+            return
+        end
+        -- Non-looping asset ran out (or the game stopped it): restart.
+        dbg("move anim %s: ended, restarting (author a looping section)", key)
+        activeMoveKey = nil
+    end
+
+    StartMoveMontage(anim, key, f)
+end
+
+-- =========================================================================
+-- 8. SLIDING TURN
 -- Three phases: NONE (watching for a reversal), SKID (velocity eased down
 -- along the old heading), LAUNCH (exit speed reasserted along input).
 -- =========================================================================
@@ -728,7 +1069,7 @@ local function UpdateSlidingTurn(dt, cmc, f, pawn)
 end
 
 -- =========================================================================
--- 8. ARC RETENTION
+-- 9. ARC RETENTION
 -- Cancel the chord shortfall of the engine's rotate-toward. Direction is
 -- left exactly as CalcVelocity produced it, so the arc is unchanged; only
 -- the magnitude is put back. Runs on grounded locomotion with input held,
@@ -799,7 +1140,7 @@ local function RetainTurnSpeed(dt, cmc, f, walled)
 end
 
 -- =========================================================================
--- 9. AIR / GROUND BRAKING SELECT
+-- 10. AIR / GROUND BRAKING SELECT
 -- bUseSeparateBrakingFriction is GLOBAL: while true, CalcVelocity uses
 -- BrakingFriction in EVERY mode, so the ground stop value lands on falling
 -- as air drag. Off while falling => air uses FallingLateralFriction (0)
@@ -827,7 +1168,7 @@ local function DebugAirFrame(cmc, mode)
 end
 
 -- =========================================================================
--- 10. LANDING
+-- 11. LANDING
 -- Seed the ease from the speed actually carried in, so the cap glides
 -- down instead of the over-max clamp braking on touchdown.
 -- =========================================================================
@@ -845,7 +1186,7 @@ local function HandleLanding(cmc)
 end
 
 -- =========================================================================
--- 11. BUILDUP
+-- 12. BUILDUP
 -- =========================================================================
 
 -- A live turn owns velocity. Hold the cap open so the ease cannot clamp
@@ -945,7 +1286,7 @@ RegisterKeyBind(Key.L, function()
 end)
 
 -- =========================================================================
--- 12. LIFECYCLE
+-- 13. LIFECYCLE
 -- =========================================================================
 
 function M.OnPlayerCached(pawn, cmc)
@@ -976,6 +1317,13 @@ function M.OnPlayerCached(pawn, cmc)
     activeSkidMontage    = nil
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
+
+    -- Lean layer: the old pawn's montage is gone with the old mesh, and a
+    -- filtered rate carried across a respawn would commit a phantom lean.
+    activeMoveKey, activeMoveMontage, activeMoveRate = nil, nil, 0
+    leanRate, leanSide, leanHoldT, leanQuietT, prevHeadingYaw = 0, 0, 0, 0, nil
+    moveMontageCache, moveClipLength = {}, {}
+    moveApiChecked = false
 
     -- The old pawn's anim instance may still report valid, in which case
     -- the lazy re-cache on the next tick would never fire and
@@ -1057,6 +1405,14 @@ function M.OnPlayerCached(pawn, cmc)
         end
     end
 
+    if MOVE_ANIM_ENABLED then
+        for key, path in pairs(MOVE_ANIMS) do
+            if LoadMontageInto(moveMontageCache, path) == nil then
+                dbg("move montage %s failed to load: %s", key, path)
+            end
+        end
+    end
+
     LogSkidSkeletons(pawn)
 end
 
@@ -1106,6 +1462,10 @@ function M.OnTick(dt, pawn, cmc)
     local walled  = UpdateWallContact(dt, frame)
     local turning = UpdateSlidingTurn(dt, cmc, frame, pawn)
     RetainTurnSpeed(dt, cmc, frame, walled)
+    -- After the turn and retention: the measured heading rate must see the
+    -- velocity the engine will actually integrate this frame. Runs on air
+    -- frames too, so the layer releases the frame the ground is lost.
+    UpdateMoveAnim(dt, frame)
 
     DebugAirFrame(cmc, frame.mode)
     SelectBrakingFriction(cmc, frame.mode)
