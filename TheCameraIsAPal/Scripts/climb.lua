@@ -53,6 +53,11 @@ local DEBUG_FRAME = false   -- per-frame lines; never leave on, the log is untri
 -- a forced latch held, which reason ended a sequence).
 local DEBUG_DISCOVERY = true
 
+-- Clip timing: one line per mode transition while a climb clip is playing,
+-- with the clip's position against its length. Turn on to tune
+-- T.Anim.CLIPS: the line says where the clip was when the code moved on.
+local DEBUG_ANIM = true
+
 -- Deeper one-shot investigations (class function dump, tick-order sampling,
 -- CanClimbingStart observation, trace-struct check) live in
 -- climb_discover.lua. Off by default: their questions are answered, and
@@ -225,26 +230,53 @@ T.Dismount = {
 -- nothing and changes nothing about the movement.
 T.Anim = {
     ENABLED     = true,
-    RATE        = 1.0,     -- play rate for every climb clip
-    STOP_BLEND  = 0.20,    -- s blend-out when this file stops its own clip (slide end)
+    -- Per clip: the montage path plus how it ends.
+    --   rate       : play rate (1.0 = as authored). Above 1 shortens the clip.
+    --   stopOnExit : stop the clip (blended over blendOut) when the mode
+    --                that started it exits. Off, the clip runs its length
+    --                unless another climb clip replaces it.
+    --   maxTime    : s after play at which the clip is stopped regardless
+    --                of mode. nil = never.
+    --   blendOut   : s blend used when this file stops the clip.
+    -- Roughly how long each owning phase lasts with the current tuning,
+    -- so a clip can be cut to fit:
+    --   climbinit_ground : launch -> latch, ~0.25-0.45 s (LOCK_TIME 0.72 max)
+    --   climbinit_hop    : hop -> latch, ~0.20-0.40 s from the hop
+    --   climbinit_grab   : no phase; climbing continues underneath
+    --   climbjump_*      : the leap drive ~0.35 s + 0.10 s attach window;
+    --                      a re-attach plays the grab over it
+    --   climbjump_away_* : the dismount, LOCK 0.20 s or the turn, 0.45 s
+    --   climbslide       : (entry speed * 0.45 - 60) / 1400 s, so
+    --                      ~0.15 s at -600 uu/s up to ~0.47 s at -1600
+    CLIPS = {
+        -- jumps out of the climb: bucket + side from ClassifyJumpDirection
+        climbjump_left       = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpLeft.AM_Player_Female_Climb_JmpLeft",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+        climbjump_right      = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpRight.AM_Player_Female_Climb_JmpRight",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+        climbjump_up         = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUp.AM_Player_Female_Climb_JmpUp",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+        climbjump_up_left    = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpLeft.AM_Player_Female_Climb_JmpUpLeft",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+        climbjump_up_right   = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpRight.AM_Player_Female_Climb_JmpUpRight",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+        climbjump_away_left  = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayLeft.AM_Player_Female_Climb_JmpAwayLeft",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.25 },
+        climbjump_away_right = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayRight.AM_Player_Female_Climb_JmpAwayRight",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.25 },
+        -- entries: the walk-in launch, the airborne mini hop, the latch
+        climbinit_ground     = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromGrnd.AM_Player_Female_Climb_InitFromGrnd",
+                                 rate = 1.0, stopOnExit = false, maxTime = nil, blendOut = 0.20 },
+        climbinit_hop        = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromHop.AM_Player_Female_Climb_InitFromHop",
+                                 rate = 1.0, stopOnExit = false, maxTime = nil, blendOut = 0.20 },
+        climbinit_grab       = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbGrab.AM_Player_Female_ClimbGrab",
+                                 rate = 1.0, stopOnExit = false, maxTime = nil, blendOut = 0.20 },
+        -- the wall slide; stopped when the slide halts
+        climbslide           = { path = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbSlide.AM_Player_Female_ClimbSlide",
+                                 rate = 1.0, stopOnExit = true,  maxTime = nil, blendOut = 0.20 },
+    },
     GRAB_ON_ORGANIC  = true,   -- grab clip when the component latched on its own
     GRAB_AFTER_LEAP  = true,   -- grab clip on a leap or dismount re-attach
-    MONTAGES = {
-        -- jumps out of the climb: bucket + side from ClassifyJumpDirection
-        climbjump_left       = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpLeft.AM_Player_Female_Climb_JmpLeft",
-        climbjump_right      = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpRight.AM_Player_Female_Climb_JmpRight",
-        climbjump_up         = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUp.AM_Player_Female_Climb_JmpUp",
-        climbjump_up_left    = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpLeft.AM_Player_Female_Climb_JmpUpLeft",
-        climbjump_up_right   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpUpRight.AM_Player_Female_Climb_JmpUpRight",
-        climbjump_away_left  = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayLeft.AM_Player_Female_Climb_JmpAwayLeft",
-        climbjump_away_right = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_JmpAwayRight.AM_Player_Female_Climb_JmpAwayRight",
-        -- entries: the walk-in launch, the airborne mini hop, the latch
-        climbinit_ground     = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromGrnd.AM_Player_Female_Climb_InitFromGrnd",
-        climbinit_hop        = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Climb_InitFromHop.AM_Player_Female_Climb_InitFromHop",
-        climbinit_grab       = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbGrab.AM_Player_Female_ClimbGrab",
-        -- the wall slide; stopped by this file when the slide halts
-        climbslide           = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbSlide.AM_Player_Female_ClimbSlide",
-    },
     -- The turn away from the wall must live in exactly one place, or the
     -- clip and the capsule stack to 360. Which place is an asset fact:
     --   CLIP_TURNS_BODY = false : the clip plays in place and does not
@@ -344,8 +376,9 @@ local function NewState()
         guard  = { armedTime = 0, lostFrames = 0, cooldown = 0, pending = nil },
         ascent = nil, watch = nil, leap = nil, slide = nil,
 
-        -- the climb clip this file last started (handle + key), if any
-        anim = { montage = nil, key = nil },
+        -- the climb clip this file last started: handle, key, its length,
+        -- the mode that started it, and seconds since the play
+        anim = { montage = nil, key = nil, length = 0, owner = nil, t = 0 },
 
         -- carried between frames
         prev = { wallFwd = { X = 1, Y = 0 }, alongWall = 0, upward = 0,
@@ -697,8 +730,9 @@ end
 -- silent, so the return value is the only signal.
 local function PlayClimbAnim(F, key)
     if not T.Anim.ENABLED then return nil end
-    local path = T.Anim.MONTAGES[key]
-    if path == nil then return nil end
+    local clip = T.Anim.CLIPS[key]
+    if clip == nil or clip.path == nil then return nil end
+    local path = clip.path
     local montage = ResolveMontage(path)
     if montage == nil then
         if Budget("anim_" .. key, 1) then ddbg("anim %s: montage not resolved (%s)", key, path) end
@@ -709,7 +743,7 @@ local function PlayClimbAnim(F, key)
         if Budget("anim_noinstance", 1) then ddbg("anim %s: no anim instance on the pawn mesh", key) end
         return nil
     end
-    local ok, length = CallOpt(anim, "Montage_Play", montage, T.Anim.RATE, 0, 0.0, true)
+    local ok, length = CallOpt(anim, "Montage_Play", montage, clip.rate or 1.0, 0, 0.0, true)
     if not ok or type(length) ~= "number" or length <= 0.0 then
         if Budget("anim_" .. key, 1) then
             ddbg("anim %s: Montage_Play %s", key,
@@ -717,8 +751,11 @@ local function PlayClimbAnim(F, key)
         end
         return nil
     end
-    S.anim.montage, S.anim.key = montage, key
-    dbg("anim %s: playing, length=%.3f", key, length)
+    S.anim.montage, S.anim.key, S.anim.length = montage, key, length
+    S.anim.owner, S.anim.t = S.mode, 0
+    if DEBUG_ANIM then
+        ddbg("anim %s: play in %s, length %.3fs at rate %.2f", key, S.mode, length, clip.rate or 1.0)
+    end
     return montage, length
 end
 
@@ -729,12 +766,15 @@ local function StopClimbAnim(F, blendOut, onlyKey)
     local montage = S.anim.montage
     if montage == nil then return end
     if onlyKey ~= nil and S.anim.key ~= onlyKey then return end
-    S.anim.montage, S.anim.key = nil, nil
+    local key, clip = S.anim.key, T.Anim.CLIPS[S.anim.key]
+    S.anim.montage, S.anim.key, S.anim.owner = nil, nil, nil
     local anim = GetAnimInstance(F.pawn)
     if anim == nil or not IsLive(montage) then return end
     local ok, playing = CallOpt(anim, "Montage_IsPlaying", montage)
     if ok and playing then
-        CallOpt(anim, "Montage_Stop", blendOut or T.Anim.STOP_BLEND, montage)
+        local blend = blendOut or (clip and clip.blendOut) or 0.2
+        CallOpt(anim, "Montage_Stop", blend, montage)
+        if DEBUG_ANIM then ddbg("anim %s: stopped at %.3fs (blend %.2f)", key, S.anim.t, blend) end
     end
 end
 
@@ -750,6 +790,30 @@ local function ClimbAnimPosition(F)
     local okPos, pos = CallOpt(anim, "Montage_GetPosition", montage)
     if okPos and type(pos) == "number" then return pos end
     return nil
+end
+
+-- Once per frame: the clip's age, and the maxTime cut. One compare while
+-- a clip is playing, nothing otherwise.
+local function ClimbAnimTick(F)
+    local a = S.anim
+    if a.montage == nil then return end
+    a.t = a.t + F.dt
+    local clip = T.Anim.CLIPS[a.key]
+    if clip and clip.maxTime and a.t >= clip.maxTime then StopClimbAnim(F, clip.blendOut) end
+end
+
+-- On a mode transition: report where the clip is, and cut it if the mode
+-- that started it asked for that.
+local function ClimbAnimOnTransition(F, from, to, why)
+    local a = S.anim
+    if a.montage == nil then return end
+    if DEBUG_ANIM then
+        local pos = ClimbAnimPosition(F)
+        ddbg("anim %s: %s -> %s (%s) at %.3fs, clip %s/%.3fs", a.key, from, to, why or "?",
+            a.t, pos and string.format("%.3f", pos) or "done", a.length)
+    end
+    local clip = T.Anim.CLIPS[a.key]
+    if a.owner == from and clip and clip.stopOnExit then StopClimbAnim(F, clip.blendOut) end
 end
 
 -- =========================================================================
@@ -1397,7 +1461,7 @@ local function SlideEnd(F, reason)
     if S.slide == nil then return end
     S.slide = nil
     Give(F, "climbmax", Mode.LATCHED)
-    StopClimbAnim(F, T.Anim.STOP_BLEND, "climbslide")
+    StopClimbAnim(F, nil, "climbslide")
     dbg("slide end: %s", reason)
 end
 
@@ -1793,6 +1857,7 @@ States[Mode.VAULT] = {
 
 local function SetMode(F, next, why, payload)
     local from = S.mode
+    ClimbAnimOnTransition(F, from, next, why)
     S.inTransition = true
     States[from].exit(F, next, why)
     S.mode     = next
@@ -2107,6 +2172,7 @@ function M.OnTick(dt, pawn, cmc)
     end
     WatchForTeleport(F)
     VisualiseClimbChecks(F)
+    ClimbAnimTick(F)
 
     -- Run to completion: a mode entered this frame ticks this frame, so a
     -- commit, a latch or a jump is acted on without a frame of delay.
