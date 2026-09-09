@@ -232,6 +232,8 @@ T.Anim = {
     ENABLED     = true,
     -- Per clip: the montage path plus how it ends.
     --   rate       : play rate (1.0 = as authored). Above 1 shortens the clip.
+    --   startAt    : s into the clip to start from (nil = 0). Trims a
+    --                lead-in without editing the asset.
     --   stopOnExit : stop the clip (blended over blendOut) when the mode
     --                that started it exits. Off, the clip runs its length
     --                unless another climb clip replaces it.
@@ -743,7 +745,7 @@ local function PlayClimbAnim(F, key)
         if Budget("anim_noinstance", 1) then ddbg("anim %s: no anim instance on the pawn mesh", key) end
         return nil
     end
-    local ok, length = CallOpt(anim, "Montage_Play", montage, clip.rate or 1.0, 0, 0.0, true)
+    local ok, length = CallOpt(anim, "Montage_Play", montage, clip.rate or 1.0, 0, clip.startAt or 0.0, true)
     if not ok or type(length) ~= "number" or length <= 0.0 then
         if Budget("anim_" .. key, 1) then
             ddbg("anim %s: Montage_Play %s", key,
@@ -754,7 +756,8 @@ local function PlayClimbAnim(F, key)
     S.anim.montage, S.anim.key, S.anim.length = montage, key, length
     S.anim.owner, S.anim.t = S.mode, 0
     if DEBUG_ANIM then
-        ddbg("anim %s: play in %s, length %.3fs at rate %.2f", key, S.mode, length, clip.rate or 1.0)
+        ddbg("anim %s: play in %s, length %.3fs at rate %.2f from %.2fs", key, S.mode, length,
+            clip.rate or 1.0, clip.startAt or 0.0)
     end
     return montage, length
 end
