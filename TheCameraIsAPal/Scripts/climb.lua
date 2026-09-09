@@ -245,29 +245,24 @@ T.Anim = {
         -- the wall slide; stopped by this file when the slide halts
         climbslide           = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_ClimbSlide.AM_Player_Female_ClimbSlide",
     },
-    -- The away clips turn the body 180 deg inside the animation. Rotation
-    -- must live in exactly one place or the clip and the capsule stack to
-    -- 360. Which arrangement applies is an asset fact, set per clip:
-    --   CLIP_ROOT_MOTION = true  : the turn is on the root bone and the
-    --     sequence has Enable Root Motion on. The ABP does not consume
-    --     montage root motion, so the rendered pose stays square to the
-    --     capsule and the capsule carries the whole turn, eased over
-    --     TURN_TIME. Smooth, stack-free, and the recommended authoring.
-    --   CLIP_ROOT_MOTION = false : the turn is baked into pelvis/spine.
+    -- The turn away from the wall must live in exactly one place, or the
+    -- clip and the capsule stack to 360. Which place is an asset fact:
+    --   CLIP_TURNS_BODY = false : the clip plays in place and does not
+    --     rotate the body (the Mixamo away clips, as exported). The
+    --     capsule carries the whole 180 deg, eased over TURN_TIME, and the
+    --     clip rides on top. No root motion involved.
+    --   CLIP_TURNS_BODY = true  : the turn is baked into pelvis/spine.
     --     The capsule is frozen while the clip turns the body, then snapped
     --     to the away heading in one frame at SNAP_POS, the moment the
     --     clip is fully round, so the pose lands exactly on the new
     --     forward and the blend-out hands off to locomotion facing the
     --     same way. SNAP_POS must sit one frame before the clip's
     --     blend-out starts (length - BlendOut), or the flip shows.
-    -- Mixamo clips keep the armature root static and put the turn on Hips,
-    -- so they are baked clips: root motion would strip nothing. Set true
-    -- only after moving the hip yaw onto the root in a DCC pass.
     AWAY = {
-        CLIP_ROOT_MOTION = false,
-        TURN_TIME = 0.45,                  -- s; match clip length minus blend-out
+        CLIP_TURNS_BODY = false,
+        TURN_TIME = 0.45,                  -- s; roughly the clip's turn beat, tune by eye
         TURN_FN   = Easing.EaseInOutSine,
-        SNAP_POS  = 0.50,                  -- s montage position (baked clip only)
+        SNAP_POS  = 0.50,                  -- s montage position (turning clip only)
         SNAP_TIME = 0.55,                  -- s from the jump: fallback when the position cannot be read
     },
 }
@@ -1693,11 +1688,11 @@ States[Mode.LEAP] = {
 -- clip turns it 180 deg on its own. So the capsule yaw is driven by exactly
 -- one of three plans, chosen at entry from what actually started playing:
 --   ease : capsule eased from the wall heading to the away heading over
---          TURN_TIME. Used with a root-motion clip (whose turn the engine
---          strips from the pose) and, over FALLBACK_TURN_TIME, when no clip
---          played at all. 0 s = the old first-frame snap.
---   snap : capsule frozen while a baked clip turns the body, then set to
---          the away heading in one frame at SNAP_POS, when the pose is
+--          TURN_TIME. Used with a clip that plays in place and, over
+--          FALLBACK_TURN_TIME, when no clip played at all. 0 s = the old
+--          first-frame snap.
+--   snap : capsule frozen while a clip that turns the body plays, then set
+--          to the away heading in one frame at SNAP_POS, when the pose is
 --          fully round, so nothing visible moves at the snap.
 -- Velocity is independent of facing throughout: the push away is written
 -- every frame regardless of where the capsule points.
@@ -1742,10 +1737,10 @@ States[Mode.DISMOUNT] = {
         local clip = PlayClimbAnim(F, side > 0 and "climbjump_away_right" or "climbjump_away_left")
         if clip == nil then
             turn.mode, turn.duration, turn.fn = "ease", T.Dismount.FALLBACK_TURN_TIME, T.Dismount.FALLBACK_TURN_FN
-        elseif T.Anim.AWAY.CLIP_ROOT_MOTION then
-            turn.mode, turn.duration, turn.fn = "ease", T.Anim.AWAY.TURN_TIME, T.Anim.AWAY.TURN_FN
-        else
+        elseif T.Anim.AWAY.CLIP_TURNS_BODY then
             turn.mode, turn.duration = "snap", T.Anim.AWAY.SNAP_TIME
+        else
+            turn.mode, turn.duration, turn.fn = "ease", T.Anim.AWAY.TURN_TIME, T.Anim.AWAY.TURN_FN
         end
         S.leap = { deltaTime = 0, faceDir = fwd, turn = turn }
         Take(F, "glider",    Mode.DISMOUNT)
