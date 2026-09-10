@@ -24,12 +24,15 @@
 --                      turn trigger (the plant), classed walk/sprint by the
 --                      same peak test as the launch. Placeholder clips
 --                      until authored skids exist.
--- Lean               : one continuous signed value (degrees, + = right)
---                      from a heading-rate signal, filtered, applied
---                      ADDITIVELY every frame. Two backends: an additive
---                      montage scrubbed by position (amount = position),
---                      or a rotator channel on the ABP. No montage
---                      cross-fades: the amount IS the blend. Section 7.
+-- Locomotion graph   : the game's ABP blends two gaits by speed and has no
+--                      lean. Montages cannot replace that: one montage per
+--                      group, weight never scriptable. So locomotion is
+--                      re-done as a 2D blend space (speed x lean) in a
+--                      post-process AnimBlueprint shipped in the pak, and
+--                      Lua feeds it three floats each frame: Speed, Lean
+--                      (-1..+1 from the heading-rate signal) and LocoAlpha
+--                      (how much of the graph's pose replaces the game's).
+--                      Section 7.
 -- Sprint cycle       : the authored sprint montage plays while sprinting
 --                      and stops otherwise. Section 7.
 -- Air                : bUseSeparateBrakingFriction is GLOBAL, so it must be
@@ -158,87 +161,67 @@ local SKID_MONTAGES = {
     walk   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_QuickTurn.AM_Player_Female_QuickTurn",
 }
 
--- ---- movement montages ----
--- Same pak and skeleton as the skid; AM_ montages only (see SKID_MONTAGES).
-local MOVE_ANIMS = {
-    -- Lean
-    sprintlean_left  = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint_LeanLeft.AM_Player_Female_Sprint_LeanLeft",
-    sprintlean_right = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint_LeanRight.AM_Player_Female_Sprint_LeanRight",
-    walklean_left    = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Walk_LeanLeft.AM_Player_Female_Walk_LeanLeft",
-    walklean_right   = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Walk_LeanRight.AM_Player_Female_Walk_LeanRight",
+-- ---- locomotion graph (post-process AnimBlueprint) ----
+-- The ABP lives in the pak, built against SK_PalHuman_Skeleton, and the
+-- ModActor must hold a hard reference so StaticFindObject resolves it.
+-- Its graph: Input Pose -> Blend(LocoAlpha) with a 2D BlendSpace whose
+-- X = Lean (-1..1) and Y = Speed (uu/s), samples: walk / run / sprint at
+-- lean 0, and the lean cycles at +-1. See LOCO_GRAPH_VARS for the names
+-- the graph must expose (all public floats, defaults 0).
+local LOCO_GRAPH_ENABLED = true
+local LOCO_GRAPH_CLASS   = "/Game/Mods/TheJumpIsAPal/Animations/ABP_PalFeel_Locomotion.ABP_PalFeel_Locomotion_C"
+local LOCO_GRAPH_VARS    = { speed = "Speed", lean = "Lean", alpha = "LocoAlpha" }
+-- Re-init route once the class is on the mesh asset:
+--   "toggle" : SetDisablePostProcessBlueprint(true) then (false); the
+--              component creates the post-process instance on re-enable.
+--   "remesh" : SetSkeletalMesh(same mesh, reinit pose). Heavier; use if
+--              the toggle leaves GetPostProcessInstance nil.
+local LOCO_GRAPH_REINIT  = "toggle"
 
-    -- New Sprint anim
-    sprint = "/Game/Mods/TheJumpIsAPal/Animations/AM_Player_Female_Sprint.AM_Player_Female_Sprint",
-}
+-- LocoAlpha: 1 = the graph's pose fully replaces the game's locomotion,
+-- 0 = pass-through. Driven by whether this frame is plain grounded
+-- movement; smoothed so the hand-off to a skid, an attack or the air is
+-- a fade, not a cut.
+local LOCO_ALPHA_MIN_SPEED = 60     -- uu/s, below this the game's idle owns
+local LOCO_ALPHA_TAU_IN    = 0.12   -- s, graph taking over
+local LOCO_ALPHA_TAU_OUT   = 0.10   -- s, graph letting go
+local LOCO_SPEED_TAU       = 0.05   -- s, smoothing on the Speed feed
 
--- ---- sprint cycle ----
--- Looping full-body cycle on DefaultSlot while sprinting straight or
--- leaning. Author with a looping section; a clip that runs out restarts.
-local SPRINT_CYCLE_ENABLED = true
-local SPRINT_CYCLE_SPEED   = SPRINT_MAX_SPEED  -- authored speed; rate = spd/this
-local SPRINT_CYCLE_RATE_MIN, SPRINT_CYCLE_RATE_MAX = 0.65, 1.35
-local SPRINT_CYCLE_BLEND_OUT = 0.20  -- s, when sprint ends
-local SPRINT_CYCLE_MIN_SPEED = 120
-
--- ---- lean: signal -> degrees ----
+-- ---- lean: signal -> -1..+1 ----
 -- Signed heading rate in deg/s, + = turning right. Two sources blended:
 --   predicted : the engine's own steer, friction * sin(input vs velocity).
 --               Same frame, no lag -- the lean starts as the stick moves.
 --   measured  : yaw delta of the velocity vector per second. Truth, one
 --               frame late, carries the arc-retention rescale.
--- The rate maps linearly to degrees, saturating at LEAN_RATE_FULL, scaled
--- by speed so a crawl barely leans, then smoothed. The smoothed value is
--- the ONLY thing the backends see. There is no on/off: 0.3 of a lean is
--- 0.3 of the pose, every frame.
+-- The rate maps to a lean through a dead band and a saturating curve,
+-- scaled by speed, then smoothed. That value is the blend space's X.
 local LEAN_ENABLED        = true
 local LEAN_PREDICT_WEIGHT = 0.6    -- 1.0 = input only, 0.0 = measured only
 local LEAN_RATE_CLAMP     = 720    -- deg/s, spike guard on the raw sample
 local LEAN_RATE_DEAD      = 12     -- deg/s, below this the target is 0
-local LEAN_RATE_FULL      = 220    -- deg/s that reaches LEAN_MAX_DEG
-local LEAN_MAX_DEG        = 1.0    -- full lean, in backend units (see below)
-local LEAN_CURVE          = Easing.EaseOutSine  -- (0, max, t): shape of the
-                                                -- rate -> amount map
+local LEAN_RATE_FULL      = 220    -- deg/s that reaches LEAN_MAX
+local LEAN_MAX            = 1.0    -- blend space X extent
+local LEAN_CURVE          = Easing.EaseOutSine  -- (0, max, t): rate -> lean map
 local LEAN_SPEED_REF      = SPRINT_MAX_SPEED    -- speed at which scale = 1
-local LEAN_SPEED_MIN_SCALE = 0.35  -- scale at standstill-ish speeds
+local LEAN_SPEED_MIN_SCALE = 0.35  -- scale at a crawl
 local LEAN_MIN_ANALOG     = 0.35   -- predicted term needs a held stick
 local LEAN_INVERT         = false  -- flip if it leans out of the turn
--- Smoothing is asymmetric: into a lean fast, out of it slower, and
--- rate-limited so a stick flick cannot snap the spine.
+-- Smoothing is asymmetric: into a lean fast, out slower, slew-limited so
+-- a stick flick cannot snap the pose.
 local LEAN_TAU_IN         = 0.09   -- s, |target| rising
 local LEAN_TAU_OUT        = 0.16   -- s, |target| falling
 local LEAN_MAX_RATE       = 6.0    -- units/s, hard slew limit
-local LEAN_ZERO_SNAP      = 0.004  -- |amount| treated as straight (an
-                                   -- exponential never reaches 0 alone)
+local LEAN_ZERO_SNAP      = 0.004  -- |lean| treated as straight
 
--- ---- lean backend ----
--- "scrub"  : ADDITIVE montage scrubbed by position. Author the lean clips
---            as additive (Local Space, base = first frame) ramps from no
---            lean at t=0 to full lean at the end. The montage is played,
---            paused, and its position set to |amount| * length each frame,
---            so the amount is the pose. t=0 is identity, so the swap
---            between the left and right clip at zero is invisible and the
---            montage's own blend-in never shows. LEAN_MAX_DEG = 1.0 here
---            (a fraction of the ramp). SlotEvaluatePose accumulates an
---            additive montage on top of whatever DefaultSlot carries, so
---            the locomotion underneath keeps playing.
--- "spine"  : write a rotator channel the ABP already feeds into the spine.
---            LEAN_MAX_DEG is then real degrees. The channel must be
---            confirmed with the L-key probe in section 12 first.
--- "off"    : signal runs, nothing is applied (log only).
-local LEAN_BACKEND        = "scrub"
-local LEAN_SCRUB_GAIT     = true   -- use walklean_* under walk, sprintlean_*
-                                   -- under sprint; false = sprint clips always
-local LEAN_SCRUB_SWAP_AT  = 0.02   -- |amount| under which a side/gait swap
-                                   -- is allowed (both clips ~identity there)
--- Montages in one GROUP are exclusive: Montage_Play stops every other
--- montage in the group. With the lean clips on DefaultSlot (DefaultGroup)
--- the scrub and the sprint cycle cannot both play, so while any lean is
--- applied the sprint cycle yields and vanilla sprint runs underneath.
--- Author the lean montages into a slot in ANOTHER group (see the slot
--- group dump at spawn) and set this true to let both play at once.
-local LEAN_SCRUB_OWN_GROUP = false
+-- ---- lean fallback: ABP rotator channel ----
+-- Used when the graph is unavailable (LOCO_GRAPH_ENABLED false, or the
+-- class did not resolve). Writes LEAN * LEAN_SPINE_DEG to a rotator the
+-- game's ABP already feeds into the spine. Channel unconfirmed: the L-key
+-- probe in section 12 is how to confirm it.
+local LEAN_SPINE_FALLBACK = false
 local LEAN_SPINE_CHANNEL  = "AimRotatorForSpine"  -- or "Ride_SpineAddRotate"
 local LEAN_SPINE_AXIS     = "Roll"                -- Roll / Pitch / Yaw
+local LEAN_SPINE_DEG      = 12.0                  -- degrees at |lean| = 1
 local LEAN_SPINE_WEIGHT   = nil                   -- "Ride_SpineWeight" when
                                                   -- the channel has a weight
 
@@ -248,7 +231,7 @@ local DEBUG_AIR  = false   -- per-frame falling log
 local DEBUG_KEEP = false   -- logs each retention burst once
 local DEBUG_CHANNELS = false -- one-shot lean-channel resting values at spawn
 local DEBUG_TURN_TRACE = true -- per-tick trace while a turn owns velocity
-local DEBUG_LEAN = false      -- per-tick lean signal + amount (60Hz spam)
+local DEBUG_LEAN = false      -- per-tick lean / speed / alpha feed (60Hz spam)
 
 -- =========================================================================
 -- 2. MODULE + STATE
@@ -296,24 +279,18 @@ local wallT   = 0
 -- ---- skid animation state ----
 local skidMontageCache = {}    -- asset path -> montage handle
 
--- ---- movement montage / lean state ----
+-- ---- locomotion graph / lean state ----
 -- One table: the main chunk is near Lua's 200-local limit.
 local mv = {
-    montageCache   = {},    -- asset path -> montage handle (separate from the
-                            -- skid cache: IsAnySkidPlaying walks that)
-    clipLength     = {},    -- MOVE_ANIMS key -> clip length (s)
-    apiChecked     = false,
-    hasIsAnyMontagePlaying = false,
-    -- sprint cycle
-    sprintMontage  = nil,   -- playing handle, or nil
-    sprintRate     = 0,
-    -- lean
+    graphClass     = nil,   -- resolved UClass of the post-process ABP
+    graphInstance  = nil,   -- live post-process anim instance, or nil
+    graphOk        = false, -- instance resolved and of our class
     rate           = 0,     -- raw blended heading rate, deg/s (this frame)
-    amount         = 0,     -- smoothed signed amount the backend applies
+    lean           = 0,     -- smoothed signed lean, -1..1
+    speed          = 0,     -- smoothed Speed feed
+    alpha          = 0,     -- smoothed LocoAlpha feed
     prevHeadingYaw = nil,   -- last velocity yaw, for the measured rate
-    scrubKey       = nil,   -- MOVE_ANIMS key currently scrubbed, or nil
-    scrubMontage   = nil,
-    spineWritten   = false, -- a non-zero value is on the channel
+    spineWritten   = false, -- a non-zero value is on the fallback channel
 }
 
 -- =========================================================================
@@ -586,10 +563,9 @@ local function LogSkidSkeletons(pawn)
     end
     dbg("mesh skeleton: %s", FullNameOf(meshSkeleton))
 
-    -- Montage slot groups the skeleton declares. A slot outside
-    -- DefaultGroup is what the lean scrub needs to coexist with the sprint
-    -- cycle (LEAN_SCRUB_OWN_GROUP). Best effort: TArray/FName access
-    -- differs across UE4SS builds, so any failure is one log line.
+    -- Montage slot groups the skeleton declares, for reference when
+    -- authoring. Best effort: TArray/FName access differs across UE4SS
+    -- builds, so any failure is one log line.
     if meshSkeleton and meshSkeleton:IsValid() then
         local ok, err = pcall(function()
             local groups = meshSkeleton.SlotGroups
@@ -611,14 +587,6 @@ local function LogSkidSkeletons(pawn)
         dbg("montage %s: obj=%s skeleton=%s", class,
             FullNameOf(montage),
             FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
-    end
-    do
-        for key, path in pairs(MOVE_ANIMS) do
-            local montage = LoadMontageInto(mv.montageCache, path)
-            dbg("move montage %s: obj=%s skeleton=%s", key,
-                FullNameOf(montage),
-                FullNameOf(montage and ReadOpt(montage, "Skeleton") or nil))
-        end
     end
 end
 
@@ -658,59 +626,105 @@ local function PlaySkidAnimation(class)
 end
 
 -- =========================================================================
--- 7. MOVEMENT MONTAGES: continuous lean + sprint cycle
+-- 7. LOCOMOTION GRAPH FEED
 -- Data flow per tick:
---   frame -> heading rate (deg/s) -> target amount -> smoothed amount
---         -> backend write (montage position | ABP rotator)
--- The amount is continuous and signed. Nothing here has an on state or an
--- off state; a small amount is a small lean. The skid owns DefaultSlot
--- while it plays: the lean and the sprint cycle both yield to it.
+--   frame -> heading rate (deg/s) -> lean target -> smoothed lean
+--   frame -> speed, "plain grounded movement?" -> smoothed Speed, LocoAlpha
+--   [Speed, Lean, LocoAlpha] -> post-process anim instance variables
+-- The graph reads them on its next update and evaluates the blend space.
+-- Nothing here is on/off: every feed is continuous. The skid montage
+-- still plays on the game's DefaultSlot upstream of the post-process
+-- graph, so LocoAlpha is faded to 0 while a turn owns the body.
 -- =========================================================================
 
-local function GetMoveMontage(key)
-    return LoadMontageInto(mv.montageCache, MOVE_ANIMS[key])
+-- ---- 7a. graph injection (spawn-time) ----
+
+-- The post-process ABP is a property of the shared USkeletalMesh asset,
+-- so every character using SK_PalHuman gets it. Their instances sit at
+-- LocoAlpha = 0 (the graph's default) and pass the game's pose through
+-- untouched; only our pawn is fed.
+local function ResolveGraphClass()
+    if mv.graphClass and mv.graphClass:IsValid() then return mv.graphClass end
+    local cls = StaticFindObject(LOCO_GRAPH_CLASS)
+    if not (cls and cls:IsValid()) then
+        cls = nil
+        pcall(function() cls = LoadAsset(LOCO_GRAPH_CLASS) end)
+        if cls and not cls:IsValid() then cls = nil end
+    end
+    mv.graphClass = cls
+    return cls
 end
 
--- Reflection probe, run once on the first live instance. Degrades to
--- "assume free" rather than throwing every tick if a build hides it.
-local function CheckMoveApi(anim)
-    if mv.apiChecked then return end
-    mv.apiChecked = true
-    mv.hasIsAnyMontagePlaying =
-        pcall(function() return anim:IsAnyMontagePlaying() end)
-    dbg("move anim api: IsAnyMontagePlaying=%s", tostring(mv.hasIsAnyMontagePlaying))
+local function ResolvePostProcessInstance(mesh)
+    local inst = nil
+    pcall(function() inst = mesh:GetPostProcessInstance() end)
+    if inst and inst:IsValid() then return inst end
+    return nil
 end
 
-local function IsMontagePlaying(anim, montage)
-    if not (montage and montage:IsValid()) then return false end
-    local playing = false
-    pcall(function() playing = anim:Montage_IsPlaying(montage) end)
-    return playing
+local function InjectLocomotionGraph(pawn)
+    mv.graphInstance, mv.graphOk = nil, false
+    if not LOCO_GRAPH_ENABLED then return end
+    local mesh = pawn and pawn:IsValid() and pawn.Mesh or nil
+    if not (mesh and mesh:IsValid()) then return end
+
+    local cls = ResolveGraphClass()
+    if cls == nil then
+        dbg("loco graph: class not resolved (%s) -- is it referenced by the ModActor?",
+            LOCO_GRAPH_CLASS)
+        return
+    end
+
+    local skelMesh = ReadOpt(mesh, "SkeletalMesh") or ReadOpt(mesh, "SkinnedAsset")
+    if not (skelMesh and skelMesh:IsValid()) then
+        dbg("loco graph: mesh asset unreadable")
+        return
+    end
+
+    -- What was there. A game-authored post-process ABP here would be
+    -- displaced by ours; that needs to be known, not silently done.
+    local existing = ReadOpt(skelMesh, "PostProcessAnimBlueprint")
+    dbg("loco graph: mesh %s existing post-process ABP = %s",
+        FullNameOf(skelMesh), FullNameOf(existing))
+    dbg("loco graph: main anim class = %s",
+        FullNameOf(ReadOpt(mesh, "AnimClass")))
+
+    local before = ResolvePostProcessInstance(mesh)
+    if before and before:IsA(cls) then
+        mv.graphInstance, mv.graphOk = before, true
+        dbg("loco graph: already installed (%s)", FullNameOf(before))
+        return
+    end
+
+    local okWrite, err = pcall(function() skelMesh.PostProcessAnimBlueprint = cls end)
+    if not okWrite then
+        dbg("loco graph: write PostProcessAnimBlueprint FAILED: %s", tostring(err))
+        return
+    end
+
+    if LOCO_GRAPH_REINIT == "remesh" then
+        pcall(function() mesh:SetSkeletalMesh(skelMesh, true) end)
+    else
+        -- The component only builds a post-process instance when the flag
+        -- flips from disabled to enabled with no instance present.
+        pcall(function() mesh:SetDisablePostProcessBlueprint(true) end)
+        pcall(function() mesh:SetDisablePostProcessBlueprint(false) end)
+    end
+
+    local inst = ResolvePostProcessInstance(mesh)
+    if inst == nil then
+        dbg("loco graph: no post-process instance after reinit (%s); "
+            .. "try LOCO_GRAPH_REINIT = \"remesh\"", LOCO_GRAPH_REINIT)
+        return
+    end
+    local isOurs = false
+    pcall(function() isOurs = inst:IsA(cls) end)
+    mv.graphInstance, mv.graphOk = inst, isOurs
+    dbg("loco graph: instance %s (%s)", FullNameOf(inst),
+        isOurs and "ours" or "NOT our class")
 end
 
--- A montage neither the skid nor this layer started (attack, emote,
--- glider unfurl). Playing over it cuts the game's clip and starts a
--- flicker war; yield instead.
-local function IsForeignMontagePlaying(anim)
-    if not mv.hasIsAnyMontagePlaying then return false end
-    local any = false
-    pcall(function() any = anim:IsAnyMontagePlaying() end)
-    if not any then return false end
-    if IsMontagePlaying(anim, mv.sprintMontage) then return false end
-    if IsMontagePlaying(anim, mv.scrubMontage) then return false end
-    if IsAnySkidPlaying(anim) then return false end
-    return true
-end
-
-local function ClipLength(key, montage)
-    local len = mv.clipLength[key]
-    if len and len > 0 then return len end
-    len = ReadOpt(montage, "SequenceLength") or 0
-    if len > 0 then mv.clipLength[key] = len end
-    return len
-end
-
--- ---- 7a. signal ----
+-- ---- 7b. lean signal ----
 
 -- Sign convention is UE yaw: X forward, Y right, positive = clockwise from
 -- above = turning right. cross(vel, input) > 0 puts the stick right of
@@ -744,229 +758,97 @@ local function ReadHeadingRate(dt, f)
     return raw
 end
 
--- rate -> signed target amount. Dead band, saturating curve, speed scale.
+-- rate -> signed lean target. Dead band, saturating curve, speed scale.
 local function LeanTarget(rate, f)
     local mag = math.abs(rate)
     if mag <= LEAN_RATE_DEAD then return 0 end
     local t = (mag - LEAN_RATE_DEAD) / math.max(1, LEAN_RATE_FULL - LEAN_RATE_DEAD)
-    local amount = LEAN_CURVE(0, LEAN_MAX_DEG, t)
+    local lean = LEAN_CURVE(0, LEAN_MAX, t)
     local speedT = math.min(1, f.spd / math.max(1, LEAN_SPEED_REF))
-    amount = amount * (LEAN_SPEED_MIN_SCALE + (1 - LEAN_SPEED_MIN_SCALE) * speedT)
-    return (rate < 0) and -amount or amount
+    lean = lean * (LEAN_SPEED_MIN_SCALE + (1 - LEAN_SPEED_MIN_SCALE) * speedT)
+    return (rate < 0) and -lean or lean
 end
 
--- Asymmetric exponential smoothing plus a slew limit. tau IN when |target|
--- grows, OUT when it shrinks (including through zero on a flip).
+-- Exponential smoothing toward `target` with the given tau.
+local function Approach(current, target, dt, tau)
+    if tau <= 0 then return target end
+    return current + (target - current) * (1 - math.exp(-dt / tau))
+end
+
+-- Asymmetric smoothing plus a slew limit. tau IN when |target| grows, OUT
+-- when it shrinks (including through zero on a flip).
 local function SmoothLean(dt, target)
-    local tau = (math.abs(target) >= math.abs(mv.amount)) and LEAN_TAU_IN or LEAN_TAU_OUT
-    local alpha = (tau > 0) and (1 - math.exp(-dt / tau)) or 1
-    local step  = (target - mv.amount) * alpha
-    local slew  = LEAN_MAX_RATE * dt
+    local tau  = (math.abs(target) >= math.abs(mv.lean)) and LEAN_TAU_IN or LEAN_TAU_OUT
+    local step = Approach(mv.lean, target, dt, tau) - mv.lean
+    local slew = LEAN_MAX_RATE * dt
     if step >  slew then step =  slew end
     if step < -slew then step = -slew end
-    mv.amount = mv.amount + step
-    if math.abs(mv.amount) < LEAN_ZERO_SNAP and math.abs(target) < LEAN_ZERO_SNAP then
-        mv.amount = 0
+    mv.lean = mv.lean + step
+    if math.abs(mv.lean) < LEAN_ZERO_SNAP and math.abs(target) < LEAN_ZERO_SNAP then
+        mv.lean = 0
     end
 end
 
--- Gate: where a lean is meaningful at all. Elsewhere the target is 0 and
--- the smoothing carries the pose back on its own.
-local function LeanAllowed(f)
-    if not LEAN_ENABLED or LEAN_BACKEND == "off" then return false end
+-- Plain grounded movement: the only state the graph should own. A turn
+-- (skid montage upstream), the air, and idle all hand the body back.
+local function GraphWantsBody(f)
     if phase ~= PHASE_NONE then return false end
-    return IsTurnCapableMode(f.mode, f.custom)
+    if not IsTurnCapableMode(f.mode, f.custom) then return false end
+    return f.spd >= LOCO_ALPHA_MIN_SPEED
 end
 
--- ---- 7b. backend: additive montage scrub ----
+-- ---- 7c. feeds ----
 
-local function StopLeanScrub(anim, blendOut)
-    if mv.scrubMontage and mv.scrubMontage:IsValid() and anim then
-        pcall(function() anim:Montage_Stop(blendOut or 0.0, mv.scrubMontage) end)
-    end
-    mv.scrubKey, mv.scrubMontage = nil, nil
-end
-
--- Play + pause once, then drive position. Returns true when the montage is
--- resident and paused at the requested position.
-local function StartLeanScrub(anim, key)
-    local montage = GetMoveMontage(key)
-    if montage == nil then
-        dbg("lean scrub %s: montage not resolved (%s)", key, MOVE_ANIMS[key])
-        return false
-    end
-    local played = 0.0
-    local ok = pcall(function()
-        played = anim:Montage_Play(montage, 1.0, 0, 0.0, false) or 0.0
-    end)
-    if not ok or played <= 0.0 then
-        dbg("lean scrub %s: Montage_Play %s", key,
-            ok and "REJECTED (returned 0)" or "threw")
-        return false
-    end
-    mv.clipLength[key] = mv.clipLength[key] or played
-    -- Paused: the clip must not advance on its own; position is ours.
-    pcall(function() anim:Montage_Pause(montage) end)
-    mv.scrubKey, mv.scrubMontage = key, montage
-    dbg("lean scrub -> %s (len %.2f)", key, played)
-    return true
-end
-
-local function ApplyLeanScrub(anim, f)
-    local sprinting = (f.mode == 6 and f.custom == 2)
-    local mag = math.abs(mv.amount)
-
-    if mag <= 0 then
-        -- Fully straight: release the slot entirely so the sprint cycle or
-        -- vanilla locomotion is all that plays. Position 0 is identity, so
-        -- a zero-length blend-out shows nothing.
-        if mv.scrubKey ~= nil then StopLeanScrub(anim, 0.0) end
+local function WriteGraphFeeds()
+    if not mv.graphOk then return end
+    local inst = mv.graphInstance
+    if not (inst and inst:IsValid()) then
+        mv.graphInstance, mv.graphOk = nil, false
         return
     end
-
-    local gait = (LEAN_SCRUB_GAIT and not sprinting) and "walklean" or "sprintlean"
-    local key  = gait .. ((mv.amount < 0) and "_left" or "_right")
-
-    if key ~= mv.scrubKey then
-        -- A side mismatch swaps now: the amount just crossed zero (the
-        -- slew limit bounds how far past it) and scrubbing the wrong-side
-        -- clip is worse than the sub-frame pop. A same-side GAIT change
-        -- waits for near-identity, since a walk clip and a sprint clip
-        -- differ visibly at the same position.
-        local wrongSide = mv.scrubKey ~= nil
-            and (mv.scrubKey:sub(-5) == "_left") ~= (mv.amount < 0)
-        if mv.scrubKey ~= nil and not wrongSide and mag > LEAN_SCRUB_SWAP_AT then
-            key = mv.scrubKey
-        else
-            StopLeanScrub(anim, 0.0)
-            if not StartLeanScrub(anim, key) then return end
-        end
-    elseif not IsMontagePlaying(anim, mv.scrubMontage) then
-        -- Cut by something else (skid, game montage). Re-enter.
-        mv.scrubKey, mv.scrubMontage = nil, nil
-        if not StartLeanScrub(anim, key) then return end
+    local ok = pcall(function()
+        inst[LOCO_GRAPH_VARS.speed] = mv.speed
+        inst[LOCO_GRAPH_VARS.lean]  = mv.lean
+        inst[LOCO_GRAPH_VARS.alpha] = mv.alpha
+    end)
+    if not ok then
+        mv.graphOk = false
+        dbg("loco graph: variable write failed -- check LOCO_GRAPH_VARS names")
     end
-
-    local len = ClipLength(key, mv.scrubMontage)
-    if len <= 0 then return end
-    -- Never touch the final frame: a montage at exactly its length is
-    -- "finished" and the engine blends it out on its own.
-    local pos = math.min(mag / LEAN_MAX_DEG, 1.0) * len
-    pos = math.min(pos, len - 0.001)
-    pcall(function() anim:Montage_SetPosition(mv.scrubMontage, pos) end)
 end
 
--- ---- 7c. backend: ABP rotator channel ----
-
-local function ApplyLeanSpine(anim)
-    if mv.amount == 0 and not mv.spineWritten then return end
+local function WriteSpineFallback(anim)
+    if not LEAN_SPINE_FALLBACK or mv.graphOk then return end
+    local deg = mv.lean * LEAN_SPINE_DEG
+    if deg == 0 and not mv.spineWritten then return end
     local ok = pcall(function()
-        anim[LEAN_SPINE_CHANNEL][LEAN_SPINE_AXIS] = mv.amount
+        anim[LEAN_SPINE_CHANNEL][LEAN_SPINE_AXIS] = deg
         if LEAN_SPINE_WEIGHT then
-            anim[LEAN_SPINE_WEIGHT] = (mv.amount ~= 0) and 1.0 or 0.0
+            anim[LEAN_SPINE_WEIGHT] = (deg ~= 0) and 1.0 or 0.0
         end
     end)
-    mv.spineWritten = ok and (mv.amount ~= 0)
+    mv.spineWritten = ok and (deg ~= 0)
 end
 
--- ---- 7d. sprint cycle ----
-
-local function StopSprintCycle(anim, blendOut)
-    if mv.sprintMontage and mv.sprintMontage:IsValid() and anim then
-        pcall(function() anim:Montage_Stop(blendOut, mv.sprintMontage) end)
-        dbg("sprint cycle -> none (blend %.2f)", blendOut)
-    end
-    mv.sprintMontage, mv.sprintRate = nil, 0
-end
-
-local function UpdateSprintCycle(anim, f)
-    if not SPRINT_CYCLE_ENABLED then return end
-    local want = phase == PHASE_NONE
-             and f.mode == 6 and f.custom == 2
-             and f.spd >= SPRINT_CYCLE_MIN_SPEED
-             and f.imag > 1e-3
-
-    if not want then
-        if mv.sprintMontage ~= nil then StopSprintCycle(anim, SPRINT_CYCLE_BLEND_OUT) end
-        return
-    end
-    -- Slot arbitration. The scrub's own Montage_Play is what blends the
-    -- cycle out (over the lean clip's BlendIn); here we only decline to
-    -- start it again until the lean has fully returned to zero.
-    local scrubOwnsSlot = LEAN_BACKEND == "scrub" and not LEAN_SCRUB_OWN_GROUP
-                      and (mv.amount ~= 0 or mv.scrubKey ~= nil)
-    if scrubOwnsSlot or IsAnySkidPlaying(anim) or IsForeignMontagePlaying(anim) then
-        if mv.sprintMontage ~= nil and not IsMontagePlaying(anim, mv.sprintMontage) then
-            mv.sprintMontage, mv.sprintRate = nil, 0
-        end
-        return
-    end
-
-    local rate = math.max(SPRINT_CYCLE_RATE_MIN,
-                 math.min(SPRINT_CYCLE_RATE_MAX, f.spd / math.max(1, SPRINT_CYCLE_SPEED)))
-
-    if mv.sprintMontage ~= nil and IsMontagePlaying(anim, mv.sprintMontage) then
-        if math.abs(rate - mv.sprintRate) >= 0.02 then
-            if pcall(function() anim:Montage_SetPlayRate(mv.sprintMontage, rate) end) then
-                mv.sprintRate = rate
-            end
-        end
-        return
-    end
-
-    local montage = GetMoveMontage("sprint")
-    if montage == nil then return end
-    local played = 0.0
-    local ok = pcall(function()
-        played = anim:Montage_Play(montage, rate, 0, 0.0, false) or 0.0
-    end)
-    if not ok or played <= 0.0 then
-        dbg("sprint cycle: Montage_Play %s", ok and "REJECTED (returned 0)" or "threw")
-        mv.sprintMontage, mv.sprintRate = nil, 0
-        return
-    end
-    -- The cycle's Montage_Play blends out every other DefaultGroup montage,
-    -- the lean scrub included. Forget it so the scrub re-enters cleanly.
-    mv.scrubKey, mv.scrubMontage = nil, nil
-    mv.sprintMontage, mv.sprintRate = montage, rate
-    dbg("sprint cycle -> playing (rate %.2f, len %.2f)", rate, played)
-end
-
--- ---- 7e. tick ----
+-- ---- 7d. tick ----
 
 local function UpdateMoveAnim(dt, f)
     mv.rate = ReadHeadingRate(dt, f)
-    SmoothLean(dt, LeanAllowed(f) and LeanTarget(mv.rate, f) or 0)
-
-    local anim = ResolveAnimInstance()
-    if anim == nil then
-        mv.sprintMontage, mv.scrubKey, mv.scrubMontage = nil, nil, nil
-        return
-    end
-    CheckMoveApi(anim)
+    local wants = GraphWantsBody(f)
+    SmoothLean(dt, (LEAN_ENABLED and wants) and LeanTarget(mv.rate, f) or 0)
+    mv.speed = Approach(mv.speed, f.spd, dt, LOCO_SPEED_TAU)
+    mv.alpha = Approach(mv.alpha, wants and 1 or 0, dt,
+                        wants and LOCO_ALPHA_TAU_IN or LOCO_ALPHA_TAU_OUT)
+    if mv.alpha < 0.005 and not wants then mv.alpha = 0 end
 
     if DEBUG_LEAN then
-        dbg("lean rate=%+.0f amount=%+.3f scrub=%s sprintcycle=%s",
-            mv.rate, mv.amount, tostring(mv.scrubKey),
-            tostring(mv.sprintMontage ~= nil))
+        dbg("feed rate=%+.0f lean=%+.3f speed=%.0f alpha=%.2f graph=%s",
+            mv.rate, mv.lean, mv.speed, mv.alpha, tostring(mv.graphOk))
     end
 
-    -- Order matters: the sprint cycle's Montage_Play would cut a scrub
-    -- started in the same tick, so it goes first and the scrub lands on
-    -- top of it.
-    UpdateSprintCycle(anim, f)
-
-    if LEAN_BACKEND == "scrub" then
-        if phase ~= PHASE_NONE or IsAnySkidPlaying(anim) or IsForeignMontagePlaying(anim) then
-            -- Slot is owned elsewhere. Our montage was already cut by that
-            -- play; drop the bookkeeping, the amount keeps decaying to 0.
-            mv.scrubKey, mv.scrubMontage = nil, nil
-        else
-            ApplyLeanScrub(anim, f)
-        end
-    elseif LEAN_BACKEND == "spine" then
-        ApplyLeanSpine(anim)
-    end
+    WriteGraphFeeds()
+    local anim = ResolveAnimInstance()
+    if anim then WriteSpineFallback(anim) end
 end
 
 -- =========================================================================
@@ -1436,14 +1318,11 @@ function M.OnPlayerCached(pawn, cmc)
     lastSplit, wasAirborne = nil, false
     keepSpeed, keepActive = 0, false
 
-    -- Lean + sprint cycle: the old pawn's montages are gone with the old
-    -- mesh, and a filtered amount carried across a respawn would land a
-    -- phantom lean on the new one.
-    mv.sprintMontage, mv.sprintRate = nil, 0
-    mv.rate, mv.amount, mv.prevHeadingYaw = 0, 0, nil
-    mv.scrubKey, mv.scrubMontage, mv.spineWritten = nil, nil, false
-    mv.montageCache, mv.clipLength = {}, {}
-    mv.apiChecked = false
+    -- Feeds reset: a lean or alpha carried across a respawn would land on
+    -- the new pawn before it has moved. The graph is re-injected below,
+    -- after the mesh is known to be valid.
+    mv.rate, mv.lean, mv.speed, mv.alpha, mv.prevHeadingYaw = 0, 0, 0, 0, nil
+    mv.graphInstance, mv.graphOk, mv.spineWritten = nil, false, false
 
     -- The old pawn's anim instance may still report valid, in which case
     -- the lazy re-cache on the next tick would never fire and
@@ -1525,15 +1404,8 @@ function M.OnPlayerCached(pawn, cmc)
         end
     end
 
-    do
-        for key, path in pairs(MOVE_ANIMS) do
-            if LoadMontageInto(mv.montageCache, path) == nil then
-                dbg("move montage %s failed to load: %s", key, path)
-            end
-        end
-    end
-
     LogSkidSkeletons(pawn)
+    InjectLocomotionGraph(pawn)
 end
 
 -- A deceleration no braking path can produce while input is held means the
@@ -1584,8 +1456,7 @@ function M.OnTick(dt, pawn, cmc)
     RetainTurnSpeed(dt, cmc, frame, walled)
     -- After the turn and retention: the measured heading rate must see the
     -- velocity the engine will actually integrate this frame. Runs on air
-    -- frames too, so the lean decays and the sprint cycle stops the frame
-    -- the ground is lost.
+    -- frames too, so the feeds fade the frame the ground is lost.
     UpdateMoveAnim(dt, frame)
 
     DebugAirFrame(cmc, frame.mode)
