@@ -30,8 +30,9 @@
 --                      re-done as a 2D blend space (speed x lean) in a
 --                      post-process AnimBlueprint shipped in the pak, and
 --                      Lua feeds it three floats each frame: Speed, Lean
---                      (-1..+1 from the heading-rate signal) and LocoAlpha
---                      (how much of the graph's pose replaces the game's).
+--                      (-1..+1 from the heading-rate signal), LocoAlpha
+--                      (how much of the graph's pose replaces the game's)
+--                      and Sprint (the game's sprint state, 0..1 smoothed).
 --                      Section 7.
 -- Sprint cycle       : the authored sprint montage plays while sprinting
 --                      and stops otherwise. Section 7.
@@ -170,7 +171,14 @@ local SKID_MONTAGES = {
 -- the graph must expose (all public floats, defaults 0).
 local LOCO_GRAPH_ENABLED = true
 local LOCO_GRAPH_CLASS   = "/Game/Mods/TheJumpIsAPal/Animations/ABP_PalFeel_Locomotion.ABP_PalFeel_Locomotion_C"
-local LOCO_GRAPH_VARS    = { speed = "Speed", lean = "Lean", alpha = "LocoAlpha" }
+local LOCO_GRAPH_VARS    = { speed = "Speed", lean = "Lean", alpha = "LocoAlpha",
+                             sprint = "Sprint" }  -- sprint: optional, nil = not fed
+-- Sprint feed: the game's sprint STATE (custom mode 2) as a 0..1 float,
+-- smoothed. Vanilla picks the sprint cycle by that state, not by speed;
+-- if the graph should do the same, blend a jog/lean space and a
+-- sprint/lean space by this value instead of putting sprint on the
+-- speed axis.
+local LOCO_SPRINT_TAU    = 0.15   -- s, jog <-> sprint cross-fade
 -- Re-init route once the class is on the mesh asset:
 --   "toggle" : SetDisablePostProcessBlueprint(true) then (false); the
 --              component creates the post-process instance on re-enable.
@@ -289,6 +297,7 @@ local mv = {
     lean           = 0,     -- smoothed signed lean, -1..1
     speed          = 0,     -- smoothed Speed feed
     alpha          = 0,     -- smoothed LocoAlpha feed
+    sprint         = 0,     -- smoothed Sprint feed (0 jog .. 1 sprint)
     prevHeadingYaw = nil,   -- last velocity yaw, for the measured rate
     spineWritten   = false, -- a non-zero value is on the fallback channel
 }
@@ -810,6 +819,7 @@ local function WriteGraphFeeds()
         inst[LOCO_GRAPH_VARS.speed] = mv.speed
         inst[LOCO_GRAPH_VARS.lean]  = mv.lean
         inst[LOCO_GRAPH_VARS.alpha] = mv.alpha
+        if LOCO_GRAPH_VARS.sprint then inst[LOCO_GRAPH_VARS.sprint] = mv.sprint end
     end)
     if not ok then
         mv.graphOk = false
@@ -840,10 +850,12 @@ local function UpdateMoveAnim(dt, f)
     mv.alpha = Approach(mv.alpha, wants and 1 or 0, dt,
                         wants and LOCO_ALPHA_TAU_IN or LOCO_ALPHA_TAU_OUT)
     if mv.alpha < 0.005 and not wants then mv.alpha = 0 end
+    local sprinting = (f.mode == 6 and f.custom == 2) and 1 or 0
+    mv.sprint = Approach(mv.sprint, sprinting, dt, LOCO_SPRINT_TAU)
 
     if DEBUG_LEAN then
-        dbg("feed rate=%+.0f lean=%+.3f speed=%.0f alpha=%.2f graph=%s",
-            mv.rate, mv.lean, mv.speed, mv.alpha, tostring(mv.graphOk))
+        dbg("feed rate=%+.0f lean=%+.3f speed=%.0f sprint=%.2f alpha=%.2f graph=%s",
+            mv.rate, mv.lean, mv.speed, mv.sprint, mv.alpha, tostring(mv.graphOk))
     end
 
     WriteGraphFeeds()
@@ -1321,7 +1333,7 @@ function M.OnPlayerCached(pawn, cmc)
     -- Feeds reset: a lean or alpha carried across a respawn would land on
     -- the new pawn before it has moved. The graph is re-injected below,
     -- after the mesh is known to be valid.
-    mv.rate, mv.lean, mv.speed, mv.alpha, mv.prevHeadingYaw = 0, 0, 0, 0, nil
+    mv.rate, mv.lean, mv.speed, mv.alpha, mv.sprint, mv.prevHeadingYaw = 0, 0, 0, 0, 0, nil
     mv.graphInstance, mv.graphOk, mv.spineWritten = nil, false, false
 
     -- The old pawn's anim instance may still report valid, in which case
