@@ -210,8 +210,12 @@ local LEAN_RATE_DEAD      = 12     -- deg/s, below this the target is 0
 local LEAN_RATE_FULL      = 220    -- deg/s that reaches LEAN_MAX
 local LEAN_MAX            = 1.0    -- blend space X extent
 local LEAN_CURVE          = Easing.EaseOutSine  -- (0, max, t): rate -> lean map
+-- Speed attenuation is OFF (min scale 1): the walk and jog lean cycles
+-- carry their own authored amount, so a slow lean already looks slow.
+-- Lower LEAN_SPEED_MIN_SCALE only if the blend space has no low-speed
+-- lean samples.
 local LEAN_SPEED_REF      = SPRINT_MAX_SPEED    -- speed at which scale = 1
-local LEAN_SPEED_MIN_SCALE = 0.35  -- scale at a crawl
+local LEAN_SPEED_MIN_SCALE = 1.0   -- scale at a crawl
 local LEAN_MIN_ANALOG     = 0.35   -- predicted term needs a held stick
 local LEAN_INVERT         = false  -- flip if it leans out of the turn
 -- Smoothing is asymmetric: into a lean fast, out slower, slew-limited so
